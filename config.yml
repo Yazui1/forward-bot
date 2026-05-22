@@ -1,0 +1,160 @@
+bot:
+  token: "${BOT_TOKEN}"
+  global_salt: "change-me-global-salt"
+  admin_ids: []
+
+database:
+  path: "./data/bot.db"
+
+cache:
+  sender_metadata_ttl_seconds: 86400
+  sender_metadata_max_size: 86400
+  pending_state_ttl_seconds: 86400
+  transient_message_ttl_hours: 72
+
+delivery:
+  telegram_rate_limit_per_second: 25
+  active_window_hours: 72
+  worker_count: 1
+
+identity:
+  allow_sign_toggle: true
+  allow_tripcode_toggle: true
+
+rate_limits:
+  message_send_limit: 8
+  window_seconds: 30
+  cooldown_seconds: 30
+
+credits:
+  starting_balance: 20.0
+  text_message_reward: 0.1
+  media_message_reward: 0.35
+  upvote_cost: 0.5
+  upvote_reward: 1.0
+  downvote_penalty: 1.0
+  transfer_allow_negative_for_admin: true
+  unsend_cost: 5.0
+  edit_cost: 5.0
+  invite_reward: 5.0
+  whisper_cost: 1.0
+  whisper_unlock_credits: 30.0
+  downvote_start_cost: 1.0
+  negative_credit_cooldown_seconds: 3600
+  daily_tax_enabled: true
+  daily_tax_check_interval_seconds: 3600
+  daily_earning_limits:
+    text_message_reward: 10
+    media_message_reward: 25
+    upvote_reward: 30
+    invite_reward: 50
+    gamble_win: -1
+    fight_win: -1
+  downvote_cost_schedule:
+    - minute: 1
+      cost: 1.0
+    - minute: 2
+      cost: 2.0
+    - minute: 3
+      cost: 3.0
+  tax_ramp:
+    - credits: 60
+      daily_tax_percent: 0.02
+    - credits: 500
+      daily_tax_percent: 0.15
+
+loss_rate:
+  schedule:
+    - credits: 20
+      loss_rate: 0.10
+    - credits: 130
+      loss_rate: 0.0
+
+inactivity:
+  period_days: 4
+  non_system_receive_chance: 0.05
+
+tips:
+  enabled: true
+  interval_hours: 24
+  messages:
+    - "Did you know, you can earn credits by sending messages and media? Check /info for your own credits /help and /creditstats for more details!"
+    - "Did you know, you can use /help to see all available commands."
+    - "Did you know, you can unsend your own messages with /unsend."
+    - "Did you know, you can vote messages with 👍, ❤️ or 👎 to send or deduct credits."
+    - "Did you know, you can reduce your message receiving loss rate, by earning credits? Check your current credits and loss rate with /info."
+    - "Did you know, you can use /s and /t to sign your messages with a custom name and tripcode? Check /help for details."
+    - "Did you know, you can see the top users by credits with /creditstats? Climb the leaderboard by earning credits through messaging and voting!"
+    - "Did you know, you can collectively moderate messages by voting to delete them with /deletevote?"
+    - "Did you know, the bot has multiple channels and a backup website in case it gets banned. Check the bots bio for details!"
+    - "Did you know, you can filter potentially unwanted messages with /togglepotentiallyunwanted? (Right now it fiters anon bot links sent by others)"
+    - "Did you know there are various /toggle commands to customize your experience? Check /help for details!"
+    - "Feeling lucky today? Try your luck with /gamble <X credits> to win or lose credits! (50% chance to double your bet)"
+    - "Want to share some credits with a friend? Use /credit <X credits> in reply to their message to send them some of your credits!"
+    - "Make sure to check the rules in /about to avoid getting banned!"
+    - "Sometimes the bot might be slow to respond due to Telegram API limits or server load. Your message will still be processed, so please be patient if you don't get a quick response."
+    - "Stay active to avoid losing media messages! The bot will not send you media messages if you are inactive for a while to avoid ratelimiting. Check /info for your current loss rate."
+    - "Feeling competitive? Challenge other users to a fight and bet your credits with /fight <X credits>! Strength is determined by your credits, but there's always a chance to win big or lose it all! Check /help for details."
+
+gamble:
+  max_amount: 1000.0
+
+vote_to_remove:
+  threshold: 3
+  user_vote_cooldown_seconds: 300
+  user_remove_limit: 3
+  user_remove_cooldown_seconds: 3600
+  global_limit: 6
+  global_cooldown_seconds: 3600
+  collateral_remove_amount: 3
+  punishment_credit_tax_percent: 0.8
+  punishment_credit_minimum: 10.0
+  punishment_cooldown_seconds: 3600
+  reversal_punishment_credit_tax_percent: 0.05
+  reversal_punishment_credit_minimum: 10.0
+  voter_min_top_credit_percentile: 0.8
+
+moderation:
+  default_cooldown_seconds: 1800
+
+fights:
+  enabled: true
+  max_stake_cap: 500.0
+  initiation_fee_percent: 0.05
+  initiation_fee_min: 1
+  initiation_fee_max: 20.0
+  cooldown_seconds: 300
+  request_timeout_seconds: 300
+  win_tax_percent: 0.05
+
+invites:
+  start_prefix: "inv_"
+
+onboarding:
+  initial_cooldown_seconds: 900
+
+duplicates:
+  enabled: true
+  retention_days: 3
+  similarity_threshold: 0.95
+
+saucenao:
+  enabled: true
+  api_key: "${SAUCENAO_API_KEY}"
+  top_credit_percentile: 0.2
+  per_user_daily_limit: 5
+  global_daily_limit: 100
+  num_results: 6
+
+ai:
+  enabled: true
+  model_path: "model.keras"
+  question_threshold: 0.93
+  block_threshold: null
+  image_size: 224
+
+tagging:
+  blocked_terms: []
+  questionable_terms: []
+  potentially_unwanted_terms:
+    - "bot?start="

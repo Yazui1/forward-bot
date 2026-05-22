@@ -1,0 +1,7 @@
+python-telegram-bot==22.7
+PyYAML==6.0.2
+aiosqlite==0.22.1
+Pillow==12.2.0
+TensorFlow==2.21.0
+numpy==2.4.6
+saucenao-api==2.4.0
