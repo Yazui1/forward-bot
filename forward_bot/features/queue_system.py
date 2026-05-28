@@ -42,10 +42,12 @@ class DeliveryQueue:
         self.repo = repo
         self.cfg = cfg
         self.media_service = media_service
-        self.queue: asyncio.PriorityQueue[tuple[int, int, DeliveryItem]] = asyncio.PriorityQueue()
+        self.queue: asyncio.PriorityQueue[tuple[int,
+                                                int, DeliveryItem]] = asyncio.PriorityQueue()
         self._counter = 0
         self._last_send = 0.0
-        self._min_interval = 1 / max(1, int(cfg["delivery"]["telegram_rate_limit_per_second"]))
+        self._min_interval = 1 / \
+            max(1, int(cfg["delivery"]["telegram_rate_limit_per_second"]))
         self._running = False
         self._bot: Any | None = None
         self._inactivity_notified: set[int] = set()
@@ -56,7 +58,8 @@ class DeliveryQueue:
 
     def update_config(self, cfg: dict[str, Any]) -> None:
         self.cfg = cfg
-        self._min_interval = 1 / max(1, int(cfg["delivery"]["telegram_rate_limit_per_second"]))
+        self._min_interval = 1 / \
+            max(1, int(cfg["delivery"]["telegram_rate_limit_per_second"]))
 
     async def enqueue_batch(
         self,
@@ -237,7 +240,8 @@ class DeliveryQueue:
             )
 
     async def _send_with_backoff(self, bot: Any, item: DeliveryItem) -> None:
-        lock = self._recipient_locks.setdefault(item.recipient_id, asyncio.Lock())
+        lock = self._recipient_locks.setdefault(
+            item.recipient_id, asyncio.Lock())
         async with lock:
             await self._send_with_backoff_locked(bot, item)
 
@@ -314,13 +318,15 @@ class DeliveryQueue:
             )
             return
         if await self._drop_due_to_inactivity(bot, recipient, item):
-            logger.debug("Dropped due to inactivity message_id=%s recipient_id=%s", item.message_id, item.recipient_id)
+            logger.debug("Dropped due to inactivity message_id=%s recipient_id=%s",
+                         item.message_id, item.recipient_id)
             return
 
         reply_markup = None
         if item.include_remove_button and not item.is_system and recipient.vote_buttons_enabled:
             reply_markup = InlineKeyboardMarkup(
-                [[InlineKeyboardButton(Msg.VOTE_TO_REMOVE_BUTTON, callback_data=f"rm:{item.message_id}")]]
+                [[InlineKeyboardButton(
+                    Msg.VOTE_TO_REMOVE_BUTTON, callback_data=f"rm:{item.message_id}")]]
             )
         reply_to_message_id = None
         if item.reply_to_message_id is not None:
@@ -348,9 +354,11 @@ class DeliveryQueue:
                 blurred = None
                 if self.media_service is not None:
                     blurred = await self.media_service.blur_photo(bot, item.media_file_id)
-                caption = self._blur_caption(item.text_content, recipient.credits)
+                caption = self._blur_caption(
+                    item.text_content, recipient.credits)
                 if blurred is not None:
-                    logger.info("Blurred photo delivery message_id=%s recipient_id=%s", item.message_id, item.recipient_id)
+                    logger.info("Blurred photo delivery message_id=%s recipient_id=%s",
+                                item.message_id, item.recipient_id)
                     sent = await bot.send_photo(
                         chat_id=item.recipient_id,
                         photo=blurred,
@@ -360,7 +368,8 @@ class DeliveryQueue:
                         parse_mode=item.parse_mode,
                     )
                 else:
-                    logger.info("Blurred photo fallback text message_id=%s recipient_id=%s", item.message_id, item.recipient_id)
+                    logger.info("Blurred photo fallback text message_id=%s recipient_id=%s",
+                                item.message_id, item.recipient_id)
                     sent = await bot.send_message(
                         chat_id=item.recipient_id,
                         text=caption,
@@ -381,7 +390,8 @@ class DeliveryQueue:
         elif item.content_type in {"video", "animation"} and item.media_file_id:
             if (not recipient.is_admin and not recipient.is_moderator) and self._should_blur(recipient.credits):
                 is_blurred = True
-                logger.info("Blurred %s delivery message_id=%s recipient_id=%s", item.content_type, item.message_id, item.recipient_id)
+                logger.info("Blurred %s delivery message_id=%s recipient_id=%s",
+                            item.content_type, item.message_id, item.recipient_id)
                 sent = await self._send_blurred_thumbnail_or_notice(bot, item, reply_markup, reply_to_message_id, recipient.credits)
             elif item.content_type == "video":
                 is_blurred = False
@@ -406,7 +416,8 @@ class DeliveryQueue:
         elif item.content_type == "video_note" and item.media_file_id:
             if (not recipient.is_admin and not recipient.is_moderator) and self._should_blur(recipient.credits):
                 is_blurred = True
-                logger.info("Blurred video_note delivery message_id=%s recipient_id=%s", item.message_id, item.recipient_id)
+                logger.info("Blurred video_note delivery message_id=%s recipient_id=%s",
+                            item.message_id, item.recipient_id)
                 sent = await self._send_blurred_thumbnail_or_notice(bot, item, reply_markup, reply_to_message_id, recipient.credits)
             else:
                 is_blurred = False
@@ -419,7 +430,8 @@ class DeliveryQueue:
         elif item.content_type == "sticker" and item.media_file_id:
             if (not recipient.is_admin and not recipient.is_moderator) and self._should_blur(recipient.credits):
                 is_blurred = True
-                logger.info("Blurred sticker delivery message_id=%s recipient_id=%s", item.message_id, item.recipient_id)
+                logger.info("Blurred sticker delivery message_id=%s recipient_id=%s",
+                            item.message_id, item.recipient_id)
                 sent = await self._send_blurred_thumbnail_or_notice(bot, item, reply_markup, reply_to_message_id, recipient.credits)
             else:
                 is_blurred = False
@@ -436,7 +448,8 @@ class DeliveryQueue:
                 and self._should_blur(recipient.credits)
             ):
                 is_blurred = True
-                logger.info("Blurred document delivery message_id=%s recipient_id=%s", item.message_id, item.recipient_id)
+                logger.info("Blurred document delivery message_id=%s recipient_id=%s",
+                            item.message_id, item.recipient_id)
                 sent = await self._send_blurred_thumbnail_or_notice(bot, item, reply_markup, reply_to_message_id, recipient.credits)
             else:
                 is_blurred = False
@@ -459,13 +472,6 @@ class DeliveryQueue:
             )
 
         await self.repo.add_delivery(item.message_id, item.recipient_id, sent.message_id, is_blurred=is_blurred)
-        logger.debug(
-            "Delivered message_id=%s recipient_id=%s telegram_message_id=%s blurred=%s",
-            item.message_id,
-            item.recipient_id,
-            sent.message_id,
-            is_blurred,
-        )
 
     async def _drop_due_to_inactivity(self, bot: Any, recipient: Any, item: DeliveryItem) -> bool:
         last_activity = recipient.last_activity
@@ -476,7 +482,8 @@ class DeliveryQueue:
         except ValueError:
             return False
         inactive_days = int(self.cfg["inactivity"]["period_days"])
-        inactive = datetime.now(timezone.utc) - dt > timedelta(days=inactive_days)
+        inactive = datetime.now(timezone.utc) - \
+            dt > timedelta(days=inactive_days)
         if not inactive:
             self._inactivity_notified.discard(recipient.telegram_id)
             return False
@@ -495,14 +502,17 @@ class DeliveryQueue:
         try:
             await bot.send_message(chat_id=recipient_id, text=Msg.INACTIVITY_NOTICE)
         except Exception:
-            logger.debug("Failed to send inactivity notice recipient_id=%s", recipient_id, exc_info=True)
+            logger.debug(
+                "Failed to send inactivity notice recipient_id=%s", recipient_id, exc_info=True)
 
     def _should_blur(self, credits: float) -> bool:
-        loss_rate = interpolate_loss_rate(self.cfg["loss_rate"]["schedule"], credits)
+        loss_rate = interpolate_loss_rate(
+            self.cfg["loss_rate"]["schedule"], credits)
         return random.random() < max(0.0, min(1.0, loss_rate))
 
     def _blur_caption(self, original: str | None, credits: float) -> str:
-        loss_rate = interpolate_loss_rate(self.cfg["loss_rate"]["schedule"], credits) * 100.0
+        loss_rate = interpolate_loss_rate(
+            self.cfg["loss_rate"]["schedule"], credits) * 100.0
         notice = Msg.blurred_notice(loss_rate)
         return f"{original}\n\n{notice}" if original else notice
 
@@ -521,7 +531,8 @@ class DeliveryQueue:
             return await bot.send_photo(
                 chat_id=item.recipient_id,
                 photo=blurred,
-                caption=self._blur_caption(item.text_content, recipient_credits),
+                caption=self._blur_caption(
+                    item.text_content, recipient_credits),
                 reply_markup=reply_markup,
                 reply_to_message_id=reply_to_message_id,
                 parse_mode=item.parse_mode,
