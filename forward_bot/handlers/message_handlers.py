@@ -524,6 +524,15 @@ async def _distribute(
             user for user in recipients
             if (user.is_moderator or user.is_admin or not user.hide_potentially_unwanted)
         ]
+    logger.debug(
+        "Distributing message_id=%s sender_id=%s recipients=%s content_type=%s tag=%s reply_to=%s",
+        message_id,
+        sender_id,
+        len(recipients),
+        payload["content_type"],
+        tag,
+        reply_to_message_id,
+    )
     await queue.enqueue_batch(
         message_id=message_id,
         sender_id=sender_id,

@@ -5,6 +5,8 @@ import random
 from datetime import datetime, timezone
 from typing import Any
 
+from telegram.error import Forbidden
+
 from forward_bot.features.credits import apply_negative_credit_cooldown, interpolate_tax_rate
 
 
@@ -43,6 +45,8 @@ async def tips_worker(bot: Any, repo: Any, cfg: dict[str, Any]) -> None:
                 continue
             try:
                 await bot.send_message(chat_id=user.telegram_id, text=random.choice(messages))
+            except Forbidden:
+                await repo.mark_left(user.telegram_id)
             except Exception:
                 pass
         await asyncio.sleep(max(300, interval))

@@ -117,6 +117,15 @@ class Repository:
             )
             await conn.commit()
 
+    async def mark_left(self, telegram_id: int) -> None:
+        conn = await self._conn()
+        async with conn:
+            await conn.execute(
+                "UPDATE users SET has_started = 0 WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+            await conn.commit()
+
     async def touch_activity(self, telegram_id: int) -> None:
         conn = await self._conn()
         async with conn:
