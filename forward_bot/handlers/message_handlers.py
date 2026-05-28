@@ -3,6 +3,7 @@ from __future__ import annotations
 import secrets
 import html
 import logging
+import unicodedata
 from datetime import datetime, timedelta, timezone
 import math
 import random
@@ -750,11 +751,21 @@ def _reaction_vote(repo: Any, cfg: dict[str, Any]):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reaction = update.message_reaction
         if reaction is None or reaction.user is None or reaction.chat is None:
+            logger.debug("Ignoring reaction update without user/chat: %s", reaction)
             return
         emojis = _reaction_emojis(getattr(reaction, "new_reaction", None))
+        logger.debug(
+            "Reaction update user_id=%s chat_id=%s message_id=%s emojis=%s",
+            reaction.user.id,
+            reaction.chat.id,
+            reaction.message_id,
+            sorted(emojis),
+        )
         if not emojis:
             return
-        delete_emoji = str(cfg.get("moderation", {}).get("delete_reaction_emoji", "✍️"))
+        delete_emoji = _normalize_reaction_emoji(
+            str(cfg.get("moderation", {}).get("delete_reaction_emoji", "✍️"))
+        )
         if delete_emoji in emojis:
             handled = await _handle_mod_delete_reaction(context, repo, cfg, reaction)
             if handled:
@@ -858,8 +869,12 @@ def _reaction_emojis(reactions: Any) -> set[str]:
             kind = getattr(item, "type", None)
             emoji = getattr(kind, "emoji", None)
         if emoji is not None:
-            result.add(str(emoji))
+            result.add(_normalize_reaction_emoji(str(emoji)))
     return result
+
+
+def _normalize_reaction_emoji(emoji: str) -> str:
+    return unicodedata.normalize("NFC", emoji).replace("\ufe0f", "")
 
 
 async def _apply_upvote(context: ContextTypes.DEFAULT_TYPE, repo: Any, cfg: dict[str, Any], message_id: int, sender_id: int, voter: Any) -> None:
