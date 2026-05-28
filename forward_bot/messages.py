@@ -114,6 +114,8 @@ class Messages:
     TRIPCODE_TOGGLE_DISABLED = "Persistent tripcode toggles are disabled."
     POTENTIALLY_UNWANTED_FILTER_LABEL = "Potentially unwanted filtering"
     VOTE_BUTTON_LABEL = "Vote button"
+    DUPLICATE_FILTER_LABEL = "Duplicate media filtering"
+    MOD_EXEMPT_SETTING = "Note: moderators and admins are exempt from this setting so moderation visibility is preserved."
     CREDIT_TARGET_NOT_FOUND = "Target user not found."
     CREDIT_TRANSFER_INVALID_USER = "Transfer failed (invalid user)."
     GAMBLE_USAGE = "Usage: /gamble <amount>"

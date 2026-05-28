@@ -30,6 +30,12 @@ async def migrate_if_needed(db: aiosqlite.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_media_hashes_created_at ON media_hashes(created_at)"
     )
     await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_hashes_hash ON media_hashes(hash)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_hashes_hash_created_at ON media_hashes(hash, created_at)"
+    )
+    await db.execute(
         "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('media_hashes_drop_message_id')"
     )
     await db.commit()

@@ -35,11 +35,13 @@ class User:
     is_banned: bool
     is_moderator: bool
     is_admin: bool
+    created_at: str | None
     last_activity: str | None
     confirmation_enabled: bool
     votes_enabled: bool
     vote_buttons_enabled: bool
     hide_potentially_unwanted: bool
+    filter_duplicates: bool
     fights_enabled: bool
     sign_enabled: bool
     tripcode_enabled: bool
@@ -53,7 +55,30 @@ class Repository:
     def __init__(self, db_path: str, transient_ttl_seconds: int = 259200) -> None:
         self.db_path = db_path
         self.transient = TransientStore(ttl_seconds=transient_ttl_seconds)
+        self._user_cache: dict[int, User] = {}
+        self._all_users_loaded = False
+        self._blocks_cache_loaded = False
+        self._blocks_by_blocker: dict[int, set[int]] = {}
+        self._media_hash_cache_loaded = False
+        self._media_hash_first_seen: dict[str, str] = {}
+        self._media_hash_latest_seen: dict[str, str] = {}
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def _cache_user(self, user: User) -> User:
+        self._user_cache[user.telegram_id] = user
+        return user
+
+    async def _refresh_user_cache(self, telegram_id: int) -> User | None:
+        conn = await self._conn()
+        async with conn:
+            row = await (await conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))).fetchone()
+        if row is None:
+            self._user_cache.pop(telegram_id, None)
+            return None
+        return self._cache_user(self._to_user(row))
+
+    def _invalidate_all_users_cache(self) -> None:
+        self._all_users_loaded = False
 
     async def _conn(self) -> ManagedConnection:
         conn = await aiosqlite.connect(self.db_path)
@@ -92,7 +117,7 @@ class Repository:
             )
             await conn.commit()
             row = await (await conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))).fetchone()
-        return self._to_user(row)
+        return self._cache_user(self._to_user(row))
 
     async def sync_admin_ids(self, admin_ids: set[int]) -> None:
         conn = await self._conn()
@@ -107,6 +132,8 @@ class Repository:
                 tuple(admin_ids),
             )
             await conn.commit()
+        self._user_cache.clear()
+        self._invalidate_all_users_cache()
 
     async def update_started(self, telegram_id: int, started: bool) -> None:
         conn = await self._conn()
@@ -116,6 +143,7 @@ class Repository:
                 (1 if started else 0, telegram_id),
             )
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def mark_left(self, telegram_id: int) -> None:
         conn = await self._conn()
@@ -125,12 +153,14 @@ class Repository:
                 (telegram_id,),
             )
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def touch_activity(self, telegram_id: int) -> None:
         conn = await self._conn()
         async with conn:
             await conn.execute("UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE telegram_id = ?", (telegram_id,))
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def get_user_by_username(self, username: str) -> User | None:
         conn = await self._conn()
@@ -141,13 +171,18 @@ class Repository:
                     (username,),
                 )
             ).fetchone()
-        return None if row is None else self._to_user(row)
+        return None if row is None else self._cache_user(self._to_user(row))
 
     async def list_users(self) -> list[User]:
+        if self._all_users_loaded:
+            return list(self._user_cache.values())
         conn = await self._conn()
         async with conn:
             rows = await (await conn.execute("SELECT * FROM users")).fetchall()
-        return [self._to_user(row) for row in rows]
+        users = [self._to_user(row) for row in rows]
+        self._user_cache = {user.telegram_id: user for user in users}
+        self._all_users_loaded = True
+        return users
 
     async def user_counts(self, inactive_days: int) -> dict[str, int]:
         conn = await self._conn()
@@ -183,32 +218,55 @@ class Repository:
         }
 
     async def get_user(self, telegram_id: int) -> User | None:
+        cached = self._user_cache.get(telegram_id)
+        if cached is not None:
+            return cached
         conn = await self._conn()
         async with conn:
             row = await (await conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))).fetchone()
-        return None if row is None else self._to_user(row)
+        return None if row is None else self._cache_user(self._to_user(row))
 
     async def list_eligible_recipients(self, sender_id: int) -> list[User]:
+        users = await self.list_users()
+        await self._ensure_blocks_cache()
+        recipients = [
+            user
+            for user in users
+            if user.has_started
+            and not user.is_banned
+            and user.telegram_id != sender_id
+            and (
+                user.is_moderator
+                or user.is_admin
+                or sender_id not in self._blocks_by_blocker.get(user.telegram_id, set())
+            )
+        ]
+        return sorted(
+            recipients,
+            key=lambda user: self._sort_activity(user.last_activity),
+            reverse=True,
+        )
+
+    async def _ensure_blocks_cache(self) -> None:
+        if self._blocks_cache_loaded:
+            return
         conn = await self._conn()
         async with conn:
-            rows = await (
-                await conn.execute(
-                    """
-                    SELECT u.*
-                    FROM users u
-                    WHERE u.has_started = 1
-                      AND u.is_banned = 0
-                      AND u.telegram_id != ?
-                      AND NOT EXISTS (
-                        SELECT 1 FROM blocks b
-                        WHERE b.blocker_id = u.telegram_id AND b.blocked_id = ?
-                      )
-                    ORDER BY COALESCE(u.last_activity, '1970-01-01') DESC
-                    """,
-                    (sender_id, sender_id),
-                )
-            ).fetchall()
-        return [self._to_user(row) for row in rows]
+            rows = await (await conn.execute("SELECT blocker_id, blocked_id FROM blocks")).fetchall()
+        blocks: dict[int, set[int]] = {}
+        for row in rows:
+            blocks.setdefault(int(row["blocker_id"]), set()).add(int(row["blocked_id"]))
+        self._blocks_by_blocker = blocks
+        self._blocks_cache_loaded = True
+
+    @staticmethod
+    def _sort_activity(raw: str | None) -> datetime:
+        if raw is None:
+            return datetime.fromtimestamp(0, timezone.utc)
+        try:
+            return as_utc(raw)
+        except ValueError:
+            return datetime.fromtimestamp(0, timezone.utc)
 
     async def create_message(
         self,
@@ -222,6 +280,11 @@ class Repository:
         reply_to_message_id: int | None = None,
         parse_mode: str | None = None,
         thumbnail_file_id: str | None = None,
+        is_forward: bool = False,
+        forward_from_chat_id: int | None = None,
+        forward_message_id: int | None = None,
+        media_hash: str | None = None,
+        media_hash_first_seen_at: str | None = None,
     ) -> int:
         message_id = self.transient.next_message_id()
         self.transient.messages[message_id] = {
@@ -232,6 +295,11 @@ class Repository:
             "media_file_id": media_file_id,
             "media_kind": media_kind,
             "thumbnail_file_id": thumbnail_file_id,
+            "is_forward": 1 if is_forward else 0,
+            "forward_from_chat_id": forward_from_chat_id,
+            "forward_message_id": forward_message_id,
+            "media_hash": media_hash,
+            "media_hash_first_seen_at": media_hash_first_seen_at,
             "source_chat_id": source_chat_id,
             "source_message_id": source_message_id,
             "reply_to_message_id": reply_to_message_id,
@@ -246,6 +314,8 @@ class Repository:
             "reverted": 0,
             "created_at": self.transient.iso_now(),
         }
+        if source_chat_id is not None and source_message_id is not None:
+            self.transient.source_message_index[(int(source_chat_id), int(source_message_id))] = message_id
         return message_id
 
     async def latest_message_by_sender(self, sender_id: int) -> dict[str, Any] | None:
@@ -258,13 +328,13 @@ class Repository:
 
     async def message_by_source(self, source_chat_id: int, source_message_id: int) -> dict[str, Any] | None:
         self.transient.cleanup()
-        rows = [
-            row for row in self.transient.messages.values()
-            if row["source_chat_id"] == source_chat_id
-            and row["source_message_id"] == source_message_id
-            and not bool(row["is_deleted"])
-        ]
-        return max(rows, key=lambda r: int(r["id"]), default=None)
+        message_id = self.transient.source_message_index.get((source_chat_id, source_message_id))
+        if message_id is None:
+            return None
+        row = self.transient.messages.get(message_id)
+        if row is None or bool(row["is_deleted"]):
+            return None
+        return row
 
     async def set_message_tag(self, message_id: int, tag: str, reason: str | None) -> None:
         row = self.transient.messages.get(message_id)
@@ -273,24 +343,77 @@ class Repository:
             row["tag_reason"] = reason
 
     async def recent_media_hashes(self, since_days: int) -> list[str]:
+        await self._ensure_media_hash_cache()
+        if since_days < 0:
+            return list(self._media_hash_first_seen)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(since_days))
+        return [
+            hash_value
+            for hash_value, latest_seen in self._media_hash_latest_seen.items()
+            if self._parse_cached_time(latest_seen) >= cutoff
+        ]
+
+    async def add_media_hash(self, hash_value: str) -> None:
+        await self._ensure_media_hash_cache()
+        created_at = datetime.now(timezone.utc).isoformat()
+        conn = await self._conn()
+        async with conn:
+            await conn.execute(
+                "INSERT INTO media_hashes (hash, created_at) VALUES (?, ?)",
+                (hash_value, created_at),
+            )
+            await conn.commit()
+        self._media_hash_first_seen.setdefault(hash_value, created_at)
+        self._media_hash_latest_seen[hash_value] = created_at
+
+    async def first_media_hash_seen_at(self, hash_value: str) -> str | None:
+        await self._ensure_media_hash_cache()
+        return self._media_hash_first_seen.get(hash_value)
+
+    async def media_hash_seen_within(self, hash_value: str, days: int) -> bool:
+        await self._ensure_media_hash_cache()
+        if days < 0:
+            return hash_value in self._media_hash_first_seen
+        latest_seen = self._media_hash_latest_seen.get(hash_value)
+        if latest_seen is None:
+            return False
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
+        return self._parse_cached_time(latest_seen) >= cutoff
+
+    async def _ensure_media_hash_cache(self) -> None:
+        if self._media_hash_cache_loaded:
+            return
         conn = await self._conn()
         async with conn:
             rows = await (
                 await conn.execute(
-                    "SELECT hash FROM media_hashes WHERE created_at >= datetime('now', ?)",
-                    (f"-{int(since_days)} days",),
+                    """
+                    SELECT hash, MIN(created_at) AS first_seen, MAX(created_at) AS latest_seen
+                    FROM media_hashes
+                    GROUP BY hash
+                    """
                 )
             ).fetchall()
-        return [str(r["hash"]) for r in rows]
+        self._media_hash_first_seen = {
+            str(row["hash"]): str(row["first_seen"]) for row in rows
+        }
+        self._media_hash_latest_seen = {
+            str(row["hash"]): str(row["latest_seen"]) for row in rows
+        }
+        self._media_hash_cache_loaded = True
 
-    async def add_media_hash(self, hash_value: str) -> None:
-        conn = await self._conn()
-        async with conn:
-            await conn.execute(
-                "INSERT INTO media_hashes (hash) VALUES (?)",
-                (hash_value,),
-            )
-            await conn.commit()
+    @staticmethod
+    def _parse_cached_time(raw: str) -> datetime:
+        try:
+            return as_utc(raw)
+        except ValueError:
+            return datetime.fromtimestamp(0, timezone.utc)
+
+    async def set_message_media_hash(self, message_id: int, hash_value: str, first_seen_at: str | None) -> None:
+        row = self.transient.messages.get(message_id)
+        if row is not None:
+            row["media_hash"] = hash_value
+            row["media_hash_first_seen_at"] = first_seen_at
 
     async def prune_media_hashes(self, older_than_days: int) -> None:
         conn = await self._conn()
@@ -310,6 +433,11 @@ class Repository:
         if row is not None:
             row["is_deleted"] = 1
             row["deletion_reason"] = reason
+            if row.get("source_chat_id") is not None and row.get("source_message_id") is not None:
+                self.transient.source_message_index.pop(
+                    (int(row["source_chat_id"]), int(row["source_message_id"])),
+                    None,
+                )
             self.transient.removals.append(
                 {
                     "message_id": message_id,
@@ -360,11 +488,7 @@ class Repository:
         telegram_message_id: int,
         is_blurred: bool = False,
     ) -> None:
-        if any(
-            int(row["recipient_id"]) == recipient_id and int(
-                row["telegram_message_id"]) == telegram_message_id
-            for row in self.transient.deliveries.values()
-        ):
+        if (recipient_id, telegram_message_id) in self.transient.delivery_by_recipient_message:
             return
         delivery_id = self.transient.next_delivery_id()
         self.transient.deliveries[delivery_id] = {
@@ -378,10 +502,18 @@ class Repository:
             "tombstone_kind": None,
             "created_at": self.transient.iso_now(),
         }
+        self.transient.delivery_by_recipient_message[(recipient_id, telegram_message_id)] = delivery_id
+        self.transient.delivery_ids_by_message.setdefault(message_id, set()).add(delivery_id)
+        self.transient.delivery_ids_by_message_recipient.setdefault((message_id, recipient_id), []).append(delivery_id)
 
     async def list_deliveries_for_message(self, message_id: int) -> list[dict[str, Any]]:
         self.transient.cleanup()
-        return [row for row in self.transient.deliveries.values() if int(row["message_id"]) == message_id]
+        delivery_ids = self.transient.delivery_ids_by_message.get(message_id, set())
+        return [
+            row
+            for delivery_id in sorted(delivery_ids)
+            if (row := self.transient.deliveries.get(delivery_id)) is not None
+        ]
 
     async def add_moderation_note(
         self,
@@ -454,20 +586,8 @@ class Repository:
 
     async def sender_by_delivery(self, recipient_id: int, replied_message_id: int) -> tuple[int, int] | None:
         self.transient.cleanup()
-        row = next(
-            (
-                d for d in self.transient.deliveries.values()
-                if int(d["recipient_id"]) == recipient_id
-                and (
-                    int(d["telegram_message_id"]) == replied_message_id
-                    or (
-                        d.get("tombstone_message_id") is not None
-                        and int(d["tombstone_message_id"]) == replied_message_id
-                    )
-                )
-            ),
-            None,
-        )
+        delivery_id = self.transient.delivery_by_recipient_message.get((recipient_id, replied_message_id))
+        row = None if delivery_id is None else self.transient.deliveries.get(delivery_id)
         if row is None:
             return None
         message = self.transient.messages.get(int(row["message_id"]))
@@ -486,8 +606,9 @@ class Repository:
         ):
             return int(message["source_message_id"])
         rows = [
-            row for row in self.transient.deliveries.values()
-            if int(row["message_id"]) == message_id and int(row["recipient_id"]) == recipient_id and not bool(row["deleted"])
+            row
+            for delivery_id in self.transient.delivery_ids_by_message_recipient.get((message_id, recipient_id), [])
+            if (row := self.transient.deliveries.get(delivery_id)) is not None and not bool(row["deleted"])
         ]
         if not rows:
             return None
@@ -496,8 +617,9 @@ class Repository:
     async def delivery_for_recipient(self, message_id: int, recipient_id: int) -> dict[str, Any] | None:
         self.transient.cleanup()
         rows = [
-            row for row in self.transient.deliveries.values()
-            if int(row["message_id"]) == message_id and int(row["recipient_id"]) == recipient_id
+            row
+            for delivery_id in self.transient.delivery_ids_by_message_recipient.get((message_id, recipient_id), [])
+            if (row := self.transient.deliveries.get(delivery_id)) is not None
         ]
         if not rows:
             return None
@@ -509,8 +631,9 @@ class Repository:
         if direct is not None:
             return direct
         rows = [
-            row for row in self.transient.deliveries.values()
-            if int(row["message_id"]) == message_id and int(row["recipient_id"]) == recipient_id
+            row
+            for delivery_id in self.transient.delivery_ids_by_message_recipient.get((message_id, recipient_id), [])
+            if (row := self.transient.deliveries.get(delivery_id)) is not None
         ]
         if not rows:
             return None
@@ -539,6 +662,7 @@ class Repository:
                 (1 if enabled else 0, telegram_id),
             )
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def set_votes_enabled(self, telegram_id: int, enabled: bool) -> None:
         conn = await self._conn()
@@ -548,6 +672,7 @@ class Repository:
                 (1 if enabled else 0, telegram_id),
             )
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def set_vote_buttons_enabled(self, telegram_id: int, enabled: bool) -> None:
         conn = await self._conn()
@@ -557,6 +682,7 @@ class Repository:
                 (1 if enabled else 0, telegram_id),
             )
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def set_about_seen(self, telegram_id: int, seen: bool = True) -> None:
         conn = await self._conn()
@@ -566,6 +692,7 @@ class Repository:
                 (1 if seen else 0, telegram_id),
             )
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def set_hide_potentially_unwanted(self, telegram_id: int, enabled: bool) -> None:
         conn = await self._conn()
@@ -575,6 +702,17 @@ class Repository:
                 (1 if enabled else 0, telegram_id),
             )
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
+
+    async def set_filter_duplicates(self, telegram_id: int, enabled: bool) -> None:
+        conn = await self._conn()
+        async with conn:
+            await conn.execute(
+                "UPDATE users SET filter_duplicates = ? WHERE telegram_id = ?",
+                (1 if enabled else 0, telegram_id),
+            )
+            await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def set_fights_enabled(self, telegram_id: int, enabled: bool) -> None:
         conn = await self._conn()
@@ -584,6 +722,7 @@ class Repository:
                 (1 if enabled else 0, telegram_id),
             )
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def set_sign_enabled(self, telegram_id: int, enabled: bool) -> None:
         conn = await self._conn()
@@ -593,6 +732,7 @@ class Repository:
                 (1 if enabled else 0, telegram_id),
             )
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def set_tripcode(self, telegram_id: int, enabled: bool, name: str | None, hash_value: str | None) -> None:
         conn = await self._conn()
@@ -606,6 +746,7 @@ class Repository:
                 (1 if enabled else 0, name, hash_value, telegram_id),
             )
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def set_moderator(self, telegram_id: int, enabled: bool) -> None:
         conn = await self._conn()
@@ -615,12 +756,14 @@ class Repository:
                 (1 if enabled else 0, telegram_id),
             )
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def set_banned(self, telegram_id: int, enabled: bool) -> None:
         conn = await self._conn()
         async with conn:
             await conn.execute("UPDATE users SET is_banned = ? WHERE telegram_id = ?", (1 if enabled else 0, telegram_id))
             await conn.commit()
+        await self._refresh_user_cache(telegram_id)
 
     async def list_banned_users(self) -> list[User]:
         conn = await self._conn()
@@ -636,6 +779,8 @@ class Repository:
                 (blocker_id, blocked_id),
             )
             await conn.commit()
+        if self._blocks_cache_loaded:
+            self._blocks_by_blocker.setdefault(blocker_id, set()).add(blocked_id)
 
     async def remove_last_block(self, blocker_id: int) -> int | None:
         conn = await self._conn()
@@ -654,6 +799,12 @@ class Repository:
                 (blocker_id, blocked_id),
             )
             await conn.commit()
+        if self._blocks_cache_loaded:
+            blocked = self._blocks_by_blocker.get(blocker_id)
+            if blocked is not None:
+                blocked.discard(blocked_id)
+                if not blocked:
+                    self._blocks_by_blocker.pop(blocker_id, None)
         return blocked_id
 
     async def set_cooldown(self, user_id: int, until_at_iso: str, reason: str, applied_by: int) -> None:
@@ -741,6 +892,7 @@ class Repository:
         async with conn:
             await conn.execute("UPDATE users SET warning_count = warning_count + 1 WHERE telegram_id = ?", (user_id,))
             await conn.commit()
+        await self._refresh_user_cache(user_id)
 
     async def warning_count(self, user_id: int) -> int:
         conn = await self._conn()
@@ -767,6 +919,7 @@ class Repository:
         async with conn:
             await conn.execute(f"UPDATE users SET {col} = {col} + 1 WHERE telegram_id = ?", (sender_id,))
             await conn.commit()
+        await self._refresh_user_cache(sender_id)
 
     async def adjust_credits(self, user_id: int, amount: float, reason: str) -> float:
         amount = round_credit(amount)
@@ -779,9 +932,11 @@ class Repository:
             )
             row = await (await conn.execute("SELECT credits FROM users WHERE telegram_id = ?", (user_id,))).fetchone()
             await conn.commit()
+        await self._refresh_user_cache(user_id)
         return round_credit(float(row["credits"]))
 
     async def positive_credits_today(self, user_id: int, reason: str) -> float:
+        start_of_day = datetime.now(timezone.utc).strftime("%Y-%m-%d 00:00:00")
         conn = await self._conn()
         async with conn:
             row = await (
@@ -792,9 +947,9 @@ class Repository:
                     WHERE user_id = ?
                       AND reason = ?
                       AND amount > 0
-                      AND date(created_at) = date('now')
+                      AND created_at >= ?
                     """,
-                    (user_id, reason),
+                    (user_id, reason, start_of_day),
                 )
             ).fetchone()
         return float(row["total"] or 0.0)
@@ -824,6 +979,8 @@ class Repository:
                 (target_id, amount, f"transfer_from:{sender_id}"),
             )
             await conn.commit()
+        await self._refresh_user_cache(sender_id)
+        await self._refresh_user_cache(target_id)
         return True
 
     async def list_top_credits(self, since_days: int | None, limit: int = 10) -> list[aiosqlite.Row]:
@@ -917,6 +1074,7 @@ class Repository:
                 (user_id, -amount, f"daily_tax:{tax_date}"),
             )
             await conn.commit()
+        await self._refresh_user_cache(user_id)
         return True
 
     async def mark_delivery_tombstoned(
@@ -930,6 +1088,10 @@ class Repository:
             row["deleted"] = 1
             row["tombstone_message_id"] = tombstone_message_id
             row["tombstone_kind"] = tombstone_kind
+            if tombstone_message_id is not None:
+                self.transient.delivery_by_recipient_message[
+                    (int(row["recipient_id"]), int(tombstone_message_id))
+                ] = delivery_id
         return True
 
     async def net_issuance_since_days(self, days: int) -> float:
@@ -1252,6 +1414,7 @@ class Repository:
             is_banned=bool(row["is_banned"]),
             is_moderator=bool(row["is_moderator"]),
             is_admin=bool(row["is_admin"]),
+            created_at=row["created_at"] if "created_at" in row.keys() else None,
             last_activity=row["last_activity"],
             confirmation_enabled=bool(row["confirmation_enabled"]),
             votes_enabled=bool(row["votes_enabled"]
@@ -1260,6 +1423,8 @@ class Repository:
                 row["vote_buttons_enabled"]) if "vote_buttons_enabled" in row.keys() else True,
             hide_potentially_unwanted=bool(
                 row["hide_potentially_unwanted"]) if "hide_potentially_unwanted" in row.keys() else False,
+            filter_duplicates=bool(
+                row["filter_duplicates"]) if "filter_duplicates" in row.keys() else False,
             fights_enabled=bool(
                 row["fights_enabled"]) if "fights_enabled" in row.keys() else True,
             sign_enabled=bool(row["sign_enabled"]

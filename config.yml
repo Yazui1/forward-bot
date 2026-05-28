@@ -116,6 +116,7 @@ vote_to_remove:
 
 moderation:
   default_cooldown_seconds: 1800
+  delete_reaction_emoji: "✍️"
 
 fights:
   enabled: true
@@ -135,8 +136,7 @@ onboarding:
 
 duplicates:
   enabled: true
-  retention_days: 3
-  similarity_threshold: 0.95
+  sender_block_retention_days: 3
 
 saucenao:
   enabled: true

@@ -6,6 +6,7 @@ from forward_bot.db.migrations.legacy_secretlounge import migrate_if_needed as m
 from forward_bot.db.migrations.media_hashes_drop_message_id import migrate_if_needed as migrate_media_hashes_drop_message_id
 from forward_bot.db.migrations.user_potentially_unwanted import migrate_if_needed as migrate_user_potentially_unwanted
 from forward_bot.db.migrations.user_start_and_vote_buttons import migrate_if_needed as migrate_user_start_and_vote_buttons
+from forward_bot.db.migrations.user_duplicate_filter import migrate_if_needed as migrate_user_duplicate_filter
 
 
 SCHEMA_SQL = """
@@ -27,6 +28,7 @@ CREATE TABLE IF NOT EXISTS users (
     votes_enabled INTEGER NOT NULL DEFAULT 1,
     vote_buttons_enabled INTEGER NOT NULL DEFAULT 1,
     hide_potentially_unwanted INTEGER NOT NULL DEFAULT 0,
+    filter_duplicates INTEGER NOT NULL DEFAULT 0,
     fights_enabled INTEGER NOT NULL DEFAULT 1,
     sign_enabled INTEGER NOT NULL DEFAULT 0,
     tripcode_enabled INTEGER NOT NULL DEFAULT 0,
@@ -59,6 +61,7 @@ CREATE TABLE IF NOT EXISTS credit_transactions (
 );
 CREATE INDEX IF NOT EXISTS idx_credit_tx_user ON credit_transactions(user_id);
 CREATE INDEX IF NOT EXISTS idx_credit_tx_time ON credit_transactions(created_at);
+CREATE INDEX IF NOT EXISTS idx_credit_tx_user_reason_time ON credit_transactions(user_id, reason, created_at);
 
 CREATE TABLE IF NOT EXISTS credit_tax_runs (
     user_id INTEGER NOT NULL,
@@ -110,7 +113,9 @@ CREATE TABLE IF NOT EXISTS media_hashes (
     hash TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_media_hashes_hash ON media_hashes(hash);
 CREATE INDEX IF NOT EXISTS idx_media_hashes_created_at ON media_hashes(created_at);
+CREATE INDEX IF NOT EXISTS idx_media_hashes_hash_created_at ON media_hashes(hash, created_at);
 
 CREATE TABLE IF NOT EXISTS about_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -128,4 +133,5 @@ async def init_schema(db_path: str, global_salt: str = "") -> None:
         await migrate_media_hashes_drop_message_id(db)
         await migrate_user_potentially_unwanted(db)
         await migrate_user_start_and_vote_buttons(db)
+        await migrate_user_duplicate_filter(db)
         await db.commit()

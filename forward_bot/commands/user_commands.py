@@ -38,6 +38,8 @@ def register_user_commands(app: Any, repo: Any, cfg: dict[str, Any]) -> None:
         lambda cfg: "show/hide vote buttons on messages you receive")
     add("togglepotentiallyunwanted", _toggle_potentially_unwanted(repo),
         lambda cfg: "hide/show potentially unwanted messages")
+    add("toggledups", _toggle_duplicates(repo),
+        lambda cfg: "hide/show duplicate media you already saw")
     add("togglesign", _toggle_sign(repo, cfg),
         lambda cfg: "enable/disable persistent signed style")
     add("toggletripcode", _toggle_tripcode(repo, cfg),
@@ -269,6 +271,24 @@ def _toggle_potentially_unwanted(repo: Any):
     return handler
 
 
+def _toggle_duplicates(repo: Any):
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.message is None or update.effective_user is None:
+            return
+        user = await repo.get_user(update.effective_user.id)
+        if user is None:
+            return
+        new_state = not user.filter_duplicates
+        await repo.set_filter_duplicates(user.telegram_id, new_state)
+        await repo.touch_activity(user.telegram_id)
+        text = Msg.enabled(Msg.DUPLICATE_FILTER_LABEL, new_state)
+        if user.is_moderator or user.is_admin:
+            text = f"{text}\n{Msg.MOD_EXEMPT_SETTING}"
+        await update.message.reply_text(text)
+
+    return handler
+
+
 def _toggle_sign(repo: Any, cfg: dict[str, Any]):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None or update.effective_user is None:
@@ -315,9 +335,13 @@ def _block(repo: Any):
         if sender_id == update.effective_user.id:
             await update.message.reply_text(Msg.CANNOT_BLOCK_SELF)
             return
+        user = await repo.get_user(update.effective_user.id)
         await repo.add_block(update.effective_user.id, sender_id)
         await repo.touch_activity(update.effective_user.id)
-        await update.message.reply_text(Msg.BLOCKED_SENDER)
+        text = Msg.BLOCKED_SENDER
+        if user is not None and (user.is_moderator or user.is_admin):
+            text = f"{text}\n{Msg.MOD_EXEMPT_SETTING}"
+        await update.message.reply_text(text)
 
     return handler
 

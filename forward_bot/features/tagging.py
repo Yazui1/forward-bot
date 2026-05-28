@@ -8,7 +8,7 @@ from typing import Any
 
 from PIL import Image
 
-from forward_bot.features.duplicate_media import compute_phash, similarity
+from forward_bot.features.duplicate_media import compute_media_hash
 
 logger = logging.getLogger(__name__)
 
@@ -234,20 +234,23 @@ class TaggingPipeline:
         if media_info is None or not getattr(media_info, "is_image_like", False):
             return None
 
-        retention_days = int(cfg.get("duplicates", {}).get("retention_days", 3))
-        threshold = float(cfg.get("duplicates", {}).get("similarity_threshold", 0.9))
+        sender_block_days = int(cfg.get("duplicates", {}).get("sender_block_retention_days", 3))
         try:
-            await repo.prune_media_hashes(retention_days)
-            phash = compute_phash(media_bytes)
-            for hash_value in await repo.recent_media_hashes(retention_days):
-                if similarity(phash, int(hash_value, 16)) >= threshold:
-                    logger.info(
-                        "Duplicate media detected message_id=%s media_kind=%s",
-                        message_id,
-                        media_kind,
-                    )
+            hash_value = compute_media_hash(media_bytes)
+            first_seen_at = await repo.first_media_hash_seen_at(hash_value)
+            if first_seen_at is not None:
+                await repo.set_message_media_hash(message_id, hash_value, first_seen_at)
+                logger.info(
+                    "Duplicate media detected message_id=%s media_kind=%s",
+                    message_id,
+                    media_kind,
+                )
+                if await repo.media_hash_seen_within(hash_value, sender_block_days):
                     return TagResult("DUPLICATE", "duplicate-media")
-            await repo.add_media_hash(f"{phash:016x}")
+                await repo.add_media_hash(hash_value)
+                return None
+            await repo.add_media_hash(hash_value)
+            await repo.set_message_media_hash(message_id, hash_value, None)
         except Exception:
             logger.exception("Failed duplicate media check message_id=%s", message_id)
         return None

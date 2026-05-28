@@ -28,6 +28,10 @@ class TransientStore:
     fights: dict[int, dict[str, Any]] = field(default_factory=dict)
     sauce_cache: dict[int, dict[str, Any]] = field(default_factory=dict)
     sauce_usage: dict[int, list[str]] = field(default_factory=dict)
+    source_message_index: dict[tuple[int, int], int] = field(default_factory=dict)
+    delivery_by_recipient_message: dict[tuple[int, int], int] = field(default_factory=dict)
+    delivery_ids_by_message: dict[int, set[int]] = field(default_factory=dict)
+    delivery_ids_by_message_recipient: dict[tuple[int, int], list[int]] = field(default_factory=dict)
 
     def cleanup(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.ttl_seconds)
@@ -55,6 +59,7 @@ class TransientStore:
             self.remove_votes = {
                 key: ts for key, ts in self.remove_votes.items() if key[0] not in expired_messages
             }
+            self._rebuild_message_delivery_indexes()
 
         self.whispers = {wid: row for wid, row in self.whispers.items() if not expired(row)}
         self.whisper_deliveries = {
@@ -80,6 +85,27 @@ class TransientStore:
             if kept:
                 cleaned_usage[user_id] = kept
         self.sauce_usage = cleaned_usage
+
+    def _rebuild_message_delivery_indexes(self) -> None:
+        self.source_message_index = {}
+        for message_id, row in self.messages.items():
+            chat_id = row.get("source_chat_id")
+            telegram_message_id = row.get("source_message_id")
+            if chat_id is not None and telegram_message_id is not None and not bool(row.get("is_deleted")):
+                self.source_message_index[(int(chat_id), int(telegram_message_id))] = int(message_id)
+
+        self.delivery_by_recipient_message = {}
+        self.delivery_ids_by_message = {}
+        self.delivery_ids_by_message_recipient = {}
+        for delivery_id, row in self.deliveries.items():
+            recipient_id = int(row["recipient_id"])
+            telegram_message_id = int(row["telegram_message_id"])
+            message_id = int(row["message_id"])
+            self.delivery_by_recipient_message[(recipient_id, telegram_message_id)] = int(delivery_id)
+            if row.get("tombstone_message_id") is not None:
+                self.delivery_by_recipient_message[(recipient_id, int(row["tombstone_message_id"]))] = int(delivery_id)
+            self.delivery_ids_by_message.setdefault(message_id, set()).add(int(delivery_id))
+            self.delivery_ids_by_message_recipient.setdefault((message_id, recipient_id), []).append(int(delivery_id))
 
     def next_message_id(self) -> int:
         self.cleanup()

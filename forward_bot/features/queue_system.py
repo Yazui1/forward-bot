@@ -31,6 +31,11 @@ class DeliveryItem:
     media_kind: str | None
     thumbnail_file_id: str | None
     is_system: bool
+    is_forward: bool = False
+    forward_from_chat_id: int | None = None
+    forward_message_id: int | None = None
+    media_hash: str | None = None
+    media_hash_first_seen_at: str | None = None
     reply_to_message_id: int | None = None
     include_remove_button: bool = False
     parse_mode: str | None = None
@@ -76,6 +81,11 @@ class DeliveryQueue:
         include_remove_button: bool = False,
         parse_mode: str | None = None,
         urgent: bool | None = None,
+        is_forward: bool = False,
+        forward_from_chat_id: int | None = None,
+        forward_message_id: int | None = None,
+        media_hash: str | None = None,
+        media_hash_first_seen_at: str | None = None,
     ) -> None:
         is_urgent = is_system if urgent is None else urgent
         logger.debug(
@@ -102,6 +112,11 @@ class DeliveryQueue:
             include_remove_button=include_remove_button,
             parse_mode=parse_mode,
             urgent=is_urgent,
+            is_forward=is_forward,
+            forward_from_chat_id=forward_from_chat_id,
+            forward_message_id=forward_message_id,
+            media_hash=media_hash,
+            media_hash_first_seen_at=media_hash_first_seen_at,
         )
         if is_urgent:
             await self._enqueue_urgent_items(items)
@@ -123,6 +138,11 @@ class DeliveryQueue:
         include_remove_button: bool = False,
         parse_mode: str | None = None,
         urgent: bool = False,
+        is_forward: bool = False,
+        forward_from_chat_id: int | None = None,
+        forward_message_id: int | None = None,
+        media_hash: str | None = None,
+        media_hash_first_seen_at: str | None = None,
     ) -> list[DeliveryItem]:
         items: list[DeliveryItem] = []
         for user in recipients:
@@ -137,6 +157,11 @@ class DeliveryQueue:
                 media_kind=media_kind,
                 thumbnail_file_id=thumbnail_file_id,
                 is_system=is_system,
+                is_forward=is_forward,
+                forward_from_chat_id=forward_from_chat_id,
+                forward_message_id=forward_message_id,
+                media_hash=media_hash,
+                media_hash_first_seen_at=media_hash_first_seen_at,
                 reply_to_message_id=reply_to_message_id,
                 include_remove_button=include_remove_button,
                 parse_mode=parse_mode,
@@ -317,6 +342,14 @@ class DeliveryQueue:
                 bool(recipient and recipient.has_started),
             )
             return
+        if self._drop_due_to_duplicate_filter(recipient, item):
+            logger.debug(
+                "Dropped due to duplicate filter message_id=%s recipient_id=%s media_hash=%s",
+                item.message_id,
+                item.recipient_id,
+                item.media_hash,
+            )
+            return
         if await self._drop_due_to_inactivity(bot, recipient, item):
             logger.debug("Dropped due to inactivity message_id=%s recipient_id=%s",
                          item.message_id, item.recipient_id)
@@ -339,7 +372,14 @@ class DeliveryQueue:
             if reply_to_message_id is None:
                 return
 
-        if item.content_type == "text":
+        if item.is_forward and item.forward_from_chat_id is not None and item.forward_message_id is not None:
+            is_blurred = False
+            sent = await bot.forward_message(
+                chat_id=item.recipient_id,
+                from_chat_id=item.forward_from_chat_id,
+                message_id=item.forward_message_id,
+            )
+        elif item.content_type == "text":
             is_blurred = False
             sent = await bot.send_message(
                 chat_id=item.recipient_id,
@@ -472,6 +512,22 @@ class DeliveryQueue:
             )
 
         await self.repo.add_delivery(item.message_id, item.recipient_id, sent.message_id, is_blurred=is_blurred)
+
+    def _drop_due_to_duplicate_filter(self, recipient: Any, item: DeliveryItem) -> bool:
+        if recipient.is_admin or recipient.is_moderator:
+            return False
+        if not recipient.filter_duplicates:
+            return False
+        if not item.media_hash or not item.media_hash_first_seen_at:
+            return False
+        if not recipient.created_at:
+            return True
+        try:
+            joined_at = as_utc(str(recipient.created_at))
+            first_seen_at = as_utc(str(item.media_hash_first_seen_at))
+        except ValueError:
+            return True
+        return joined_at <= first_seen_at
 
     async def _drop_due_to_inactivity(self, bot: Any, recipient: Any, item: DeliveryItem) -> bool:
         last_activity = recipient.last_activity

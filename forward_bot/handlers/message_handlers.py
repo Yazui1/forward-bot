@@ -320,6 +320,9 @@ async def _send_cooldown_message_to_mods(
         reply_to_message_id=reply_to_message_id,
         parse_mode=payload.get("parse_mode"),
         thumbnail_file_id=payload.get("thumbnail_file_id"),
+        is_forward=bool(payload.get("is_forward")),
+        forward_from_chat_id=payload.get("forward_from_chat_id"),
+        forward_message_id=payload.get("forward_message_id"),
     )
     await repo.set_message_tag(message_id, "OK", "cooldown-visible-to-mods")
     sender_user = await repo.get_user(sender_id)
@@ -348,6 +351,11 @@ async def _send_cooldown_message_to_mods(
         reply_to_message_id=reply_to_message_id,
         include_remove_button=False,
         parse_mode=payload.get("parse_mode"),
+        is_forward=bool(payload.get("is_forward")),
+        forward_from_chat_id=payload.get("forward_from_chat_id"),
+        forward_message_id=payload.get("forward_message_id"),
+        media_hash=payload.get("media_hash"),
+        media_hash_first_seen_at=payload.get("media_hash_first_seen_at"),
     )
 
 
@@ -477,6 +485,10 @@ async def _run_pipeline(
     if result.tag == "QUESTIONABLE" and user.confirmation_enabled:
         logger.debug(
             "Questionable message sender_id=%s message_id=%s", sender_id, message_id)
+        stored_message = await repo.get_message(message_id)
+        if stored_message is not None:
+            payload["media_hash"] = stored_message.get("media_hash")
+            payload["media_hash_first_seen_at"] = stored_message.get("media_hash_first_seen_at")
         state.set_confirmation(
             message_id,
             {"sender_id": sender_id, "username": username, "payload": payload,
@@ -493,6 +505,11 @@ async def _run_pipeline(
             reply_to_message_id=msg.message_id,
         )
         return
+
+    stored_message = await repo.get_message(message_id)
+    if stored_message is not None:
+        payload["media_hash"] = stored_message.get("media_hash")
+        payload["media_hash_first_seen_at"] = stored_message.get("media_hash_first_seen_at")
 
     await _distribute(
         message_id,
@@ -546,6 +563,11 @@ async def _distribute(
         reply_to_message_id=reply_to_message_id,
         include_remove_button=include_remove_button,
         parse_mode=payload.get("parse_mode"),
+        is_forward=bool(payload.get("is_forward")),
+        forward_from_chat_id=payload.get("forward_from_chat_id"),
+        forward_message_id=payload.get("forward_message_id"),
+        media_hash=payload.get("media_hash"),
+        media_hash_first_seen_at=payload.get("media_hash_first_seen_at"),
     )
     reward = float(
         cfg_value(
@@ -732,6 +754,11 @@ def _reaction_vote(repo: Any, cfg: dict[str, Any]):
         emojis = _reaction_emojis(getattr(reaction, "new_reaction", None))
         if not emojis:
             return
+        delete_emoji = str(cfg.get("moderation", {}).get("delete_reaction_emoji", "✍️"))
+        if delete_emoji in emojis:
+            handled = await _handle_mod_delete_reaction(context, repo, cfg, reaction)
+            if handled:
+                return
         vote_type = None
         if emojis & {"👍", "❤", "❤️", "💖", "💙", "💚", "💛", "🧡", "💜"}:
             vote_type = "upvote"
@@ -785,6 +812,42 @@ def _reaction_vote(repo: Any, cfg: dict[str, Any]):
             await _apply_downvote(context, repo, cfg, message_id, sender_id, voter)
 
     return handler
+
+
+async def _handle_mod_delete_reaction(context: ContextTypes.DEFAULT_TYPE, repo: Any, cfg: dict[str, Any], reaction: Any) -> bool:
+    moderator_id = int(reaction.user.id)
+    caller = await repo.get_user(moderator_id)
+    if caller is None or not (caller.is_moderator or caller.is_admin):
+        return False
+    lookup = await repo.sender_by_delivery(moderator_id, int(reaction.message_id))
+    if lookup is None:
+        try:
+            await context.bot.send_message(chat_id=moderator_id, text=Msg.MESSAGE_NOT_IN_CACHE)
+        except Exception:
+            pass
+        return True
+    message_id, sender_id = lookup
+    if await repo.get_message(message_id) is None:
+        try:
+            await context.bot.send_message(chat_id=moderator_id, text=Msg.MESSAGE_NOT_IN_CACHE)
+        except Exception:
+            pass
+        return True
+    await remove_message_with_tombstones(
+        context,
+        repo,
+        cfg,
+        message_id,
+        sender_id,
+        "deleted by admin" if caller.is_admin else "deleted by moderator",
+    )
+    await append_action_info_to_message_for_mods(
+        context,
+        repo,
+        message_id,
+        "This message was deleted by moderator action",
+    )
+    return True
 
 
 def _reaction_emojis(reactions: Any) -> set[str]:
@@ -1426,17 +1489,24 @@ def _fight_decline(repo: Any):
 
 
 def _extract_payload(msg: Any) -> dict[str, Any]:
+    base = {}
+    if getattr(msg, "forward_origin", None) is not None:
+        base = {
+            "is_forward": True,
+            "forward_from_chat_id": getattr(msg, "chat_id", None),
+            "forward_message_id": getattr(msg, "message_id", None),
+        }
     if getattr(msg, "text", None):
-        return {"content_type": "text", "text": msg.text, "media_file_id": None, "media_kind": None}
+        return base | {"content_type": "text", "text": msg.text, "media_file_id": None, "media_kind": None}
     if getattr(msg, "photo", None):
-        return {
+        return base | {
             "content_type": "photo",
             "text": getattr(msg, "caption", None),
             "media_file_id": msg.photo[-1].file_id,
             "media_kind": "photo",
         }
     if getattr(msg, "video", None):
-        return {
+        return base | {
             "content_type": "video",
             "text": getattr(msg, "caption", None),
             "media_file_id": msg.video.file_id,
@@ -1445,7 +1515,7 @@ def _extract_payload(msg: Any) -> dict[str, Any]:
             "mime_type": getattr(msg.video, "mime_type", None),
         }
     if getattr(msg, "animation", None):
-        return {
+        return base | {
             "content_type": "animation",
             "text": getattr(msg, "caption", None),
             "media_file_id": msg.animation.file_id,
@@ -1454,7 +1524,7 @@ def _extract_payload(msg: Any) -> dict[str, Any]:
             "mime_type": getattr(msg.animation, "mime_type", None),
         }
     if getattr(msg, "sticker", None):
-        return {
+        return base | {
             "content_type": "sticker",
             "text": None,
             "media_file_id": msg.sticker.file_id,
@@ -1464,7 +1534,7 @@ def _extract_payload(msg: Any) -> dict[str, Any]:
             "is_video": getattr(msg.sticker, "is_video", None),
         }
     if getattr(msg, "document", None):
-        return {
+        return base | {
             "content_type": "document",
             "text": getattr(msg, "caption", None),
             "media_file_id": msg.document.file_id,
@@ -1473,11 +1543,11 @@ def _extract_payload(msg: Any) -> dict[str, Any]:
             "mime_type": getattr(msg.document, "mime_type", None),
         }
     if getattr(msg, "video_note", None):
-        return {
+        return base | {
             "content_type": "video_note",
             "text": None,
             "media_file_id": msg.video_note.file_id,
             "media_kind": "video_note",
             "thumbnail_file_id": msg.video_note.thumbnail.file_id if getattr(msg.video_note, "thumbnail", None) else None,
         }
-    return {"content_type": "text", "text": "", "media_file_id": None, "media_kind": None}
+    return base | {"content_type": "text", "text": "", "media_file_id": None, "media_kind": None}
