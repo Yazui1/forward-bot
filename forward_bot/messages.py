@@ -124,6 +124,7 @@ class Messages:
     GAMBLE_TOO_MUCH = "Cannot gamble more than current credits."
     GAMBLE_MAX = "Amount exceeds configured max."
     TRIPCODESET_USAGE = "Usage: /settripcode name#secret"
+    TRIPCODE_UNSET = "Tripcode cleared."
     TRIPCODE_SEND_USAGE = "Usage: /t <message>"
     TRIPCODE_SENT = "Tripcoded message sent."
     SIGN_SEND_USAGE = "Usage: /s <message>"

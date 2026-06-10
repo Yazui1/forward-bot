@@ -16,7 +16,7 @@ from forward_bot.features.credits import adjust_credits_with_daily_limit, apply_
 from forward_bot.features.remove_votes import check_remove_vote_allowed
 from forward_bot.features.tagging import TELEGRAM_INVITE_RE
 from forward_bot.features.tombstones import remove_message_with_tombstones
-from forward_bot.utils import as_utc
+from forward_bot.utils import as_utc, resolve_reply_target, resolve_user_reference
 from forward_bot.commands.help_registry import register_command
 from forward_bot.messages import Messages as Msg
 
@@ -54,6 +54,8 @@ def register_user_commands(app: Any, repo: Any, cfg: dict[str, Any]) -> None:
     add("t", _tripcode_send(repo, cfg), lambda cfg: "send tripcoded message")
     add("settripcode", _set_tripcode(repo, cfg),
         lambda cfg: "set tripcode (<name#secret>)")
+    add("unsettripcode", _unset_tripcode(repo),
+        lambda cfg: "clear your configured tripcode")
     add("s", _signed_send(repo, cfg), lambda cfg: "send signed message")
     add("sendinvite", _send_invite_message(repo, cfg),
         lambda cfg: "send a Telegram invite with required description")
@@ -379,33 +381,34 @@ def _credit(repo: Any, cfg: dict[str, Any]):
             if amount is None or (amount <= 0 and not sender.is_admin):
                 await update.message.reply_text(Msg.CREDIT_USAGE_REPLY)
                 return
-            lookup = await repo.sender_by_delivery(update.effective_user.id, update.message.reply_to_message.message_id)
-            if lookup is None:
-                await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
+            resolved = await resolve_reply_target(
+                repo,
+                update.effective_user.id,
+                update.message.reply_to_message.message_id,
+            )
+            if resolved.user is None:
+                await update.message.reply_text(resolved.error or Msg.MESSAGE_NOT_IN_CACHE)
                 return
-            source_message_id, target = lookup
-            target_reply_to = await repo.delivery_message_for_recipient(source_message_id, target)
+            source_message_id = resolved.source_message_id
+            target = resolved.user.telegram_id
+            if source_message_id is not None and source_message_id > 0:
+                target_reply_to = await repo.delivery_message_for_recipient(source_message_id, target)
         elif len(context.args) >= 2:
-            target_arg = context.args[0]
+            resolved = await resolve_user_reference(repo, cfg, sender, context.args)
+            if resolved.user is None:
+                await update.message.reply_text(resolved.error or Msg.CREDIT_TARGET_NOT_FOUND)
+                return
             try:
-                amount = round_credit(float(context.args[1]))
+                amount = round_credit(float(context.args[resolved.consumed]))
+            except IndexError:
+                await update.message.reply_text(Msg.CREDIT_USAGE_TARGET)
+                return
             except ValueError:
                 amount = None
             if amount is None:
                 await update.message.reply_text(Msg.CREDIT_USAGE_TARGET)
                 return
-            if target_arg.startswith("@"):
-                target_user = await repo.get_user_by_username(target_arg[1:])
-                if target_user is None:
-                    await update.message.reply_text(Msg.CREDIT_TARGET_NOT_FOUND)
-                    return
-                target = target_user.telegram_id
-            else:
-                try:
-                    target = int(target_arg)
-                except ValueError:
-                    await update.message.reply_text(Msg.CREDIT_INVALID_TARGET)
-                    return
+            target = resolved.user.telegram_id
         else:
             await update.message.reply_text(Msg.CREDIT_USAGE)
             return
@@ -673,6 +676,17 @@ def _set_tripcode(repo: Any, cfg: dict[str, Any]):
             Msg.tripcode_set(html.escape(name), hashed[:6]),
             parse_mode="HTML",
         )
+
+    return handler
+
+
+def _unset_tripcode(repo: Any):
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.message is None or update.effective_user is None:
+            return
+        await repo.set_tripcode(update.effective_user.id, False, None, None)
+        await repo.touch_activity(update.effective_user.id)
+        await update.message.reply_text(Msg.TRIPCODE_UNSET)
 
     return handler
 
@@ -1127,25 +1141,28 @@ def _w(repo: Any, cfg: dict[str, Any]):
         replied_message_id = None
         replied_whisper_id = None
         if update.message.reply_to_message and context.args:
-            lookup = await repo.sender_by_delivery(update.effective_user.id, update.message.reply_to_message.message_id)
-            if lookup:
-                replied_message_id, target_id = lookup
-                text = " ".join(context.args).strip()
+            resolved = await resolve_reply_target(
+                repo,
+                update.effective_user.id,
+                update.message.reply_to_message.message_id,
+            )
+            if resolved.user is None:
+                await update.message.reply_text(resolved.error or Msg.MESSAGE_NOT_IN_CACHE)
+                return
+            target_id = resolved.user.telegram_id
+            if resolved.source_message_id is not None and resolved.source_message_id < 0:
+                replied_whisper_id = -resolved.source_message_id
+                reply_is_whisper = True
             else:
-                whisper_ctx = await repo.whisper_context_by_reply(update.effective_user.id, update.message.reply_to_message.message_id)
-                if whisper_ctx is not None:
-                    replied_whisper_id = int(whisper_ctx["id"])
-                    target_id = int(whisper_ctx["sender_id"])
-                    text = " ".join(context.args).strip()
-                    reply_is_whisper = True
-                else:
-                    await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
-                    return
-        elif len(context.args) >= 2 and context.args[0].startswith("@"):
-            target = await repo.get_user_by_username(context.args[0][1:])
-            if target:
-                target_id = target.telegram_id
-                text = " ".join(context.args[1:]).strip()
+                replied_message_id = resolved.source_message_id
+            text = " ".join(context.args).strip()
+        elif len(context.args) >= 2:
+            resolved = await resolve_user_reference(repo, cfg, sender, context.args)
+            if resolved.user is None:
+                await update.message.reply_text(resolved.error or Msg.WHISPER_USAGE)
+                return
+            target_id = resolved.user.telegram_id
+            text = " ".join(context.args[resolved.consumed:]).strip()
         if target_id is None or not text:
             await update.message.reply_text(Msg.WHISPER_USAGE)
             return
@@ -1257,24 +1274,23 @@ def _fight(repo: Any, cfg: dict[str, Any]):
             return
         target = None
         amount_arg_idx = 0
-        if context.args and context.args[0].startswith("@"):
-            target = await repo.get_user_by_username(context.args[0][1:])
-            amount_arg_idx = 1
-        elif update.message.reply_to_message:
-            lookup = await repo.sender_by_delivery(sender.telegram_id, update.message.reply_to_message.message_id)
-            if lookup:
-                _, target_id = lookup
-                target = await repo.get_user(target_id)
-            else:
-                whisper_sender = await repo.whisper_sender_by_reply(
-                    sender.telegram_id,
-                    update.message.reply_to_message.message_id,
-                )
-                if whisper_sender is not None:
-                    target = await repo.get_user(whisper_sender)
-                else:
-                    await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
-                    return
+        if update.message.reply_to_message:
+            resolved = await resolve_reply_target(
+                repo,
+                sender.telegram_id,
+                update.message.reply_to_message.message_id,
+            )
+            if resolved.user is None:
+                await update.message.reply_text(resolved.error or Msg.MESSAGE_NOT_IN_CACHE)
+                return
+            target = resolved.user
+        elif context.args:
+            resolved = await resolve_user_reference(repo, cfg, sender, context.args)
+            if resolved.user is None:
+                await update.message.reply_text(resolved.error or Msg.FIGHT_UNAVAILABLE)
+                return
+            target = resolved.user
+            amount_arg_idx = resolved.consumed
         else:
             await update.message.reply_text(Msg.FIGHT_USAGE)
             return

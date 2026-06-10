@@ -10,6 +10,14 @@ from PIL import Image, ImageFilter
 
 logger = logging.getLogger(__name__)
 
+
+def _named_image(data: bytes, name: str = "image.jpg") -> BytesIO:
+    stream = BytesIO(data)
+    stream.seek(0)
+    stream.name = name
+    return stream
+
+
 @dataclass(frozen=True)
 class MediaInspection:
     file_id: str
@@ -20,6 +28,7 @@ class MediaInspection:
     byte_size: int | None = None
     thumbnail_file_id: str | None = None
     mime_type: str | None = None
+    preview_bytes: bytes | None = None
 
 
 class MediaService:
@@ -27,8 +36,7 @@ class MediaService:
         self.ttl_seconds = ttl_seconds
         self.max_size = max_size
         self._inspections: dict[str, tuple[MediaInspection, float]] = {}
-        self._blurred: dict[str, tuple[BytesIO, float]] = {}
-        self._downloads: dict[str, tuple[bytes, float]] = {}
+        self._blurred: dict[str, tuple[bytes, float]] = {}
 
     async def inspect(
         self,
@@ -77,8 +85,23 @@ class MediaService:
             byte_size=byte_size,
             thumbnail_file_id=thumbnail_file_id,
             mime_type=mime_type,
+            preview_bytes=preview,
         )
-        self._set(self._inspections, key, inspection)
+        self._set(
+            self._inspections,
+            key,
+            MediaInspection(
+                file_id=file_id,
+                media_kind=media_kind,
+                is_image_like=is_image_like,
+                width=width,
+                height=height,
+                byte_size=byte_size,
+                thumbnail_file_id=thumbnail_file_id,
+                mime_type=mime_type,
+                preview_bytes=None,
+            ),
+        )
         return inspection
 
     async def blur_photo(self, bot: Any, file_id: str) -> BytesIO | None:
@@ -96,17 +119,12 @@ class MediaService:
     ) -> bytes | None:
         if not file_id or not media_kind:
             return None
-        cache_key = f"preview:{media_kind}:{file_id}:{thumbnail_file_id or ''}:{mime_type or ''}:{is_animated}:{is_video}"
-        cached = self._get(self._downloads, cache_key)
-        if cached is not None:
-            return cached
 
         if thumbnail_file_id:
             try:
                 raw = await self.fetch_bytes(bot, thumbnail_file_id)
                 preview = self._image_preview(raw)
                 if preview is not None:
-                    self._set(self._downloads, cache_key, preview)
                     return preview
             except Exception:
                 logger.debug(
@@ -132,15 +150,12 @@ class MediaService:
             return None
 
         preview = self._image_preview(raw)
-        if preview is not None:
-            self._set(self._downloads, cache_key, preview)
         return preview
 
     async def blur_image(self, bot: Any, file_id: str) -> BytesIO | None:
         cached = self._get(self._blurred, file_id)
         if cached is not None:
-            cached.seek(0)
-            return cached
+            return _named_image(cached, "blurred.jpg")
         try:
             raw = await self.fetch_bytes(bot, file_id)
             src = BytesIO(raw)
@@ -148,22 +163,33 @@ class MediaService:
                 image = image.convert("RGB").filter(ImageFilter.GaussianBlur(radius=18))
                 out = BytesIO()
                 image.save(out, format="JPEG", quality=82)
-                out.seek(0)
-                out.name = "blurred.jpg"
-                self._set(self._blurred, file_id, out)
-                return out
+                data = out.getvalue()
+                self._set(self._blurred, file_id, data)
+                return _named_image(data, "blurred.jpg")
         except Exception:
             return None
 
     async def fetch_bytes(self, bot: Any, file_id: str) -> bytes:
-        cached = self._get(self._downloads, file_id)
-        if cached is not None:
-            return cached
         logger.debug("Downloading media bytes for file_id=%s", file_id)
         tg_file = await bot.get_file(file_id)
-        data = bytes(await tg_file.download_as_bytearray())
-        self._set(self._downloads, file_id, data)
-        return data
+        return bytes(await tg_file.download_as_bytearray())
+
+    def release_media(
+        self,
+        file_id: str | None,
+        media_kind: str | None,
+        thumbnail_file_id: str | None = None,
+        mime_type: str | None = None,
+        is_animated: bool | None = None,
+        is_video: bool | None = None,
+    ) -> None:
+        if not file_id or not media_kind:
+            return
+        inspection_key = f"{media_kind}:{file_id}:{thumbnail_file_id or ''}:{mime_type or ''}:{is_animated}:{is_video}"
+        self._inspections.pop(inspection_key, None)
+        self._blurred.pop(file_id, None)
+        if thumbnail_file_id:
+            self._blurred.pop(thumbnail_file_id, None)
 
     def _image_preview(self, raw: bytes) -> bytes | None:
         try:

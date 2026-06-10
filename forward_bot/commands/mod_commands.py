@@ -12,7 +12,7 @@ from forward_bot.cache.state import CachedSenderMetadata, SenderMetadataCache
 from forward_bot.crypto.obfuscation import temporal_id
 from forward_bot.features.credits import interpolate_loss_rate, interpolate_tax_rate
 from forward_bot.features.tombstones import remove_message_with_tombstones, tombstone
-from forward_bot.utils import as_utc
+from forward_bot.utils import as_utc, resolve_reply_target, resolve_user_reference
 from forward_bot.commands.help_registry import register_command
 from forward_bot.config import Config
 from forward_bot.messages import Messages as Msg
@@ -27,14 +27,14 @@ def register_mod_commands(app: Any, repo: Any, cfg: dict[str, Any], sender_cache
 
     add("info", _info(repo, cfg, sender_cache),
         lambda cfg: "moderator/admin sender lookup (reply mode)")
-    add("togglemod", _toggle_mod(repo),
+    add("togglemod", _toggle_mod(repo, cfg),
         lambda cfg: "promote/demote moderator (admin only)")
-    add("ban", _ban(repo), lambda cfg: "ban user (admin only)")
-    add("unban", _unban(repo), lambda cfg: "unban user (admin only)")
-    add("warn", _warn(repo), lambda cfg: "warn user (mod/admin)")
+    add("ban", _ban(repo, cfg), lambda cfg: "ban user (admin only)")
+    add("unban", _unban(repo, cfg), lambda cfg: "unban user (admin only)")
+    add("warn", _warn(repo, cfg), lambda cfg: "warn user (mod/admin)")
     add("cooldown", _cooldown(repo, cfg),
         lambda cfg: "cooldown user (mod/admin)")
-    add("uncooldown", _uncooldown(repo),
+    add("uncooldown", _uncooldown(repo, cfg),
         lambda cfg: "remove cooldown (mod/admin)")
     add("purgebanned", _purge_banned(repo),
         lambda cfg: "show banned users and cooldown history (admin only)")
@@ -201,30 +201,17 @@ def _parse_duration_to_seconds(token: str | None, fallback_seconds: int) -> int:
     return fallback_seconds
 
 
-def _resolve_target_from_reply_or_arg(repo: Any, update: Update, arg0: str | None) -> Any:
-    async def inner() -> int | None:
-        if update.message and update.message.reply_to_message and update.effective_user:
-            lookup = await repo.sender_by_delivery(update.effective_user.id, update.message.reply_to_message.message_id)
-            if lookup:
-                _, sid = lookup
-                return sid
-            whisper = await repo.whisper_context_by_reply(
-                update.effective_user.id,
-                update.message.reply_to_message.message_id,
-            )
-            if whisper is not None:
-                return int(whisper["sender_id"])
-        if arg0:
-            if arg0.startswith("@"):
-                user = await repo.get_user_by_username(arg0[1:])
-                return None if user is None else user.telegram_id
-            try:
-                return int(arg0)
-            except ValueError:
-                return None
+async def _resolve_target(repo: Any, cfg: dict[str, Any], update: Update, args: list[str]) -> Any:
+    if update.message and update.message.reply_to_message and update.effective_user:
+        return await resolve_reply_target(
+            repo,
+            update.effective_user.id,
+            update.message.reply_to_message.message_id,
+        )
+    caller = await repo.get_user(update.effective_user.id) if update.effective_user else None
+    if caller is None:
         return None
-
-    return inner()
+    return await resolve_user_reference(repo, cfg, caller, args)
 
 
 def _identity_for_viewer(user: Any, viewer: Any, salt: str) -> str:
@@ -346,15 +333,8 @@ def _info(repo: Any, cfg: dict[str, Any], sender_cache: SenderMetadataCache):
             return
 
         if context.args:
-            arg = context.args[0].strip()
-            if arg.startswith("@") and caller.is_admin:
-                target = await repo.get_user_by_username(arg[1:])
-            else:
-                target = None
-                for u in await repo.list_users():
-                    if temporal_id(u.telegram_id, cfg["bot"]["global_salt"]) == arg.upper():
-                        target = u
-                        break
+            resolved = await resolve_user_reference(repo, cfg, caller, context.args)
+            target = resolved.user
             if target is None:
                 await update.message.reply_text(Msg.USER_NOT_FOUND)
                 return
@@ -459,7 +439,7 @@ def _reload(repo: Any):
     return handler
 
 
-def _toggle_mod(repo: Any):
+def _toggle_mod(repo: Any, cfg: dict[str, Any]):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None or update.effective_user is None:
             return
@@ -467,7 +447,8 @@ def _toggle_mod(repo: Any):
         if caller is None or not caller.is_admin:
             await update.message.reply_text(Msg.ADMIN_ONLY)
             return
-        target_id = await _resolve_target_from_reply_or_arg(repo, update, context.args[0] if context.args else None)
+        target = await _resolve_target(repo, cfg, update, context.args)
+        target_id = None if target is None or target.user is None else int(target.user.telegram_id)
         if target_id is None:
             if update.message.reply_to_message:
                 await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
@@ -491,7 +472,7 @@ def _toggle_mod(repo: Any):
     return handler
 
 
-def _ban(repo: Any):
+def _ban(repo: Any, cfg: dict[str, Any]):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None or update.effective_user is None:
             return
@@ -499,7 +480,8 @@ def _ban(repo: Any):
         if caller is None or not caller.is_admin:
             await update.message.reply_text(Msg.ADMIN_ONLY)
             return
-        target_id = await _resolve_target_from_reply_or_arg(repo, update, context.args[0] if context.args else None)
+        resolved = await _resolve_target(repo, cfg, update, context.args)
+        target_id = None if resolved is None or resolved.user is None else int(resolved.user.telegram_id)
         if target_id is None:
             if update.message.reply_to_message:
                 await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
@@ -516,7 +498,7 @@ def _ban(repo: Any):
     return handler
 
 
-def _unban(repo: Any):
+def _unban(repo: Any, cfg: dict[str, Any]):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None or update.effective_user is None:
             return
@@ -524,7 +506,8 @@ def _unban(repo: Any):
         if caller is None or not caller.is_admin:
             await update.message.reply_text(Msg.ADMIN_ONLY)
             return
-        target_id = await _resolve_target_from_reply_or_arg(repo, update, context.args[0] if context.args else None)
+        resolved = await _resolve_target(repo, cfg, update, context.args)
+        target_id = None if resolved is None or resolved.user is None else int(resolved.user.telegram_id)
         if target_id is None:
             if update.message.reply_to_message:
                 await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
@@ -541,7 +524,7 @@ def _unban(repo: Any):
     return handler
 
 
-def _warn(repo: Any):
+def _warn(repo: Any, cfg: dict[str, Any]):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None or update.effective_user is None:
             return
@@ -549,7 +532,8 @@ def _warn(repo: Any):
         if not _is_mod_or_admin(caller):
             await update.message.reply_text(Msg.MOD_ONLY)
             return
-        target_id = await _resolve_target_from_reply_or_arg(repo, update, context.args[0] if context.args else None)
+        resolved = await _resolve_target(repo, cfg, update, context.args)
+        target_id = None if resolved is None or resolved.user is None else int(resolved.user.telegram_id)
         warned_message_id = None
         warned_whisper_id = None
         if update.message.reply_to_message:
@@ -574,8 +558,9 @@ def _warn(repo: Any):
         if update.message.reply_to_message:
             msg = " ".join(context.args).strip() or "Warned by moderator"
         else:
-            msg = " ".join(context.args[1:]).strip() if len(
-                context.args) > 1 else "Warned by moderator"
+            consumed = int(getattr(target, "consumed", 1) or 1)
+            msg = " ".join(context.args[consumed:]).strip() if len(
+                context.args) > consumed else "Warned by moderator"
         await repo.add_warning(target_id, caller.telegram_id, msg)
         try:
             suffix = "~ admin" if caller.is_admin else "~ mods"
@@ -605,21 +590,22 @@ def _cooldown(repo: Any, cfg: dict[str, Any]):
         if not _is_mod_or_admin(caller):
             await update.message.reply_text(Msg.MOD_ONLY)
             return
-        arg0 = context.args[0] if context.args else None
-        target_id = await _resolve_target_from_reply_or_arg(repo, update, arg0 if arg0 and arg0.startswith("@") else None)
         duration_token = None
         reason = "cooldown"
         if update.message.reply_to_message:
+            target = await _resolve_target(repo, cfg, update, [])
+            target_id = None if target is None or target.user is None else int(target.user.telegram_id)
             duration_token = context.args[0] if context.args else None
             if len(context.args) > 1:
                 reason = " ".join(context.args[1:])
         else:
-            if target_id is None and context.args:
-                target_id = await _resolve_target_from_reply_or_arg(repo, update, context.args[0])
-            if len(context.args) >= 2:
-                duration_token = context.args[1]
-            if len(context.args) >= 3:
-                reason = " ".join(context.args[2:])
+            target = await _resolve_target(repo, cfg, update, context.args)
+            target_id = None if target is None or target.user is None else int(target.user.telegram_id)
+            consumed = int(getattr(target, "consumed", 1) or 1) if target is not None else 1
+            if len(context.args) > consumed:
+                duration_token = context.args[consumed]
+            if len(context.args) > consumed + 1:
+                reason = " ".join(context.args[consumed + 1:])
         if target_id is None:
             if update.message.reply_to_message:
                 await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
@@ -659,7 +645,7 @@ def _cooldown(repo: Any, cfg: dict[str, Any]):
     return handler
 
 
-def _uncooldown(repo: Any):
+def _uncooldown(repo: Any, cfg: dict[str, Any]):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None or update.effective_user is None:
             return
@@ -667,7 +653,8 @@ def _uncooldown(repo: Any):
         if not _is_mod_or_admin(caller):
             await update.message.reply_text(Msg.MOD_ONLY)
             return
-        target_id = await _resolve_target_from_reply_or_arg(repo, update, context.args[0] if context.args else None)
+        resolved = await _resolve_target(repo, cfg, update, context.args)
+        target_id = None if resolved is None or resolved.user is None else int(resolved.user.telegram_id)
         if target_id is None:
             if update.message.reply_to_message:
                 await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
@@ -813,7 +800,16 @@ def _modsay(repo: Any):
         text = f"{html.escape(' '.join(context.args))} <b><i>~ mods</i></b>"
         mods = [u for u in await repo.list_eligible_recipients(-1) if u.telegram_id != caller.telegram_id]
         queue = context.application.bot_data["queue"]
-        msg_id = await repo.create_message(caller.telegram_id, "text", text, None, None, parse_mode="HTML")
+        msg_id = await repo.create_message(
+            caller.telegram_id,
+            "text",
+            text,
+            None,
+            None,
+            source_chat_id=caller.telegram_id,
+            source_message_id=update.message.message_id,
+            parse_mode="HTML",
+        )
         await repo.set_message_tag(msg_id, "OK", None)
         await queue.enqueue_batch(msg_id, caller.telegram_id, mods, "text", text, None, None, is_system=True, parse_mode="HTML")
         await update.message.reply_text(Msg.MESSAGE_SENT)
@@ -834,7 +830,16 @@ def _adminsay(repo: Any):
         text = f"{html.escape(' '.join(context.args))} <b><i>~ admin</i></b>"
         users = [u for u in await repo.list_eligible_recipients(-1) if u.telegram_id != caller.telegram_id]
         queue = context.application.bot_data["queue"]
-        msg_id = await repo.create_message(caller.telegram_id, "text", text, None, None, parse_mode="HTML")
+        msg_id = await repo.create_message(
+            caller.telegram_id,
+            "text",
+            text,
+            None,
+            None,
+            source_chat_id=caller.telegram_id,
+            source_message_id=update.message.message_id,
+            parse_mode="HTML",
+        )
         await repo.set_message_tag(msg_id, "OK", None)
         await queue.enqueue_batch(msg_id, caller.telegram_id, users, "text", text, None, None, is_system=True, parse_mode="HTML")
         await update.message.reply_text(Msg.MESSAGE_SENT)

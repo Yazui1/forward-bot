@@ -84,6 +84,8 @@ def _incoming(repo: Any, cfg: dict[str, Any], rate_limiter: Any, queue: Any, tag
         if db_user.is_banned:
             await msg.reply_text(Msg.BANNED)
             return
+        await repo.touch_activity(user.id)
+        db_user = await repo.get_user(user.id) or db_user
         cd = await repo.get_active_cooldown(user.id)
         if cd is not None and not (db_user.is_moderator or db_user.is_admin):
             await msg.reply_text(Msg.cooldown_remaining(_cooldown_remaining_text(cd)))
@@ -357,6 +359,9 @@ async def _send_cooldown_message_to_mods(
         forward_message_id=payload.get("forward_message_id"),
         media_hash=payload.get("media_hash"),
         media_hash_first_seen_at=payload.get("media_hash_first_seen_at"),
+        mime_type=payload.get("mime_type"),
+        is_animated=payload.get("is_animated"),
+        is_video=payload.get("is_video"),
     )
 
 
@@ -421,35 +426,8 @@ async def _run_pipeline(
             is_animated=payload.get("is_animated"),
             is_video=payload.get("is_video"),
         )
-        if media_info is not None and media_info.is_image_like and bot is not None:
-            if payload.get("media_kind") != "sticker":
-                try:
-                    media_bytes = await media_service.preview_bytes(
-                        bot,
-                        media_info.file_id,
-                        media_info.media_kind,
-                        media_info.thumbnail_file_id,
-                        mime_type=media_info.mime_type,
-                        is_animated=payload.get("is_animated"),
-                        is_video=payload.get("is_video"),
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to prepare media preview bytes sender_id=%s", sender_id)
-    if media_bytes is None and media_service is not None and bot is not None and media_info is not None and media_info.is_image_like and payload.get("media_kind") != "sticker":
-        try:
-            media_bytes = await media_service.preview_bytes(
-                bot,
-                media_info.file_id,
-                media_info.media_kind,
-                media_info.thumbnail_file_id,
-                mime_type=media_info.mime_type,
-                is_animated=payload.get("is_animated"),
-                is_video=payload.get("is_video"),
-            )
-        except Exception:
-            logger.exception(
-                "Failed to fetch media bytes for duplicate classification sender_id=%s", sender_id)
+        if media_info is not None and media_info.is_image_like and payload.get("media_kind") != "sticker":
+            media_bytes = media_info.preview_bytes
     result = await tagger.run_once(
         payload.get("text"),
         payload.get("media_kind"),
@@ -538,10 +516,17 @@ async def _distribute(
 ) -> None:
     recipients = await repo.list_eligible_recipients(sender_id)
     if tag == "POTENTIALLY_UNWANTED":
+        before_count = len(recipients)
         recipients = [
             user for user in recipients
             if (user.is_moderator or user.is_admin or not user.hide_potentially_unwanted)
         ]
+        logger.debug(
+            "Filtered potentially unwanted message_id=%s recipients_before=%s recipients_after=%s",
+            message_id,
+            before_count,
+            len(recipients),
+        )
     logger.debug(
         "Distributing message_id=%s sender_id=%s recipients=%s content_type=%s tag=%s reply_to=%s",
         message_id,
@@ -569,6 +554,9 @@ async def _distribute(
         forward_message_id=payload.get("forward_message_id"),
         media_hash=payload.get("media_hash"),
         media_hash_first_seen_at=payload.get("media_hash_first_seen_at"),
+        mime_type=payload.get("mime_type"),
+        is_animated=payload.get("is_animated"),
+        is_video=payload.get("is_video"),
     )
     reward = float(
         cfg_value(
