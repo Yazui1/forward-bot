@@ -236,13 +236,15 @@ class DeliveryQueue:
             await self._enqueue_ordered_item(item)
 
     async def _enqueue_urgent_items(self, items: list[DeliveryItem]) -> None:
+        if self._bot is not None:
+            message_ids = {item.message_id for item in items}
+            logger.debug(
+                "Dispatching urgent delivery batch messages=%s recipients=%s",
+                len(message_ids),
+                len(items),
+            )
         for item in items:
             if self._bot is not None:
-                logger.debug(
-                    "Dispatching urgent delivery immediately message_id=%s recipient_id=%s",
-                    item.message_id,
-                    item.recipient_id,
-                )
                 asyncio.create_task(self._send_urgent(self._bot, item))
             else:
                 self._counter += 1

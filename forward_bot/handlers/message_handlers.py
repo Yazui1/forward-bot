@@ -536,6 +536,14 @@ async def _distribute(
         tag,
         reply_to_message_id,
     )
+    if not recipients:
+        logger.warning(
+            "Message has no eligible recipients message_id=%s sender_id=%s content_type=%s tag=%s",
+            message_id,
+            sender_id,
+            payload["content_type"],
+            tag,
+        )
     await queue.enqueue_batch(
         message_id=message_id,
         sender_id=sender_id,

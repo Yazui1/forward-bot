@@ -12,7 +12,7 @@ from forward_bot.cache.state import CachedSenderMetadata, SenderMetadataCache
 from forward_bot.crypto.obfuscation import temporal_id
 from forward_bot.features.credits import interpolate_loss_rate, interpolate_tax_rate
 from forward_bot.features.tombstones import remove_message_with_tombstones, tombstone
-from forward_bot.utils import as_utc, resolve_reply_target, resolve_user_reference
+from forward_bot.utils import as_utc, resolve_reply_target, resolve_user_reference, safe_reply_text
 from forward_bot.commands.help_registry import register_command
 from forward_bot.config import Config
 from forward_bot.messages import Messages as Msg
@@ -791,11 +791,11 @@ def _modsay(repo: Any):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None or update.effective_user is None or not context.args:
             if update.message:
-                await update.message.reply_text(Msg.USAGE_MODSAY)
+                await safe_reply_text(update.message, repo, Msg.USAGE_MODSAY)
             return
         caller = await _caller(repo, update, context)
         if not _is_mod_or_admin(caller):
-            await update.message.reply_text(Msg.MOD_ONLY)
+            await safe_reply_text(update.message, repo, Msg.MOD_ONLY)
             return
         text = f"{html.escape(' '.join(context.args))} <b><i>~ mods</i></b>"
         mods = [u for u in await repo.list_eligible_recipients(-1) if u.telegram_id != caller.telegram_id]
@@ -812,7 +812,7 @@ def _modsay(repo: Any):
         )
         await repo.set_message_tag(msg_id, "OK", None)
         await queue.enqueue_batch(msg_id, caller.telegram_id, mods, "text", text, None, None, is_system=True, parse_mode="HTML")
-        await update.message.reply_text(Msg.MESSAGE_SENT)
+        await safe_reply_text(update.message, repo, Msg.MESSAGE_SENT)
 
     return handler
 
@@ -821,11 +821,11 @@ def _adminsay(repo: Any):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None or update.effective_user is None or not context.args:
             if update.message:
-                await update.message.reply_text(Msg.USAGE_ADMINSAY)
+                await safe_reply_text(update.message, repo, Msg.USAGE_ADMINSAY)
             return
         caller = await _caller(repo, update, context)
         if caller is None or not caller.is_admin:
-            await update.message.reply_text(Msg.ADMIN_ONLY)
+            await safe_reply_text(update.message, repo, Msg.ADMIN_ONLY)
             return
         text = f"{html.escape(' '.join(context.args))} <b><i>~ admin</i></b>"
         users = [u for u in await repo.list_eligible_recipients(-1) if u.telegram_id != caller.telegram_id]
@@ -842,6 +842,6 @@ def _adminsay(repo: Any):
         )
         await repo.set_message_tag(msg_id, "OK", None)
         await queue.enqueue_batch(msg_id, caller.telegram_id, users, "text", text, None, None, is_system=True, parse_mode="HTML")
-        await update.message.reply_text(Msg.MESSAGE_SENT)
+        await safe_reply_text(update.message, repo, Msg.MESSAGE_SENT)
 
     return handler

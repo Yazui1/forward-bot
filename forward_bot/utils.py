@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from dataclasses import dataclass
+import logging
 from typing import Any
 
+from telegram.error import Forbidden, TelegramError, TimedOut
+
 from forward_bot.crypto.obfuscation import temporal_id
+
+logger = logging.getLogger(__name__)
 
 
 def as_utc(value: str) -> datetime:
@@ -20,6 +25,39 @@ async def resolve_forwarded_sender(repo: Any, viewer_id: int, replied_message_id
 
 async def resolve_whisper_sender(repo: Any, viewer_id: int, replied_message_id: int) -> int | None:
     return await repo.whisper_sender_by_reply(viewer_id, replied_message_id)
+
+
+async def safe_send_message(bot: Any, repo: Any, chat_id: int, **kwargs: Any) -> Any | None:
+    try:
+        return await bot.send_message(chat_id=chat_id, **kwargs)
+    except Forbidden:
+        logger.info("Direct send failed; marking user left chat_id=%s", chat_id)
+        if repo is not None:
+            await repo.mark_left(int(chat_id))
+        return None
+    except TimedOut:
+        logger.warning("Direct send timed out chat_id=%s", chat_id)
+        return None
+    except TelegramError as exc:
+        logger.warning("Direct send failed chat_id=%s error=%s", chat_id, exc)
+        return None
+
+
+async def safe_reply_text(message: Any, repo: Any, text: str, **kwargs: Any) -> Any | None:
+    chat_id = getattr(message, "chat_id", None)
+    try:
+        return await message.reply_text(text, **kwargs)
+    except Forbidden:
+        logger.info("Reply failed; marking user left chat_id=%s", chat_id)
+        if repo is not None and chat_id is not None:
+            await repo.mark_left(int(chat_id))
+        return None
+    except TimedOut:
+        logger.warning("Reply timed out chat_id=%s", chat_id)
+        return None
+    except TelegramError as exc:
+        logger.warning("Reply failed chat_id=%s error=%s", chat_id, exc)
+        return None
 
 
 @dataclass(frozen=True)

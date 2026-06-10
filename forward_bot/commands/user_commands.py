@@ -16,7 +16,7 @@ from forward_bot.features.credits import adjust_credits_with_daily_limit, apply_
 from forward_bot.features.remove_votes import check_remove_vote_allowed
 from forward_bot.features.tagging import TELEGRAM_INVITE_RE
 from forward_bot.features.tombstones import remove_message_with_tombstones
-from forward_bot.utils import as_utc, resolve_reply_target, resolve_user_reference
+from forward_bot.utils import as_utc, resolve_reply_target, resolve_user_reference, safe_reply_text, safe_send_message
 from forward_bot.commands.help_registry import register_command
 from forward_bot.messages import Messages as Msg
 
@@ -105,7 +105,9 @@ def _start(repo: Any, cfg: dict[str, Any]):
         await repo.update_started(user.id, True)
         if not db_user.about_seen:
             about = await repo.get_about()
-            await update.message.reply_text(about or Msg.ABOUT_DEFAULT)
+            sent = await safe_reply_text(update.message, repo, about or Msg.ABOUT_DEFAULT)
+            if sent is None:
+                return
             await repo.set_about_seen(user.id, True)
 
         # Invite credit flow
@@ -126,14 +128,13 @@ def _start(repo: Any, cfg: dict[str, Any]):
                             "invite_reward",
                         )
                         await repo.clear_cooldown(inviter_id)
-                        try:
-                            await context.bot.send_message(
-                                chat_id=inviter_id,
-                                text=Msg.invite_used_cooldown_removed(
-                                    applied, balance),
-                            )
-                        except Exception:
-                            pass
+                        await safe_send_message(
+                            context.bot,
+                            repo,
+                            inviter_id,
+                            text=Msg.invite_used_cooldown_removed(
+                                applied, balance),
+                        )
 
         initial_cooldown = int(cfg.get("onboarding", {}).get(
             "initial_cooldown_seconds", 0))
@@ -142,7 +143,7 @@ def _start(repo: Any, cfg: dict[str, Any]):
                 timedelta(seconds=initial_cooldown)
             await repo.set_cooldown(user.id, until.isoformat(), "initial-join", 0)
             minutes = max(1, math.ceil(initial_cooldown / 60))
-            await update.message.reply_text(Msg.initial_cooldown(minutes))
+            await safe_reply_text(update.message, repo, Msg.initial_cooldown(minutes))
 
     return handler
 
@@ -153,7 +154,7 @@ def _stop(repo: Any):
         if user is None or update.message is None:
             return
         await repo.update_started(user.id, False)
-        await update.message.reply_text(Msg.STOPPED)
+        await safe_reply_text(update.message, repo, Msg.STOPPED)
 
     return handler
 

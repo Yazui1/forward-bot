@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,8 @@ import aiosqlite
 from forward_bot.cache.transient import TransientStore
 from forward_bot.features.credits import round_credit
 from forward_bot.utils import as_utc
+
+logger = logging.getLogger(__name__)
 
 
 class ManagedConnection:
@@ -67,6 +70,12 @@ class Repository:
     def _cache_user(self, user: User) -> User:
         self._user_cache[user.telegram_id] = user
         return user
+
+    def _cache_users(self, users: list[User]) -> list[User]:
+        for user in users:
+            self._cache_user(user)
+        self._all_users_loaded = True
+        return users
 
     async def _refresh_user_cache(self, telegram_id: int) -> User | None:
         conn = await self._conn()
@@ -180,9 +189,8 @@ class Repository:
         async with conn:
             rows = await (await conn.execute("SELECT * FROM users")).fetchall()
         users = [self._to_user(row) for row in rows]
-        self._user_cache = {user.telegram_id: user for user in users}
-        self._all_users_loaded = True
-        return users
+        self._user_cache = {}
+        return self._cache_users(users)
 
     async def user_counts(self, inactive_days: int) -> dict[str, int]:
         conn = await self._conn()
@@ -229,23 +237,56 @@ class Repository:
     async def list_eligible_recipients(self, sender_id: int) -> list[User]:
         users = await self.list_users()
         await self._ensure_blocks_cache()
+        started = 0
+        banned = 0
+        sender = 0
+        blocked = 0
         recipients = [
             user
             for user in users
-            if user.has_started
-            and not user.is_banned
-            and user.telegram_id != sender_id
-            and (
-                user.is_moderator
-                or user.is_admin
-                or sender_id not in self._blocks_by_blocker.get(user.telegram_id, set())
-            )
+            if self._is_eligible_recipient(user, sender_id)
         ]
+        for user in users:
+            if user.telegram_id == sender_id:
+                sender += 1
+                continue
+            if not user.has_started:
+                continue
+            started += 1
+            if user.is_banned:
+                banned += 1
+                continue
+            if (
+                not user.is_moderator
+                and not user.is_admin
+                and sender_id in self._blocks_by_blocker.get(user.telegram_id, set())
+            ):
+                blocked += 1
+        logger.debug(
+            "Recipient eligibility sender_id=%s users=%s started_excluding_sender=%s banned=%s blocked=%s eligible=%s",
+            sender_id,
+            len(users),
+            started,
+            banned,
+            blocked,
+            len(recipients),
+        )
         return sorted(
             recipients,
             key=lambda user: self._sort_activity(user.last_activity),
             reverse=True,
         )
+
+    def _is_eligible_recipient(self, user: User, sender_id: int) -> bool:
+        if not user.has_started:
+            return False
+        if user.is_banned:
+            return False
+        if user.telegram_id == sender_id:
+            return False
+        if user.is_moderator or user.is_admin:
+            return True
+        return sender_id not in self._blocks_by_blocker.get(user.telegram_id, set())
 
     async def _ensure_blocks_cache(self) -> None:
         if self._blocks_cache_loaded:
