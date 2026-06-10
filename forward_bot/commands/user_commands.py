@@ -67,7 +67,7 @@ def register_user_commands(app: Any, repo: Any, cfg: dict[str, Any]) -> None:
     add("deletevote", _delete_vote(repo, cfg),
         lambda cfg: "vote to remove a replied message")
     add("reactions", _noop_help(),
-        lambda cfg: f"react 👍 or ❤️ to upvote (cost {float(cfg['credits']['upvote_cost']):.2f}) or 👎 to downvote (starts at {float(cfg['credits']['downvote_start_cost']):.2f})")
+        lambda cfg: f"react 👍, 🔥 or ❤️ to upvote (cost {float(cfg['credits']['upvote_cost']):.2f}) or 👎 to downvote (starts at {float(cfg['credits']['downvote_start_cost']):.2f})")
     add("w", _w(repo, cfg),
         lambda cfg: f"send whisper (cost {float(cfg['credits']['whisper_cost']):.2f}, unlock {float(cfg['credits']['whisper_unlock_credits']):.2f})")
     add("wmods", _whisper_mod(repo),
@@ -1370,7 +1370,7 @@ def _fight(repo: Any, cfg: dict[str, Any]):
         try:
             await context.bot.send_message(
                 chat_id=target.telegram_id,
-                text=Msg.fight_request(rel),
+                text=Msg.fight_request(stake, rel),
                 reply_markup=InlineKeyboardMarkup(
                     [[
                         InlineKeyboardButton(

@@ -152,6 +152,7 @@ ai:
   question_threshold: 0.93
   block_threshold: null
   image_size: 224
+  timeout_seconds: 2.0
 
 tagging:
   blocked_terms: []

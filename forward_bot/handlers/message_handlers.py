@@ -428,6 +428,10 @@ async def _run_pipeline(
         )
         if media_info is not None and media_info.is_image_like and payload.get("media_kind") != "sticker":
             media_bytes = media_info.preview_bytes
+            media_service.seed_blurred_image(
+                payload.get("thumbnail_file_id") or payload.get("media_file_id"),
+                media_bytes,
+            )
     result = await tagger.run_once(
         payload.get("text"),
         payload.get("media_kind"),
@@ -767,7 +771,7 @@ def _reaction_vote(repo: Any, cfg: dict[str, Any]):
             if handled:
                 return
         vote_type = None
-        if emojis & {"👍", "❤", "❤️", "💖", "💙", "💚", "💛", "🧡", "💜"}:
+        if emojis & {"👍", "🔥", "❤", "❤️", "💖", "💙", "💚", "💛", "🧡", "💜"}:
             vote_type = "upvote"
         elif emojis & {"👎"}:
             vote_type = "downvote"
@@ -1515,6 +1519,7 @@ def _extract_payload(msg: Any) -> dict[str, Any]:
             "text": getattr(msg, "caption", None),
             "media_file_id": msg.photo[-1].file_id,
             "media_kind": "photo",
+            "thumbnail_file_id": msg.photo[0].file_id if len(msg.photo) > 1 else None,
         }
     if getattr(msg, "video", None):
         return base | {

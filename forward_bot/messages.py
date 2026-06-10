@@ -108,7 +108,7 @@ class Messages:
     def removed_pending(reason: str) -> str:
         return f"This message was removed and is pending moderation action. Reason: {reason}"
 
-    REACT_USAGE = "Use Telegram reactions on a message: 👍 or ❤️ for upvote, 👎 for downvote."
+    REACT_USAGE = "Use Telegram reactions on a message: 👍, 🔥 or ❤️ for upvote, 👎 for downvote."
     ABOUT_UPDATED = "About updated."
     SIGN_TOGGLE_DISABLED = "Persistent sign toggles are disabled."
     TRIPCODE_TOGGLE_DISABLED = "Persistent tripcode toggles are disabled."
@@ -309,8 +309,8 @@ class Messages:
     DELETEVOTE_DELETED_NOTIFY = "The message you voted to remove was deleted."
 
     @staticmethod
-    def fight_request(rel: str) -> str:
-        return f"Someone wants to fight you for an unknown stake.\nRelative matchup: {rel}"
+    def fight_request(stake: float, rel: str) -> str:
+        return f"Someone wants to fight you for {stake:.2f} credits.\nRelative matchup: {rel}"
 
     @staticmethod
     def upvote_cast(cost: float, remaining: float) -> str:

@@ -122,7 +122,7 @@ class MediaService:
 
         if thumbnail_file_id:
             try:
-                raw = await self.fetch_bytes(bot, thumbnail_file_id)
+                raw = await self.fetch_bytes(bot, thumbnail_file_id, purpose="preview-thumbnail")
                 preview = self._image_preview(raw)
                 if preview is not None:
                     return preview
@@ -144,7 +144,7 @@ class MediaService:
             return None
 
         try:
-            raw = await self.fetch_bytes(bot, file_id)
+            raw = await self.fetch_bytes(bot, file_id, purpose="preview-original")
         except Exception:
             logger.debug("Could not fetch media for preview file_id=%s kind=%s", file_id, media_kind, exc_info=True)
             return None
@@ -152,27 +152,47 @@ class MediaService:
         preview = self._image_preview(raw)
         return preview
 
+    def seed_blurred_image(self, file_id: str | None, image_bytes: bytes | None) -> None:
+        if not file_id or not image_bytes:
+            return
+        if self._get(self._blurred, file_id) is not None:
+            return
+        blurred = self._blur_bytes(image_bytes)
+        if blurred is not None:
+            self._set(self._blurred, file_id, blurred)
+
     async def blur_image(self, bot: Any, file_id: str) -> BytesIO | None:
         cached = self._get(self._blurred, file_id)
         if cached is not None:
             return _named_image(cached, "blurred.jpg")
         try:
-            raw = await self.fetch_bytes(bot, file_id)
-            src = BytesIO(raw)
-            with Image.open(src) as image:
-                image = image.convert("RGB").filter(ImageFilter.GaussianBlur(radius=18))
-                out = BytesIO()
-                image.save(out, format="JPEG", quality=82)
-                data = out.getvalue()
-                self._set(self._blurred, file_id, data)
-                return _named_image(data, "blurred.jpg")
+            raw = await self.fetch_bytes(bot, file_id, purpose="blur")
+            data = self._blur_bytes(raw)
+            if data is None:
+                return None
+            self._set(self._blurred, file_id, data)
+            return _named_image(data, "blurred.jpg")
         except Exception:
             return None
 
-    async def fetch_bytes(self, bot: Any, file_id: str) -> bytes:
-        logger.debug("Downloading media bytes for file_id=%s", file_id)
+    async def fetch_bytes(self, bot: Any, file_id: str, purpose: str = "media") -> bytes:
+        logger.debug("Downloading media bytes purpose=%s file_id=%s", purpose, file_id)
         tg_file = await bot.get_file(file_id)
         return bytes(await tg_file.download_as_bytearray())
+
+    def _blur_bytes(self, raw: bytes) -> bytes | None:
+        try:
+            with Image.open(BytesIO(raw)) as image:
+                try:
+                    image.seek(0)
+                except EOFError:
+                    pass
+                image = image.convert("RGB").filter(ImageFilter.GaussianBlur(radius=18))
+                out = BytesIO()
+                image.save(out, format="JPEG", quality=82)
+                return out.getvalue()
+        except Exception:
+            return None
 
     def release_media(
         self,
@@ -216,9 +236,9 @@ class MediaService:
         if media_kind == "photo":
             return True
         if media_kind == "document":
-            return mime.startswith("image/")
+            return False
         if media_kind == "animation":
-            return mime == "image/gif"
+            return False
         if media_kind == "sticker":
             return not bool(is_animated) and not bool(is_video)
         return False

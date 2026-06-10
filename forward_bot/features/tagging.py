@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -31,9 +32,11 @@ class AIClassifier:
     question_threshold: float = 0.93
     block_threshold: float | None = None
     image_size: int = 224
+    timeout_seconds: float = 2.0
 
     _model: Any | None = None
     _load_attempted: bool = False
+    _lock: asyncio.Lock | None = None
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> "AIClassifier":
@@ -49,6 +52,7 @@ class AIClassifier:
                 else None
             ),
             image_size=int(ai_cfg.get("image_size", 224)),
+            timeout_seconds=float(ai_cfg.get("timeout_seconds", 2.0)),
         )
 
     def update_config(self, cfg: dict[str, Any]) -> None:
@@ -67,8 +71,39 @@ class AIClassifier:
             else None
         )
         self.image_size = int(ai_cfg.get("image_size", self.image_size))
+        self.timeout_seconds = float(ai_cfg.get("timeout_seconds", self.timeout_seconds))
 
-    def classify_image(self, image_bytes: bytes) -> TagResult:
+    async def classify_image(self, image_bytes: bytes) -> TagResult:
+        if not self.enabled:
+            return TagResult("OK")
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        if self._lock.locked():
+            logger.warning("AI media classifier is still busy; allowing message")
+            return TagResult("OK")
+        await self._lock.acquire()
+        task = asyncio.create_task(asyncio.to_thread(self._classify_image_sync, image_bytes))
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=max(0.1, self.timeout_seconds))
+            self._lock.release()
+            return result
+        except TimeoutError:
+            logger.warning(
+                "AI media classification timed out after %.2fs; allowing message",
+                self.timeout_seconds,
+            )
+            task.add_done_callback(lambda _task: self._release_lock_after_ai_task())
+            return TagResult("OK")
+        except Exception:
+            if self._lock.locked():
+                self._lock.release()
+            raise
+
+    def _release_lock_after_ai_task(self) -> None:
+        if self._lock is not None and self._lock.locked():
+            self._lock.release()
+
+    def _classify_image_sync(self, image_bytes: bytes) -> TagResult:
         if not self.enabled:
             return TagResult("OK")
         model = self._load_model()
@@ -150,7 +185,7 @@ class TaggingPipeline:
         if media_kind:
             if media_info is not None and getattr(media_info, "byte_size", None) == 0:
                 result = TagResult("QUESTIONABLE", "empty-media")
-            ai_result = self._classify_media(
+            ai_result = await self._classify_media(
                 media_kind, media_info, media_bytes)
             if ai_result is not None:
                 result = ai_result
@@ -197,7 +232,7 @@ class TaggingPipeline:
             return TagResult("OK", "telegram-invite-described")
         return TagResult("BLOCKED", "telegram-invite-link")
 
-    def _classify_media(
+    async def _classify_media(
         self,
         media_kind: str | None,
         media_info: Any,
@@ -209,7 +244,7 @@ class TaggingPipeline:
             return None
         if not media_kind or media_info is None or not getattr(media_info, "is_image_like", False):
             return None
-        result = self.ai_classifier.classify_image(media_bytes)
+        result = await self.ai_classifier.classify_image(media_bytes)
         if result.tag != "OK":
             return result
         return None

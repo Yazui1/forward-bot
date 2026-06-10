@@ -380,28 +380,9 @@ class DeliveryQueue:
                     await self.repo.mark_left(item.recipient_id)
                     return "chat_not_found_left"
                 if item.reply_to_message_id is not None:
-                    logger.debug(
-                        "Dropping reply delivery because Telegram rejected reply target message_id=%s recipient_id=%s reply_to_message_id=%s error=%s",
-                        item.message_id,
-                        item.recipient_id,
-                        item.reply_to_message_id,
-                        e,
-                    )
                     return "reply_rejected"
-                logger.debug(
-                    "Dropping delivery after Telegram bad request message_id=%s recipient_id=%s error=%s",
-                    item.message_id,
-                    item.recipient_id,
-                    e,
-                )
                 return "bad_request"
             except TelegramError as e:
-                logger.debug(
-                    "Dropping delivery after Telegram error message_id=%s recipient_id=%s error=%s",
-                    item.message_id,
-                    item.recipient_id,
-                    e,
-                )
                 return "telegram_error"
             except Exception:
                 logger.exception(
@@ -438,13 +419,12 @@ class DeliveryQueue:
                 return "reply_missing"
 
         if item.is_forward and item.forward_from_chat_id is not None and item.forward_message_id is not None:
-            is_blurred = False
-            sent = await bot.forward_message(
-                chat_id=item.recipient_id,
-                from_chat_id=item.forward_from_chat_id,
-                message_id=item.forward_message_id,
-            )
-        elif item.content_type == "text":
+            sent = await self._try_forward(bot, item)
+            if sent is not None:
+                await self.repo.add_delivery(item.message_id, item.recipient_id, sent.message_id, is_blurred=False)
+                return "sent"
+
+        if item.content_type == "text":
             is_blurred = False
             sent = await bot.send_message(
                 chat_id=item.recipient_id,
@@ -458,7 +438,7 @@ class DeliveryQueue:
                 is_blurred = True
                 blurred = None
                 if self.media_service is not None:
-                    blurred = await self.media_service.blur_photo(bot, item.media_file_id)
+                    blurred = await self.media_service.blur_photo(bot, item.thumbnail_file_id or item.media_file_id)
                 caption = self._blur_caption(
                     item.text_content, recipient.credits)
                 if blurred is not None:
@@ -566,6 +546,19 @@ class DeliveryQueue:
 
         await self.repo.add_delivery(item.message_id, item.recipient_id, sent.message_id, is_blurred=is_blurred)
         return "sent_blurred" if is_blurred else "sent"
+
+    async def _try_forward(self, bot: Any, item: DeliveryItem) -> Any | None:
+        try:
+            return await bot.forward_message(
+                chat_id=item.recipient_id,
+                from_chat_id=item.forward_from_chat_id,
+                message_id=item.forward_message_id,
+            )
+        except BadRequest as exc:
+            text = str(exc).lower()
+            if "message to forward not found" in text or "message can't be forwarded" in text or "message is protected" in text:
+                return None
+            raise
 
     def _drop_due_to_duplicate_filter(self, recipient: Any, item: DeliveryItem) -> bool:
         if recipient.is_admin or recipient.is_moderator:
