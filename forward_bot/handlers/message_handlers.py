@@ -88,11 +88,17 @@ def _incoming(repo: Any, cfg: dict[str, Any], rate_limiter: Any, queue: Any, tag
         db_user = await repo.get_user(user.id) or db_user
         cd = await repo.get_active_cooldown(user.id)
         if cd is not None and not (db_user.is_moderator or db_user.is_admin):
-            await msg.reply_text(Msg.cooldown_remaining(_cooldown_remaining_text(cd)))
+            await msg.reply_text(
+                Msg.cooldown_remaining_with_reason(
+                    _cooldown_remaining_text(cd),
+                    str(cd["reason"] or "cooldown"),
+                )
+            )
             await _send_cooldown_message_to_mods(
                 msg,
                 user.id,
                 user.username,
+                cd,
                 repo,
                 cfg,
                 queue,
@@ -292,13 +298,18 @@ async def _send_cooldown_message_to_mods(
     msg: Any,
     sender_id: int,
     username: str | None,
+    cooldown: Any,
     repo: Any,
     cfg: dict[str, Any],
     queue: Any,
     sender_cache: SenderMetadataCache,
 ) -> None:
     payload = _extract_payload(msg)
-    prefix = "<b>In cooldown:</b>"
+    prefix = (
+        f"<b>In cooldown:</b> "
+        f"Remaining: {html.escape(_cooldown_remaining_text(cooldown))}. "
+        f"Reason: {html.escape(str(cooldown['reason'] or 'cooldown'))}."
+    )
     if payload.get("text"):
         payload["text"] = f"{prefix} {html.escape(str(payload['text']))}"
     else:
@@ -326,6 +337,7 @@ async def _send_cooldown_message_to_mods(
         is_forward=bool(payload.get("is_forward")),
         forward_from_chat_id=payload.get("forward_from_chat_id"),
         forward_message_id=payload.get("forward_message_id"),
+        sticker_set_name=payload.get("sticker_set_name"),
     )
     await repo.set_message_tag(message_id, "OK", "cooldown-visible-to-mods")
     sender_user = await repo.get_user(sender_id)
@@ -406,6 +418,7 @@ async def _run_pipeline(
         reply_to_message_id=reply_to_message_id,
         parse_mode=payload.get("parse_mode"),
         thumbnail_file_id=payload.get("thumbnail_file_id"),
+        sticker_set_name=payload.get("sticker_set_name"),
     )
     media_info = None
     media_service = None
@@ -437,6 +450,7 @@ async def _run_pipeline(
         payload.get("media_kind"),
         media_info,
         media_bytes,
+        sticker_set_name=payload.get("sticker_set_name"),
         repo=repo,
         cfg=cfg,
         message_id=message_id,
@@ -446,7 +460,22 @@ async def _run_pipeline(
     if result.tag == "BLOCKED":
         logger.info("Message blocked sender_id=%s message_id=%s reason=%s",
                     sender_id, message_id, result.reason)
-        reply = Msg.INVITE_LINK_BLOCKED if result.reason == "telegram-invite-link" else Msg.BLOCKED_REPLY
+        if result.reason == "blocked-sticker-set":
+            await _distribute_blocked_sticker_to_mods(
+                message_id,
+                sender_id,
+                payload,
+                repo,
+                queue,
+                reply_to_message_id=reply_to_message_id,
+            )
+        reply = (
+            Msg.INVITE_LINK_BLOCKED
+            if result.reason == "telegram-invite-link"
+            else Msg.STICKERPACK_BLOCKED_REPLY
+            if result.reason == "blocked-sticker-set"
+            else Msg.BLOCKED_REPLY
+        )
         await msg.reply_text(reply, reply_to_message_id=msg.message_id)
         return
     if result.tag == "DUPLICATE":
@@ -569,6 +598,63 @@ async def _distribute(
         mime_type=payload.get("mime_type"),
         is_animated=payload.get("is_animated"),
         is_video=payload.get("is_video"),
+    )
+
+
+async def _distribute_blocked_sticker_to_mods(
+    message_id: int,
+    sender_id: int,
+    payload: dict[str, Any],
+    repo: Any,
+    queue: Any,
+    reply_to_message_id: int | None = None,
+) -> None:
+    mods = await repo.list_mod_and_admin_users()
+    if not mods:
+        return
+    await queue.enqueue_batch(
+        message_id=message_id,
+        sender_id=sender_id,
+        recipients=mods,
+        content_type=payload["content_type"],
+        text_content=payload.get("text"),
+        media_file_id=payload.get("media_file_id"),
+        media_kind=payload.get("media_kind"),
+        thumbnail_file_id=payload.get("thumbnail_file_id"),
+        is_system=True,
+        reply_to_message_id=reply_to_message_id,
+        include_remove_button=False,
+        parse_mode=payload.get("parse_mode"),
+        is_forward=bool(payload.get("is_forward")),
+        forward_from_chat_id=payload.get("forward_from_chat_id"),
+        forward_message_id=payload.get("forward_message_id"),
+        media_hash=payload.get("media_hash"),
+        media_hash_first_seen_at=payload.get("media_hash_first_seen_at"),
+        mime_type=payload.get("mime_type"),
+        is_animated=payload.get("is_animated"),
+        is_video=payload.get("is_video"),
+    )
+    notice_id = await repo.create_message(
+        sender_id=sender_id,
+        content_type="text",
+        text_content=Msg.STICKER_BLOCKED_MOD_NOTICE,
+        media_file_id=None,
+        media_kind=None,
+        reply_to_message_id=message_id,
+        parse_mode=None,
+    )
+    await repo.set_message_tag(notice_id, "OK", "blocked-sticker-mod-notice")
+    await queue.enqueue_batch(
+        message_id=notice_id,
+        sender_id=sender_id,
+        recipients=mods,
+        content_type="text",
+        text_content=Msg.STICKER_BLOCKED_MOD_NOTICE,
+        media_file_id=None,
+        media_kind=None,
+        is_system=True,
+        reply_to_message_id=message_id,
+        include_remove_button=False,
     )
     reward = float(
         cfg_value(
@@ -811,8 +897,10 @@ def _reaction_vote(repo: Any, cfg: dict[str, Any]):
             try:
                 await context.bot.send_message(
                     chat_id=voter_id,
-                    text=Msg.cooldown_remaining(
-                        _cooldown_remaining_text(cooldown)),
+                    text=Msg.cooldown_remaining_with_reason(
+                        _cooldown_remaining_text(cooldown),
+                        str(cooldown["reason"] or "cooldown"),
+                    ),
                 )
             except Exception:
                 pass
@@ -1505,7 +1593,7 @@ def _fight_decline(repo: Any):
 
 def _extract_payload(msg: Any) -> dict[str, Any]:
     base = {}
-    if getattr(msg, "forward_origin", None) is not None:
+    if _should_preserve_forward_origin(msg):
         base = {
             "is_forward": True,
             "forward_from_chat_id": getattr(msg, "chat_id", None),
@@ -1546,6 +1634,7 @@ def _extract_payload(msg: Any) -> dict[str, Any]:
             "media_file_id": msg.sticker.file_id,
             "media_kind": "sticker",
             "thumbnail_file_id": msg.sticker.thumbnail.file_id if getattr(msg.sticker, "thumbnail", None) else None,
+            "sticker_set_name": getattr(msg.sticker, "set_name", None),
             "is_animated": getattr(msg.sticker, "is_animated", None),
             "is_video": getattr(msg.sticker, "is_video", None),
         }
@@ -1567,3 +1656,21 @@ def _extract_payload(msg: Any) -> dict[str, Any]:
             "thumbnail_file_id": msg.video_note.thumbnail.file_id if getattr(msg.video_note, "thumbnail", None) else None,
         }
     return base | {"content_type": "text", "text": "", "media_file_id": None, "media_kind": None}
+
+
+def _should_preserve_forward_origin(msg: Any) -> bool:
+    origin = getattr(msg, "forward_origin", None)
+    if origin is None:
+        return False
+    if bool(getattr(msg, "has_protected_content", False)):
+        return False
+    origin_type = str(getattr(origin, "type", "") or "").lower()
+    if origin_type == "hidden_user":
+        return False
+    if origin_type in {"user", "chat", "channel"}:
+        return True
+    if getattr(origin, "sender_user", None) is not None:
+        return True
+    if getattr(origin, "chat", None) is not None:
+        return True
+    return False

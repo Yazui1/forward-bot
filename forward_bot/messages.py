@@ -14,6 +14,8 @@ class Messages:
     BANNED = "You are banned."
     ABOUT_DEFAULT = "Anonymous message relay bot."
     BLOCKED_REPLY = "Your message was blocked."
+    STICKERPACK_BLOCKED_REPLY = "This sticker pack is blocked."
+    STICKER_BLOCKED_MOD_NOTICE = "Sticker blocked"
     INVITE_LINK_BLOCKED = "Telegram invite links need context. Use /sendinvite <link> <reason/group description>, or send the invite link followed by a description."
     QUESTIONABLE_PROMPT = "This message may be questionable. Send anyway?"
     CONFIRMATION_SEND_BUTTON = "Send anyway"
@@ -38,6 +40,8 @@ class Messages:
     USAGE_COOLDOWN = "Usage: reply /cooldown [dur] OR /cooldown @user <dur>"
     USAGE_UNCOOLDOWN = "Usage: /uncooldown @user|id OR reply /uncooldown"
     USAGE_DELETE = "Reply to a message with /delete."
+    BLOCKSTICKER_USAGE = "Reply to a sticker with /blocksticker [reason]."
+    BLOCKSTICKER_NO_SET = "This sticker does not belong to a sticker pack."
     USAGE_MODSAY = "Usage: /modsay <message>"
     USAGE_ADMINSAY = "Usage: /adminsay <message>"
     BANNED_NOTIFY = "You have been banned."
@@ -164,6 +168,15 @@ class Messages:
     @staticmethod
     def cooldown_remaining(remaining: str) -> str:
         return f"You are currently cooled down. Remaining: {remaining}."
+
+    @staticmethod
+    def cooldown_remaining_with_reason(remaining: str, reason: str | None) -> str:
+        reason_text = reason or "cooldown"
+        return f"You are currently cooled down. Remaining: {remaining}. Reason: {reason_text}."
+
+    @staticmethod
+    def stickerpack_blocked(set_name: str) -> str:
+        return f"Sticker pack blocked: {set_name}"
 
     @staticmethod
     def initial_cooldown(minutes: int) -> str:

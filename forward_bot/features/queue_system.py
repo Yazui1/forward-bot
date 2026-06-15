@@ -67,6 +67,7 @@ class DeliveryQueue:
         self._message_release_items: dict[int, DeliveryItem] = {}
         self._message_stats: dict[int, Counter[str]] = {}
         self._message_started_at: dict[int, float] = {}
+        self._send_rate_lock = asyncio.Lock()
 
     def update_config(self, cfg: dict[str, Any]) -> None:
         self.cfg = cfg
@@ -236,19 +237,14 @@ class DeliveryQueue:
             await self._enqueue_ordered_item(item)
 
     async def _enqueue_urgent_items(self, items: list[DeliveryItem]) -> None:
-        if self._bot is not None:
-            message_ids = {item.message_id for item in items}
-            logger.debug(
-                "Dispatching urgent delivery batch messages=%s recipients=%s",
-                len(message_ids),
-                len(items),
-            )
-        for item in items:
-            if self._bot is not None:
-                asyncio.create_task(self._send_urgent(self._bot, item))
-            else:
-                self._counter += 1
-                await self.queue.put((item.priority, self._counter, item))
+        message_ids = {item.message_id for item in items}
+        logger.debug(
+            "Queueing urgent delivery batch messages=%s recipients=%s",
+            len(message_ids),
+            len(items),
+        )
+        self._track_message_lifetime(items[0].message_id, items)
+        await self._enqueue_items(items)
 
     async def _enqueue_ordered_item(self, item: DeliveryItem) -> None:
         async with self._recipient_queue_lock:
@@ -271,8 +267,6 @@ class DeliveryQueue:
         await self.queue.put((item.priority, self._counter, item))
 
     async def _complete_ordered_item(self, item: DeliveryItem, status: str = "unknown") -> None:
-        if item.urgent:
-            return
         async with self._recipient_queue_lock:
             self._recipient_queued.discard(item.recipient_id)
             self._mark_message_delivery_complete_locked(item, status)
@@ -325,8 +319,6 @@ class DeliveryQueue:
         )
 
     async def worker(self, bot: Any) -> None:
-        if self._running:
-            return
         self._running = True
         self._bot = bot
         logger.debug("Delivery worker started")
@@ -365,8 +357,7 @@ class DeliveryQueue:
     async def _send_with_backoff_locked(self, bot: Any, item: DeliveryItem) -> str:
         while True:
             try:
-                if not item.urgent:
-                    await self._respect_api_interval()
+                await self._respect_api_interval()
                 return await self._deliver(bot, item)
             except RetryAfter as e:
                 await asyncio.sleep(float(e.retry_after) + 0.1)
@@ -651,8 +642,9 @@ class DeliveryQueue:
         )
 
     async def _respect_api_interval(self) -> None:
-        now = time.time()
-        delta = now - self._last_send
-        if delta < self._min_interval:
-            await asyncio.sleep(self._min_interval - delta)
-        self._last_send = time.time()
+        async with self._send_rate_lock:
+            now = time.time()
+            delta = now - self._last_send
+            if delta < self._min_interval:
+                await asyncio.sleep(self._min_interval - delta)
+            self._last_send = time.time()

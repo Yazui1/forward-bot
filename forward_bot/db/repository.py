@@ -65,6 +65,8 @@ class Repository:
         self._media_hash_cache_loaded = False
         self._media_hash_first_seen: dict[str, str] = {}
         self._media_hash_latest_seen: dict[str, str] = {}
+        self._blocked_sticker_sets_loaded = False
+        self._blocked_sticker_sets: set[str] = set()
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
     def _cache_user(self, user: User) -> User:
@@ -90,8 +92,10 @@ class Repository:
         self._all_users_loaded = False
 
     async def _conn(self) -> ManagedConnection:
-        conn = await aiosqlite.connect(self.db_path)
+        conn = await aiosqlite.connect(self.db_path, timeout=30.0)
         conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA busy_timeout = 30000")
+        await conn.execute("PRAGMA synchronous = NORMAL")
         return ManagedConnection(conn)
 
     async def get_or_create_user(
@@ -326,6 +330,7 @@ class Repository:
         forward_message_id: int | None = None,
         media_hash: str | None = None,
         media_hash_first_seen_at: str | None = None,
+        sticker_set_name: str | None = None,
     ) -> int:
         message_id = self.transient.next_message_id()
         self.transient.messages[message_id] = {
@@ -341,6 +346,7 @@ class Repository:
             "forward_message_id": forward_message_id,
             "media_hash": media_hash,
             "media_hash_first_seen_at": media_hash_first_seen_at,
+            "sticker_set_name": sticker_set_name,
             "source_chat_id": source_chat_id,
             "source_message_id": source_message_id,
             "reply_to_message_id": reply_to_message_id,
@@ -382,6 +388,47 @@ class Repository:
         if row is not None:
             row["tag"] = tag
             row["tag_reason"] = reason
+
+    async def block_sticker_set(self, set_name: str, blocked_by: int, reason: str | None = None) -> None:
+        normalized = self._normalize_sticker_set_name(set_name)
+        if not normalized:
+            return
+        conn = await self._conn()
+        async with conn:
+            await conn.execute(
+                """
+                INSERT INTO blocked_sticker_sets (set_name, blocked_by, reason)
+                VALUES (?, ?, ?)
+                ON CONFLICT(set_name) DO UPDATE SET
+                    blocked_by = excluded.blocked_by,
+                    reason = excluded.reason,
+                    created_at = CURRENT_TIMESTAMP
+                """,
+                (normalized, blocked_by, reason),
+            )
+            await conn.commit()
+        if self._blocked_sticker_sets_loaded:
+            self._blocked_sticker_sets.add(normalized)
+
+    async def is_sticker_set_blocked(self, set_name: str | None) -> bool:
+        normalized = self._normalize_sticker_set_name(set_name)
+        if not normalized:
+            return False
+        await self._ensure_blocked_sticker_sets_cache()
+        return normalized in self._blocked_sticker_sets
+
+    async def _ensure_blocked_sticker_sets_cache(self) -> None:
+        if self._blocked_sticker_sets_loaded:
+            return
+        conn = await self._conn()
+        async with conn:
+            rows = await (await conn.execute("SELECT set_name FROM blocked_sticker_sets")).fetchall()
+        self._blocked_sticker_sets = {str(row["set_name"]).casefold() for row in rows}
+        self._blocked_sticker_sets_loaded = True
+
+    @staticmethod
+    def _normalize_sticker_set_name(set_name: str | None) -> str:
+        return (set_name or "").strip().casefold()
 
     async def recent_media_hashes(self, since_days: int) -> list[str]:
         await self._ensure_media_hash_cache()

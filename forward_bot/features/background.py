@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
 from telegram.error import Forbidden
 
 from forward_bot.features.credits import apply_negative_credit_cooldown, interpolate_tax_rate
+
+logger = logging.getLogger(__name__)
 
 
 async def daily_tax_worker(repo: Any, cfg: dict[str, Any]) -> None:
@@ -22,11 +26,25 @@ async def daily_tax_worker(repo: Any, cfg: dict[str, Any]) -> None:
                 continue
             rate = interpolate_tax_rate(cfg["credits"]["tax_ramp"], user.credits)
             amount = max(0.0, user.credits * rate)
-            applied = await repo.apply_daily_tax_once(user.telegram_id, today, amount)
-            if applied:
-                refreshed = await repo.get_user(user.telegram_id)
-                if refreshed is not None:
-                    await apply_negative_credit_cooldown(repo, cfg, user.telegram_id, refreshed.credits, 0)
+            try:
+                applied = await repo.apply_daily_tax_once(user.telegram_id, today, amount)
+                if applied:
+                    refreshed = await repo.get_user(user.telegram_id)
+                    if refreshed is not None:
+                        await apply_negative_credit_cooldown(repo, cfg, user.telegram_id, refreshed.credits, 0)
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower():
+                    logger.warning(
+                        "Skipping daily tax for user_id=%s because database is locked",
+                        user.telegram_id,
+                    )
+                    continue
+                raise
+            except Exception:
+                logger.exception(
+                    "Daily tax failed for user_id=%s; continuing",
+                    user.telegram_id,
+                )
         await asyncio.sleep(max(60, interval))
 
 

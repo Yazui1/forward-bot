@@ -65,7 +65,13 @@ async def run(config_path: str = "config.yml") -> None:
         ai_classifier=ai_classifier,
     )
 
-    app = Application.builder().token(cfg["bot"]["token"]).build()
+    app = (
+        Application.builder()
+        .token(cfg["bot"]["token"])
+        .connection_pool_size(int(cfg.get("delivery", {}).get("connection_pool_size", 64)))
+        .pool_timeout(float(cfg.get("delivery", {}).get("pool_timeout_seconds", 30.0)))
+        .build()
+    )
     app.bot_data["repo"] = repo
     app.bot_data["cfg"] = cfg
     app.bot_data["config_path"] = config_path

@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 
 from forward_bot.crypto.obfuscation import temporal_id
 from forward_bot.messages import Messages as Msg
@@ -79,6 +80,7 @@ async def remove_message_with_tombstones(
             telegram_message_id,
             text,
             str(message.get("content_type") or "") if message is not None else "",
+            preserve_reference=False,
         )
         await repo.mark_delivery_tombstoned(int(delivery["id"]), tombstone_message_id, tombstone_kind)
 
@@ -114,6 +116,8 @@ async def remove_message_for_mods(
 ) -> int:
     salt = cfg["bot"]["global_salt"]
     deliveries = await repo.list_deliveries_for_message(message_id)
+    message = await repo.get_message(message_id)
+    content_type = str((message or {}).get("content_type") or "")
     removed = 0
     for delivery in deliveries:
         recipient_id = int(delivery["recipient_id"])
@@ -129,7 +133,8 @@ async def remove_message_for_mods(
             recipient_id,
             telegram_message_id,
             text,
-            str((await repo.get_message(message_id) or {}).get("content_type") or ""),
+            content_type,
+            preserve_reference=True,
         )
         await repo.mark_delivery_tombstoned(int(delivery["id"]), tombstone_message_id, tombstone_kind)
         removed += 1
@@ -152,7 +157,7 @@ async def append_action_info_to_message_for_mods(
     separator = "\n\n" if base else ""
     updated_text = f"{base}{separator}{action_info}"
     await repo.update_message_text_content(message_id, updated_text)
-    return await update_message_for_mods(context, repo, message_id, None)
+    return await update_message_for_mods(context, repo, message_id, None, reaction_status=action_info)
 
 
 async def update_message_for_mods(
@@ -160,6 +165,7 @@ async def update_message_for_mods(
     repo: Any,
     message_id: int,
     status: str | None,
+    reaction_status: str | None = None,
 ) -> int:
     message = await repo.get_message(message_id)
     if message is None:
@@ -199,8 +205,15 @@ async def update_message_for_mods(
                 )
             updated += 1
         except Exception as exc:
-            logger.debug("HTML status append failed message_id=%s recipient_id=%s: %s",
-                         message_id, recipient_id, exc)
+            logger.debug(
+                "HTML status append failed message_id=%s recipient_id=%s telegram_message_id=%s content_type=%s reason=%s detail=%s",
+                message_id,
+                recipient_id,
+                telegram_message_id,
+                content_type,
+                _telegram_edit_failure_reason(exc),
+                exc,
+            )
             try:
                 if content_type == "text":
                     await context.bot.edit_message_text(
@@ -219,12 +232,84 @@ async def update_message_for_mods(
                 updated += 1
             except Exception as fallback_exc:
                 logger.debug(
-                    "Failed to append mod-visible message status message_id=%s recipient_id=%s: %s",
+                    "Failed to append mod-visible message status message_id=%s recipient_id=%s telegram_message_id=%s content_type=%s reason=%s detail=%s",
                     message_id,
                     recipient_id,
+                    telegram_message_id,
+                    content_type,
+                    _telegram_edit_failure_reason(fallback_exc),
                     fallback_exc,
                 )
+                if await _set_mod_status_reaction(
+                    context,
+                    recipient_id,
+                    telegram_message_id,
+                    reaction_status or status,
+                ):
+                    updated += 1
     return updated
+
+
+def _telegram_edit_failure_reason(exc: Exception) -> str:
+    text = str(exc).lower()
+    if isinstance(exc, BadRequest):
+        if "message can't be edited" in text or "message can not be edited" in text:
+            return "telegram says this message cannot be edited; common causes are media without editable caption, protected/forwarded messages, old messages, or unsupported message type"
+        if "message is not modified" in text:
+            return "message already has the requested content"
+        if "message to edit not found" in text:
+            return "message no longer exists or is no longer visible to the bot"
+    return type(exc).__name__
+
+
+async def _set_mod_status_reaction(
+    context: Any,
+    chat_id: int,
+    message_id: int,
+    status: str | None,
+) -> bool:
+    emoji = _reaction_for_status(context, status)
+    if not emoji:
+        return False
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[emoji],
+        )
+        logger.debug(
+            "Applied mod-visible status reaction chat_id=%s message_id=%s emoji=%s status=%s",
+            chat_id,
+            message_id,
+            emoji,
+            status,
+        )
+        return True
+    except Exception as exc:
+        logger.debug(
+            "Failed to apply mod-visible status reaction chat_id=%s message_id=%s emoji=%s reason=%s detail=%s",
+            chat_id,
+            message_id,
+            emoji,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+
+def _reaction_for_status(context: Any, status: str | None) -> str | None:
+    cfg = getattr(getattr(context, "application", None), "bot_data", {}).get("cfg", {})
+    reactions = cfg.get("moderation", {}).get("status_reactions", {})
+    text = (status or "").lower()
+    if "confirmed" in text:
+        return str(reactions.get("confirmed", "👍"))
+    if "removed" in text and "pending" not in text:
+        return str(reactions.get("removed", "👌"))
+    if "revert" in text or "did not confirm" in text:
+        return str(reactions.get("reverted", "👎"))
+    if "pending" in text or "moderation action" in text:
+        return str(reactions.get("pending", "🤔"))
+    return None
 
 
 async def _replace_or_send_tombstone(
@@ -233,6 +318,7 @@ async def _replace_or_send_tombstone(
     message_id: int,
     text: str,
     content_type: str,
+    preserve_reference: bool = False,
 ) -> tuple[int | None, str]:
     if content_type == "text":
         try:
@@ -249,12 +335,20 @@ async def _replace_or_send_tombstone(
             logger.debug(
                 "Edit tombstone failed chat_id=%s message_id=%s: %s", chat_id, message_id, exc)
 
+    if content_type != "text" and preserve_reference:
+        logger.debug(
+            "Delete-for-mods requested for media; media cannot become a text tombstone, deleting original chat_id=%s message_id=%s content_type=%s",
+            chat_id,
+            message_id,
+            content_type,
+        )
+
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
         logger.debug(
             "Deleted message before tombstone chat_id=%s message_id=%s", chat_id, message_id)
         if content_type != "text":
-            return None, "deleted"
+            return None, "deleted_uneditable_media"
     except Exception as exc:
         logger.debug(
             "Delete before tombstone failed chat_id=%s message_id=%s: %s", chat_id, message_id, exc)
@@ -346,6 +440,10 @@ async def moderation_note_text_and_markup(
             status_lines.append("Removed for mods: yes")
         if reverted:
             status_lines.append("Reverted: yes")
+        if await _has_deleted_uneditable_mod_delivery(repo, message_id):
+            status_lines.append(
+                "Remove for mods deleted the referenced media because Telegram cannot edit media into a text-only tombstone."
+            )
 
     lines = [
         headline,
@@ -376,6 +474,16 @@ async def moderation_note_text_and_markup(
     if row:
         buttons.append(row)
     return "\n".join(lines), InlineKeyboardMarkup(buttons) if buttons else None
+
+
+async def _has_deleted_uneditable_mod_delivery(repo: Any, message_id: int) -> bool:
+    for delivery in await repo.list_deliveries_for_message(message_id):
+        if delivery.get("tombstone_kind") != "deleted_uneditable_media":
+            continue
+        recipient = await repo.get_user(int(delivery["recipient_id"]))
+        if recipient is not None and (recipient.is_moderator or recipient.is_admin):
+            return True
+    return False
 
 
 async def refresh_moderation_notes(context: Any, repo: Any, cfg: dict[str, Any], message_id: int, sender_id: int) -> None:

@@ -42,6 +42,8 @@ def register_mod_commands(app: Any, repo: Any, cfg: dict[str, Any], sender_cache
         lambda cfg: "show moderation info (mod/admin)")
     add("delete", _delete(repo),
         lambda cfg: "delete a replied message (admin immediate, mod confirmation)")
+    add("blocksticker", _block_sticker(repo),
+        lambda cfg: "block the sticker pack of a replied sticker")
     add("modsay", _modsay(repo), lambda cfg: "broadcast to active users (mod/admin)")
     add("adminsay", _adminsay(repo),
         lambda cfg: "broadcast to active users (admin only)")
@@ -783,6 +785,32 @@ def _delete(repo: Any):
             "deleted by admin" if caller.is_admin else "deleted by moderator",
         )
         await update.message.reply_text(Msg.DELETE_FOR_USERS)
+
+    return handler
+
+
+def _block_sticker(repo: Any):
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.message is None or update.effective_user is None:
+            return
+        caller = await _caller(repo, update, context)
+        if not _is_mod_or_admin(caller):
+            await update.message.reply_text(Msg.MOD_ONLY)
+            return
+        replied = update.message.reply_to_message
+        if replied is None or getattr(replied, "sticker", None) is None:
+            await update.message.reply_text(Msg.BLOCKSTICKER_USAGE)
+            return
+        set_name = getattr(replied.sticker, "set_name", None)
+        if not set_name:
+            await update.message.reply_text(Msg.BLOCKSTICKER_NO_SET)
+            return
+        reason = " ".join(context.args).strip() or "blocked by moderator"
+        await repo.block_sticker_set(set_name, caller.telegram_id, reason)
+        await update.message.reply_text(
+            Msg.stickerpack_blocked(str(set_name)),
+            reply_to_message_id=replied.message_id,
+        )
 
     return handler
 

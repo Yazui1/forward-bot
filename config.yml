@@ -16,6 +16,8 @@ delivery:
   telegram_rate_limit_per_second: 25
   active_window_hours: 72
   worker_count: 1
+  connection_pool_size: 64
+  pool_timeout_seconds: 30
 
 identity:
   allow_sign_toggle: true
@@ -117,6 +119,11 @@ vote_to_remove:
 moderation:
   default_cooldown_seconds: 1800
   delete_reaction_emoji: "✍️"
+  status_reactions:
+    pending: "🤔"
+    confirmed: "👍"
+    removed: "👌"
+    reverted: "👎"
 
 fights:
   enabled: true

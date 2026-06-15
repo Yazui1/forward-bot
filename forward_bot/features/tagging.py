@@ -177,11 +177,14 @@ class TaggingPipeline:
         media_kind: str | None,
         media_info: object | None = None,
         media_bytes: bytes | None = None,
+        sticker_set_name: str | None = None,
         repo: Any | None = None,
         cfg: dict[str, Any] | None = None,
         message_id: int | None = None,
     ) -> TagResult:
         result = TagResult("OK")
+        if media_kind == "sticker" and repo is not None and await repo.is_sticker_set_blocked(sticker_set_name):
+            return TagResult("BLOCKED", "blocked-sticker-set")
         if media_kind:
             if media_info is not None and getattr(media_info, "byte_size", None) == 0:
                 result = TagResult("QUESTIONABLE", "empty-media")

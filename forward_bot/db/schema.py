@@ -117,6 +117,13 @@ CREATE INDEX IF NOT EXISTS idx_media_hashes_hash ON media_hashes(hash);
 CREATE INDEX IF NOT EXISTS idx_media_hashes_created_at ON media_hashes(created_at);
 CREATE INDEX IF NOT EXISTS idx_media_hashes_hash_created_at ON media_hashes(hash, created_at);
 
+CREATE TABLE IF NOT EXISTS blocked_sticker_sets (
+    set_name TEXT PRIMARY KEY,
+    blocked_by INTEGER NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS about_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     message TEXT NOT NULL
@@ -126,8 +133,11 @@ INSERT OR IGNORE INTO about_state (id, message) VALUES (1, 'Anonymous message re
 
 
 async def init_schema(db_path: str, global_salt: str = "") -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=30.0) as db:
         db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA busy_timeout = 30000")
+        await db.execute("PRAGMA journal_mode = WAL")
+        await db.execute("PRAGMA synchronous = NORMAL")
         await migrate_legacy_secretlounge(db, SCHEMA_SQL, global_salt)
         await db.executescript(SCHEMA_SQL)
         await migrate_media_hashes_drop_message_id(db)
