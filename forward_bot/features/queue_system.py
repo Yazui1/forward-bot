@@ -360,9 +360,23 @@ class DeliveryQueue:
                 await self._respect_api_interval()
                 return await self._deliver(bot, item)
             except RetryAfter as e:
-                await asyncio.sleep(float(e.retry_after) + 0.1)
+                delay = float(e.retry_after) + 0.1
+                logger.warning(
+                    "Delivery sleeping after Telegram RetryAfter delay=%.2fs message_id=%s recipient_id=%s",
+                    delay,
+                    item.message_id,
+                    item.recipient_id,
+                )
+                await asyncio.sleep(delay)
             except TimedOut:
-                await asyncio.sleep(0.5)
+                delay = 0.5
+                logger.warning(
+                    "Delivery sleeping after Telegram timeout delay=%.2fs message_id=%s recipient_id=%s",
+                    delay,
+                    item.message_id,
+                    item.recipient_id,
+                )
+                await asyncio.sleep(delay)
             except Forbidden:
                 await self.repo.mark_left(item.recipient_id)
                 return "forbidden_left"
@@ -646,5 +660,8 @@ class DeliveryQueue:
             now = time.time()
             delta = now - self._last_send
             if delta < self._min_interval:
-                await asyncio.sleep(self._min_interval - delta)
+                delay = self._min_interval - delta
+                if delay >= 1.0:
+                    logger.debug("Delivery rate limiter sleeping delay=%.2fs", delay)
+                await asyncio.sleep(delay)
             self._last_send = time.time()

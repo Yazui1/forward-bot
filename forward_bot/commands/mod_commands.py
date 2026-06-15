@@ -43,7 +43,7 @@ def register_mod_commands(app: Any, repo: Any, cfg: dict[str, Any], sender_cache
     add("delete", _delete(repo),
         lambda cfg: "delete a replied message (admin immediate, mod confirmation)")
     add("blocksticker", _block_sticker(repo),
-        lambda cfg: "block the sticker pack of a replied sticker")
+        lambda cfg: "block the sticker pack of a replied sticker (mod/admin)")
     add("modsay", _modsay(repo), lambda cfg: "broadcast to active users (mod/admin)")
     add("adminsay", _adminsay(repo),
         lambda cfg: "broadcast to active users (admin only)")
@@ -402,7 +402,8 @@ def _reload(repo: Any):
         if caller is None or not caller.is_admin:
             await update.message.reply_text(Msg.ADMIN_ONLY)
             return
-        config_path = str(context.application.bot_data.get("config_path", "config.yml"))
+        config_path = str(context.application.bot_data.get(
+            "config_path", "config.yml"))
         try:
             new_cfg = Config(config_path).data
         except Exception as exc:
@@ -450,7 +451,8 @@ def _toggle_mod(repo: Any, cfg: dict[str, Any]):
             await update.message.reply_text(Msg.ADMIN_ONLY)
             return
         target = await _resolve_target(repo, cfg, update, context.args)
-        target_id = None if target is None or target.user is None else int(target.user.telegram_id)
+        target_id = None if target is None or target.user is None else int(
+            target.user.telegram_id)
         if target_id is None:
             if update.message.reply_to_message:
                 await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
@@ -483,7 +485,8 @@ def _ban(repo: Any, cfg: dict[str, Any]):
             await update.message.reply_text(Msg.ADMIN_ONLY)
             return
         resolved = await _resolve_target(repo, cfg, update, context.args)
-        target_id = None if resolved is None or resolved.user is None else int(resolved.user.telegram_id)
+        target_id = None if resolved is None or resolved.user is None else int(
+            resolved.user.telegram_id)
         if target_id is None:
             if update.message.reply_to_message:
                 await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
@@ -509,7 +512,8 @@ def _unban(repo: Any, cfg: dict[str, Any]):
             await update.message.reply_text(Msg.ADMIN_ONLY)
             return
         resolved = await _resolve_target(repo, cfg, update, context.args)
-        target_id = None if resolved is None or resolved.user is None else int(resolved.user.telegram_id)
+        target_id = None if resolved is None or resolved.user is None else int(
+            resolved.user.telegram_id)
         if target_id is None:
             if update.message.reply_to_message:
                 await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
@@ -535,7 +539,8 @@ def _warn(repo: Any, cfg: dict[str, Any]):
             await update.message.reply_text(Msg.MOD_ONLY)
             return
         resolved = await _resolve_target(repo, cfg, update, context.args)
-        target_id = None if resolved is None or resolved.user is None else int(resolved.user.telegram_id)
+        target_id = None if resolved is None or resolved.user is None else int(
+            resolved.user.telegram_id)
         warned_message_id = None
         warned_whisper_id = None
         if update.message.reply_to_message:
@@ -596,14 +601,17 @@ def _cooldown(repo: Any, cfg: dict[str, Any]):
         reason = "cooldown"
         if update.message.reply_to_message:
             target = await _resolve_target(repo, cfg, update, [])
-            target_id = None if target is None or target.user is None else int(target.user.telegram_id)
+            target_id = None if target is None or target.user is None else int(
+                target.user.telegram_id)
             duration_token = context.args[0] if context.args else None
             if len(context.args) > 1:
                 reason = " ".join(context.args[1:])
         else:
             target = await _resolve_target(repo, cfg, update, context.args)
-            target_id = None if target is None or target.user is None else int(target.user.telegram_id)
-            consumed = int(getattr(target, "consumed", 1) or 1) if target is not None else 1
+            target_id = None if target is None or target.user is None else int(
+                target.user.telegram_id)
+            consumed = int(getattr(target, "consumed", 1)
+                           or 1) if target is not None else 1
             if len(context.args) > consumed:
                 duration_token = context.args[consumed]
             if len(context.args) > consumed + 1:
@@ -656,7 +664,8 @@ def _uncooldown(repo: Any, cfg: dict[str, Any]):
             await update.message.reply_text(Msg.MOD_ONLY)
             return
         resolved = await _resolve_target(repo, cfg, update, context.args)
-        target_id = None if resolved is None or resolved.user is None else int(resolved.user.telegram_id)
+        target_id = None if resolved is None or resolved.user is None else int(
+            resolved.user.telegram_id)
         if target_id is None:
             if update.message.reply_to_message:
                 await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
@@ -839,6 +848,11 @@ def _modsay(repo: Any):
             parse_mode="HTML",
         )
         await repo.set_message_tag(msg_id, "OK", None)
+        logger.debug(
+            "Queueing modsay broadcast caller_id=%s recipients=%s",
+            caller.telegram_id,
+            len(mods),
+        )
         await queue.enqueue_batch(msg_id, caller.telegram_id, mods, "text", text, None, None, is_system=True, parse_mode="HTML")
         await safe_reply_text(update.message, repo, Msg.MESSAGE_SENT)
 
@@ -869,6 +883,11 @@ def _adminsay(repo: Any):
             parse_mode="HTML",
         )
         await repo.set_message_tag(msg_id, "OK", None)
+        logger.debug(
+            "Queueing adminsay broadcast caller_id=%s recipients=%s",
+            caller.telegram_id,
+            len(users),
+        )
         await queue.enqueue_batch(msg_id, caller.telegram_id, users, "text", text, None, None, is_system=True, parse_mode="HTML")
         await safe_reply_text(update.message, repo, Msg.MESSAGE_SENT)
 

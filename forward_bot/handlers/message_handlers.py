@@ -353,6 +353,13 @@ async def _send_cooldown_message_to_mods(
         ),
     )
     recipients = [u for u in await repo.list_mod_and_admin_users() if u.telegram_id != sender_id]
+    logger.debug(
+        "Queueing cooldown-visible message to mods sender_id=%s recipients=%s reason=%s remaining=%s",
+        sender_id,
+        len(recipients),
+        str(cooldown["reason"] or "cooldown"),
+        _cooldown_remaining_text(cooldown),
+    )
     await queue.enqueue_batch(
         message_id=message_id,
         sender_id=sender_id,

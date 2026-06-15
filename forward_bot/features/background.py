@@ -45,7 +45,9 @@ async def daily_tax_worker(repo: Any, cfg: dict[str, Any]) -> None:
                     "Daily tax failed for user_id=%s; continuing",
                     user.telegram_id,
                 )
-        await asyncio.sleep(max(60, interval))
+        sleep_for = max(60, interval)
+        logger.debug("Daily tax worker sleeping delay=%ss", sleep_for)
+        await asyncio.sleep(sleep_for)
 
 
 async def tips_worker(bot: Any, repo: Any, cfg: dict[str, Any]) -> None:
@@ -67,4 +69,6 @@ async def tips_worker(bot: Any, repo: Any, cfg: dict[str, Any]) -> None:
                 await repo.mark_left(user.telegram_id)
             except Exception:
                 pass
-        await asyncio.sleep(max(300, interval))
+        sleep_for = max(300, interval)
+        logger.debug("Tips worker sleeping delay=%ss", sleep_for)
+        await asyncio.sleep(sleep_for)
