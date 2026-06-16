@@ -94,10 +94,12 @@ def _start(repo: Any, cfg: dict[str, Any]):
             return
         admin_ids = set(int(x) for x in cfg["bot"].get("admin_ids", []))
         existing = await repo.get_user(user.id)
-        joining_now = existing is None or not existing.has_started
+        first_seen = existing is None
+        joining_now = first_seen or not existing.has_started
         logger.debug(
-            "Start command user_id=%s joining_now=%s args=%s",
+            "Start command user_id=%s first_seen=%s joining_now=%s args=%s",
             user.id,
+            first_seen,
             joining_now,
             list(context.args or []),
         )
@@ -115,80 +117,80 @@ def _start(repo: Any, cfg: dict[str, Any]):
                 return
             await repo.set_about_seen(user.id, True)
 
-        # Invite credit flow. Only users who are joining now may redeem, so
-        # existing active users cannot restart with someone else's code.
-        if joining_now and context.args:
+        # Invite credit flow. Only accounts the bot has never seen before may
+        # redeem, so restarting or rejoining cannot abuse invite rewards.
+        if first_seen and context.args:
             code = context.args[0].strip()
             prefix = str(cfg.get("invites", {}).get("start_prefix", "inv_"))
-            if code.startswith(prefix):
-                invite = await repo.invite_by_code(code)
-                if invite and int(invite["inviter_id"]) != user.id:
-                    if await repo.redeem_invite_once(code, user.id):
-                        reward = float(cfg["credits"]["invite_reward"])
-                        inviter_id = int(invite["inviter_id"])
-                        balance, applied = await adjust_credits_with_daily_limit(
-                            repo,
-                            cfg,
-                            inviter_id,
-                            reward,
-                            "invite_reward",
-                        )
-                        await repo.clear_cooldown(inviter_id)
-                        sent = await safe_send_message(
-                            context.bot,
-                            repo,
-                            inviter_id,
-                            text=Msg.invite_used_cooldown_removed(
-                                applied, balance),
-                        )
-                        logger.info(
-                            "Invite redeemed code=%s inviter_id=%s invitee_id=%s awarded=%.2f balance=%.2f",
+            logger.debug(
+                "Invite start parameter received invitee_id=%s code=%s expected_prefix=%s",
+                user.id,
+                code,
+                prefix,
+            )
+            invite = await repo.invite_by_code(code)
+            if invite and int(invite["inviter_id"]) != user.id:
+                if await repo.redeem_invite_once(code, user.id):
+                    reward = float(cfg["credits"]["invite_reward"])
+                    inviter_id = int(invite["inviter_id"])
+                    balance, applied = await adjust_credits_with_daily_limit(
+                        repo,
+                        cfg,
+                        inviter_id,
+                        reward,
+                        "invite_reward",
+                    )
+                    await repo.clear_cooldown(inviter_id)
+                    sent = await safe_send_message(
+                        context.bot,
+                        repo,
+                        inviter_id,
+                        text=Msg.invite_used_cooldown_removed(applied, balance),
+                    )
+                    logger.info(
+                        "Invite redeemed code=%s inviter_id=%s invitee_id=%s awarded=%.2f balance=%.2f",
+                        code,
+                        inviter_id,
+                        user.id,
+                        applied,
+                        balance,
+                    )
+                    if sent is None:
+                        logger.warning(
+                            "Invite reward notification failed code=%s inviter_id=%s invitee_id=%s awarded=%.2f balance=%.2f",
                             code,
                             inviter_id,
                             user.id,
                             applied,
                             balance,
                         )
-                        if sent is None:
-                            logger.warning(
-                                "Invite reward notification failed code=%s inviter_id=%s invitee_id=%s awarded=%.2f balance=%.2f",
-                                code,
-                                inviter_id,
-                                user.id,
-                                applied,
-                                balance,
-                            )
-                        else:
-                            logger.info(
-                                "Invite reward notification sent code=%s inviter_id=%s invitee_id=%s",
-                                code,
-                                inviter_id,
-                                user.id,
-                            )
                     else:
-                        logger.debug(
-                            "Invite redemption skipped code=%s invitee_id=%s reason=already-redeemed",
+                        logger.info(
+                            "Invite reward notification sent code=%s inviter_id=%s invitee_id=%s",
                             code,
+                            inviter_id,
                             user.id,
                         )
                 else:
                     logger.debug(
-                        "Invite redemption skipped code=%s invitee_id=%s reason=%s",
+                        "Invite redemption skipped code=%s invitee_id=%s reason=already-redeemed",
                         code,
                         user.id,
-                        "self-invite" if invite and int(invite["inviter_id"]) == user.id else "invalid-code",
                     )
             else:
                 logger.debug(
-                    "Start parameter ignored user_id=%s code=%s reason=prefix-mismatch expected_prefix=%s",
-                    user.id,
+                    "Invite redemption skipped code=%s invitee_id=%s reason=%s expected_prefix=%s",
                     code,
+                    user.id,
+                    "self-invite" if invite and int(invite["inviter_id"]) == user.id else "invalid-code-or-prefix-mismatch",
                     prefix,
                 )
         elif context.args:
             logger.debug(
-                "Invite redemption ignored for already-started user_id=%s code=%s",
+                "Invite redemption ignored for known user_id=%s first_seen=%s joining_now=%s code=%s",
                 user.id,
+                first_seen,
+                joining_now,
                 context.args[0],
             )
 
