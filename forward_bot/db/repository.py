@@ -1024,7 +1024,6 @@ class Repository:
         return round_credit(float(row["credits"]))
 
     async def positive_credits_today(self, user_id: int, reason: str) -> float:
-        start_of_day = datetime.now(timezone.utc).strftime("%Y-%m-%d 00:00:00")
         conn = await self._conn()
         async with conn:
             row = await (
@@ -1035,9 +1034,9 @@ class Repository:
                     WHERE user_id = ?
                       AND reason = ?
                       AND amount > 0
-                      AND created_at >= ?
+                      AND date(created_at) = date('now')
                     """,
-                    (user_id, reason, start_of_day),
+                    (user_id, reason),
                 )
             ).fetchone()
         return float(row["total"] or 0.0)

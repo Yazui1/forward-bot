@@ -584,6 +584,25 @@ async def _distribute(
             payload["content_type"],
             tag,
         )
+    reward = cfg_value(
+        payload["content_type"],
+        text_reward=float(cfg["credits"]["text_message_reward"]),
+        media_reward=float(cfg["credits"]["media_message_reward"]),
+    )
+    reward_reason = "text_message_reward" if payload["content_type"] == "text" else "media_message_reward"
+    balance, applied_reward = await adjust_credits_with_daily_limit(repo, cfg, sender_id, reward, reward_reason)
+    log_method = logger.warning if reward > 0 and applied_reward <= 0 else logger.info
+    log_method(
+        "Sender reward message_id=%s sender_id=%s content_type=%s reason=%s configured=%.2f applied=%.2f balance=%.2f",
+        message_id,
+        sender_id,
+        payload["content_type"],
+        reward_reason,
+        reward,
+        applied_reward,
+        balance,
+    )
+    await repo.touch_activity(sender_id)
     await queue.enqueue_batch(
         message_id=message_id,
         sender_id=sender_id,
@@ -663,16 +682,6 @@ async def _distribute_blocked_sticker_to_mods(
         reply_to_message_id=message_id,
         include_remove_button=False,
     )
-    reward = float(
-        cfg_value(
-            payload["content_type"],
-            text_reward=float(cfg["credits"]["text_message_reward"]),
-            media_reward=float(cfg["credits"]["media_message_reward"]),
-        )
-    )
-    reward_reason = "text_message_reward" if payload["content_type"] == "text" else "media_message_reward"
-    await adjust_credits_with_daily_limit(repo, cfg, sender_id, reward, reward_reason)
-    await repo.touch_activity(sender_id)
 
 
 def cfg_value(content_type: str, text_reward: float, media_reward: float) -> float:
