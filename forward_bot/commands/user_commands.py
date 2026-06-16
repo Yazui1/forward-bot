@@ -94,8 +94,13 @@ def _start(repo: Any, cfg: dict[str, Any]):
             return
         admin_ids = set(int(x) for x in cfg["bot"].get("admin_ids", []))
         existing = await repo.get_user(user.id)
-        first_start = existing is None
         joining_now = existing is None or not existing.has_started
+        logger.debug(
+            "Start command user_id=%s joining_now=%s args=%s",
+            user.id,
+            joining_now,
+            list(context.args or []),
+        )
         db_user = await repo.get_or_create_user(
             user.id,
             user.username,
@@ -110,8 +115,9 @@ def _start(repo: Any, cfg: dict[str, Any]):
                 return
             await repo.set_about_seen(user.id, True)
 
-        # Invite credit flow
-        if first_start and context.args:
+        # Invite credit flow. Only users who are joining now may redeem, so
+        # existing active users cannot restart with someone else's code.
+        if joining_now and context.args:
             code = context.args[0].strip()
             prefix = str(cfg.get("invites", {}).get("start_prefix", "inv_"))
             if code.startswith(prefix):
@@ -128,13 +134,63 @@ def _start(repo: Any, cfg: dict[str, Any]):
                             "invite_reward",
                         )
                         await repo.clear_cooldown(inviter_id)
-                        await safe_send_message(
+                        sent = await safe_send_message(
                             context.bot,
                             repo,
                             inviter_id,
                             text=Msg.invite_used_cooldown_removed(
                                 applied, balance),
                         )
+                        logger.info(
+                            "Invite redeemed code=%s inviter_id=%s invitee_id=%s awarded=%.2f balance=%.2f",
+                            code,
+                            inviter_id,
+                            user.id,
+                            applied,
+                            balance,
+                        )
+                        if sent is None:
+                            logger.warning(
+                                "Invite reward notification failed code=%s inviter_id=%s invitee_id=%s awarded=%.2f balance=%.2f",
+                                code,
+                                inviter_id,
+                                user.id,
+                                applied,
+                                balance,
+                            )
+                        else:
+                            logger.info(
+                                "Invite reward notification sent code=%s inviter_id=%s invitee_id=%s",
+                                code,
+                                inviter_id,
+                                user.id,
+                            )
+                    else:
+                        logger.debug(
+                            "Invite redemption skipped code=%s invitee_id=%s reason=already-redeemed",
+                            code,
+                            user.id,
+                        )
+                else:
+                    logger.debug(
+                        "Invite redemption skipped code=%s invitee_id=%s reason=%s",
+                        code,
+                        user.id,
+                        "self-invite" if invite and int(invite["inviter_id"]) == user.id else "invalid-code",
+                    )
+            else:
+                logger.debug(
+                    "Start parameter ignored user_id=%s code=%s reason=prefix-mismatch expected_prefix=%s",
+                    user.id,
+                    code,
+                    prefix,
+                )
+        elif context.args:
+            logger.debug(
+                "Invite redemption ignored for already-started user_id=%s code=%s",
+                user.id,
+                context.args[0],
+            )
 
         initial_cooldown = int(cfg.get("onboarding", {}).get(
             "initial_cooldown_seconds", 0))

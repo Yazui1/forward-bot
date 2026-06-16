@@ -1432,6 +1432,14 @@ class Repository:
     async def redeem_invite_once(self, code: str, invitee_id: int) -> bool:
         conn = await self._conn()
         async with conn:
+            existing = await (
+                await conn.execute(
+                    "SELECT 1 FROM invite_redemptions WHERE invitee_id = ? LIMIT 1",
+                    (invitee_id,),
+                )
+            ).fetchone()
+            if existing is not None:
+                return False
             try:
                 await conn.execute(
                     "INSERT INTO invite_redemptions (invite_code, invitee_id) VALUES (?, ?)",
