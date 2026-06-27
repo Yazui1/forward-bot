@@ -1,0 +1,31 @@
+bot:
+  username: "YourForwardBot"
+  token: "123456789:replace-with-bot-token"
+  launch:
+    enabled: true
+    python: "venv/Scripts/python.exe"
+    run_py: "run.py"
+    base_config: "config.yml"
+    runtime_config: "e2e/.runtime/bot.config.yml"
+    runtime_database: "e2e/.runtime/bot.db"
+    fresh_database: true
+    log_file: "e2e/.runtime/bot.log"
+
+accounts:
+  owner:
+    session: "e2e/.sessions/owner"
+    api_id: 123456
+    api_hash: "0123456789abcdef0123456789abcdef"
+  user_a:
+    session: "e2e/.sessions/user_a"
+    api_id: 123456
+    api_hash: "0123456789abcdef0123456789abcdef"
+  user_b:
+    session: "e2e/.sessions/user_b"
+    api_id: 123456
+    api_hash: "0123456789abcdef0123456789abcdef"
+
+timeouts:
+  bot_start_seconds: 8
+  message_seconds: 30
+  absent_seconds: 3

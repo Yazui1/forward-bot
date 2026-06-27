@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-from bisect import bisect_left
 
-
-def linear_interpolate(points: list[tuple[float, float]], x: float) -> float:
+def interpolate(schedule: list[dict], x_key: str, y_key: str, x: float, default: float = 0.0) -> float:
+    points = sorted(
+        [(float(item[x_key]), float(item[y_key])) for item in schedule if item.get(x_key) is not None and item.get(y_key) is not None],
+        key=lambda p: p[0],
+    )
     if not points:
-        raise ValueError("points must not be empty")
-    points = sorted(points, key=lambda p: p[0])
-    xs = [p[0] for p in points]
-    idx = bisect_left(xs, x)
-    if idx <= 0:
+        return default
+    if x <= points[0][0]:
         return points[0][1]
-    if idx >= len(points):
+    if x >= points[-1][0]:
         return points[-1][1]
-    x0, y0 = points[idx - 1]
-    x1, y1 = points[idx]
-    if x1 == x0:
-        return y1
-    ratio = (x - x0) / (x1 - x0)
-    return y0 + (y1 - y0) * ratio
+    for (x1, y1), (x2, y2) in zip(points, points[1:]):
+        if x1 <= x <= x2:
+            if x2 == x1:
+                return y2
+            ratio = (x - x1) / (x2 - x1)
+            return y1 + (y2 - y1) * ratio
+    return default

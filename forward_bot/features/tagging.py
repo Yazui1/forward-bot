@@ -1,294 +1,119 @@
 from __future__ import annotations
 
-import asyncio
-import logging
 import re
 from dataclasses import dataclass
-from io import BytesIO
+from datetime import timedelta
 from typing import Any
 
-from PIL import Image
-
-from forward_bot.features.duplicate_media import compute_media_hash
-
-logger = logging.getLogger(__name__)
-
-TELEGRAM_INVITE_RE = re.compile(
-    r"(?:https?://)?(?:t\.me|telegram\.me)/(?!c/|s/|share/|addstickers/|iv\\?|botfather\\b)[A-Za-z0-9_+][A-Za-z0-9_+/?=&.-]*",
-    re.IGNORECASE,
-)
+from forward_bot.config import Config
+from forward_bot.db.repository import Repository
+from forward_bot.features.duplicate_media import media_digest
+from forward_bot.features.media import AIClassifier, MediaInspection
+from forward_bot.utils import now_utc, parse_dt
 
 
-@dataclass(frozen=True)
+TAG_OK = "OK"
+TAG_BLOCKED = "BLOCKED"
+TAG_QUESTIONABLE = "QUESTIONABLE"
+TAG_POTENTIALLY_UNWANTED = "POTENTIALLY_UNWANTED"
+TAG_DUPLICATE = "DUPLICATE"
+
+_INVITE_RE = re.compile(r"https?://(?:t\.me|telegram\.me)/([A-Za-z0-9_+/.-]+)|(?:^|\s)(?:t\.me|telegram\.me)/([A-Za-z0-9_+/.-]+)", re.I)
+_EXCLUDED_INVITE_PREFIXES = ("c/", "s/", "share/", "addstickers/", "iv", "BotFather")
+
+
+@dataclass(slots=True)
 class TagResult:
-    tag: str
+    tag: str = TAG_OK
     reason: str | None = None
-
-
-@dataclass
-class AIClassifier:
-    enabled: bool = False
-    model_path: str = "model.keras"
-    question_threshold: float = 0.93
-    block_threshold: float | None = None
-    image_size: int = 224
-    timeout_seconds: float = 2.0
-
-    _model: Any | None = None
-    _load_attempted: bool = False
-    _lock: asyncio.Lock | None = None
-
-    @classmethod
-    def from_config(cls, cfg: dict[str, Any]) -> "AIClassifier":
-        ai_cfg = cfg.get("ai", {})
-        return cls(
-            enabled=bool(ai_cfg.get("enabled", False)),
-            model_path=str(ai_cfg.get(
-                "model_path", "model.keras")),
-            question_threshold=float(ai_cfg.get("question_threshold", 0.93)),
-            block_threshold=(
-                float(ai_cfg["block_threshold"])
-                if ai_cfg.get("block_threshold") is not None
-                else None
-            ),
-            image_size=int(ai_cfg.get("image_size", 224)),
-            timeout_seconds=float(ai_cfg.get("timeout_seconds", 2.0)),
-        )
-
-    def update_config(self, cfg: dict[str, Any]) -> None:
-        ai_cfg = cfg.get("ai", {})
-        model_path = str(ai_cfg.get("model_path", self.model_path))
-        if model_path != self.model_path:
-            self._model = None
-            self._load_attempted = False
-        self.enabled = bool(ai_cfg.get("enabled", self.enabled))
-        self.model_path = model_path
-        self.question_threshold = float(ai_cfg.get(
-            "question_threshold", self.question_threshold))
-        self.block_threshold = (
-            float(ai_cfg["block_threshold"])
-            if ai_cfg.get("block_threshold") is not None
-            else None
-        )
-        self.image_size = int(ai_cfg.get("image_size", self.image_size))
-        self.timeout_seconds = float(ai_cfg.get("timeout_seconds", self.timeout_seconds))
-
-    async def classify_image(self, image_bytes: bytes) -> TagResult:
-        if not self.enabled:
-            return TagResult("OK")
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        if self._lock.locked():
-            logger.warning("AI media classifier is still busy; allowing message")
-            return TagResult("OK")
-        await self._lock.acquire()
-        task = asyncio.create_task(asyncio.to_thread(self._classify_image_sync, image_bytes))
-        try:
-            result = await asyncio.wait_for(asyncio.shield(task), timeout=max(0.1, self.timeout_seconds))
-            self._lock.release()
-            return result
-        except TimeoutError:
-            logger.warning(
-                "AI media classification timed out after %.2fs; allowing message",
-                self.timeout_seconds,
-            )
-            task.add_done_callback(lambda _task: self._release_lock_after_ai_task())
-            return TagResult("OK")
-        except Exception:
-            if self._lock.locked():
-                self._lock.release()
-            raise
-
-    def _release_lock_after_ai_task(self) -> None:
-        if self._lock is not None and self._lock.locked():
-            self._lock.release()
-
-    def _classify_image_sync(self, image_bytes: bytes) -> TagResult:
-        if not self.enabled:
-            return TagResult("OK")
-        model = self._load_model()
-        if model is None:
-            return TagResult("OK")
-        try:
-            arr = self._preprocess(image_bytes)
-            pred = float(model.predict(arr, verbose=0)[0][0])
-        except Exception as exc:
-            logger.exception("AI media classification failed: %s", exc)
-            return TagResult("OK")
-
-        logger.debug("AI media classification prediction=%.4f", pred)
-        if self.block_threshold is not None and pred >= self.block_threshold:
-            logger.info(
-                "AI media classifier blocked image prediction=%.4f", pred)
-            return TagResult("BLOCKED", "ai-blocked-media")
-        if pred >= self.question_threshold:
-            logger.info(
-                "AI media classifier marked image questionable prediction=%.4f", pred)
-            return TagResult("QUESTIONABLE", "ai-questionable-media")
-        return TagResult("OK")
-
-    def _load_model(self) -> Any | None:
-        if self._load_attempted:
-            return self._model
-        self._load_attempted = True
-        try:
-            import tensorflow as tf  # type: ignore[import-not-found]
-
-            self._model = tf.keras.models.load_model(self.model_path)
-            logger.info("Loaded AI media classifier model from %s",
-                        self.model_path)
-        except Exception as exc:
-            self._model = None
-            logger.warning(
-                "AI media classifier disabled; failed to load model %s: %s", self.model_path, exc)
-        return self._model
-
-    def _preprocess(self, image_bytes: bytes) -> Any:
-        try:
-            import numpy as np  # type: ignore[import-not-found]
-        except Exception as exc:
-            raise RuntimeError(
-                "numpy is required for AI media classification") from exc
-
-        with Image.open(BytesIO(image_bytes)) as image:
-            image = image.convert("RGB").resize(
-                (self.image_size, self.image_size))
-            arr = np.array(image, dtype=np.float32) / 255.0
-        return np.expand_dims(arr, axis=0)
+    media_hash: str | None = None
+    media_hash_first_seen_at: str | None = None
+    remove_buttons: bool = False
 
 
 class TaggingPipeline:
-    def __init__(
-        self,
-        blocked_terms: list[str],
-        questionable_terms: list[str],
-        potentially_unwanted_terms: list[str] | None = None,
-        ai_classifier: AIClassifier | None = None,
-    ) -> None:
-        self.blocked_terms = [x.lower() for x in blocked_terms]
-        self.questionable_terms = [x.lower() for x in questionable_terms]
-        self.potentially_unwanted_terms = [
-            x.lower() for x in (potentially_unwanted_terms or [])]
-        self.ai_classifier = ai_classifier
+    def __init__(self, config: Config, repo: Repository, ai: AIClassifier):
+        self.config = config
+        self.repo = repo
+        self.ai = ai
+        self.refresh(config)
 
-    async def run_once(
-        self,
-        text: str | None,
-        media_kind: str | None,
-        media_info: object | None = None,
-        media_bytes: bytes | None = None,
-        sticker_set_name: str | None = None,
-        repo: Any | None = None,
-        cfg: dict[str, Any] | None = None,
-        message_id: int | None = None,
-    ) -> TagResult:
-        result = TagResult("OK")
-        if media_kind == "sticker" and repo is not None and await repo.is_sticker_set_blocked(sticker_set_name):
-            return TagResult("BLOCKED", "blocked-sticker-set")
-        if media_kind:
-            if media_info is not None and getattr(media_info, "byte_size", None) == 0:
-                result = TagResult("QUESTIONABLE", "empty-media")
-            ai_result = await self._classify_media(
-                media_kind, media_info, media_bytes)
-            if ai_result is not None:
-                result = ai_result
+    def refresh(self, config: Config) -> None:
+        self.config = config
+        self.blocked_terms = [str(x).lower() for x in config.get("tagging.blocked_terms", []) or []]
+        self.questionable_terms = [str(x).lower() for x in config.get("tagging.questionable_terms", []) or []]
+        self.potentially_unwanted_terms = [str(x).lower() for x in config.get("tagging.potentially_unwanted_terms", []) or []]
 
-        if text:
-            lowered = text.lower()
-            invite = self._classify_telegram_invite(text)
-            if invite is not None:
-                result = invite
+    async def classify(self, payload: dict[str, Any], inspection: MediaInspection) -> TagResult:
+        result = TagResult()
+        text = (payload.get("text") or "").lower()
+
+        sticker_set = payload.get("sticker_set_name")
+        if sticker_set and self.repo.get_blocked_sticker_set(sticker_set):
+            return TagResult(TAG_BLOCKED, "blocked-sticker-set")
+
+        invite = self._invite_result(payload.get("text") or "")
+        if invite:
+            if invite == "blocked":
+                return TagResult(TAG_BLOCKED, "telegram-invite-undescribed")
+            result.reason = "telegram-invite-described"
+            result.remove_buttons = True
+
+        if result.tag == TAG_OK:
             for term in self.potentially_unwanted_terms:
-                if term and term in lowered:
-                    if result.tag == "OK":
-                        result = TagResult("POTENTIALLY_UNWANTED", "potentially-unwanted-term")
+                if term and term in text:
+                    result.tag = TAG_POTENTIALLY_UNWANTED
+                    result.reason = f"potentially-unwanted-term:{term}"
                     break
-            for term in self.blocked_terms:
-                if term and term in lowered:
-                    result = TagResult("BLOCKED", "blocked-term")
-                    break
+
+        for term in self.blocked_terms:
+            if term and term in text:
+                return TagResult(TAG_BLOCKED, f"blocked-term:{term}")
+
+        if result.tag in {TAG_OK, TAG_POTENTIALLY_UNWANTED}:
             for term in self.questionable_terms:
-                if term and term in lowered:
-                    if result.tag in {"OK", "POTENTIALLY_UNWANTED"}:
-                        result = TagResult("QUESTIONABLE", "questionable-term")
+                if term and term in text:
+                    result.tag = TAG_QUESTIONABLE
+                    result.reason = f"questionable-term:{term}"
                     break
 
-        duplicate = await self._classify_duplicate_media(
-            media_kind,
-            media_info,
-            media_bytes,
-            repo,
-            cfg,
-            message_id,
-        )
-        if duplicate is not None:
-            return duplicate
+        if inspection.empty_preview and payload.get("content_type") not in {"text", None}:
+            result.tag = TAG_QUESTIONABLE
+            result.reason = result.reason or "empty-media-preview"
 
+        if inspection.image_like and inspection.preview_bytes:
+            ai_tag, ai_reason = await self.ai.classify(inspection.preview_bytes)
+            if ai_tag == TAG_BLOCKED:
+                return TagResult(TAG_BLOCKED, ai_reason or "ai-blocked")
+            if ai_tag == TAG_QUESTIONABLE and result.tag == TAG_OK:
+                result.tag = TAG_QUESTIONABLE
+                result.reason = ai_reason or "ai-questionable"
+
+        if self.config.get("duplicates.enabled", True) and inspection.image_like and payload.get("content_type") != "sticker":
+            digest = media_digest(inspection.preview_bytes)
+            if digest:
+                existing = self.repo.get_media_hash(digest)
+                if existing:
+                    result.media_hash = digest
+                    result.media_hash_first_seen_at = existing.get("first_seen_at")
+                    first = parse_dt(existing.get("first_seen_at"))
+                    retention = int(self.config.get("duplicates.sender_block_retention_days", 3) or 3)
+                    if first and first + timedelta(days=retention) >= now_utc():
+                        result.tag = TAG_DUPLICATE
+                        result.reason = "duplicate-media"
+                    self.repo.upsert_media_hash(digest, first_seen_at=existing.get("first_seen_at"))
+                else:
+                    info = self.repo.upsert_media_hash(digest)
+                    result.media_hash = digest
+                    result.media_hash_first_seen_at = info.get("first_seen_at")
         return result
 
-    def _classify_telegram_invite(self, text: str) -> TagResult | None:
-        match = TELEGRAM_INVITE_RE.search(text)
-        if match is None:
-            return None
-        remaining = (text[:match.start()] + " " + text[match.end():]).strip()
-        if len(remaining) >= 3:
-            return TagResult("OK", "telegram-invite-described")
-        return TagResult("BLOCKED", "telegram-invite-link")
-
-    async def _classify_media(
-        self,
-        media_kind: str | None,
-        media_info: Any,
-        media_bytes: bytes | None,
-    ) -> TagResult | None:
-        if self.ai_classifier is None or not self.ai_classifier.enabled:
-            return None
-        if media_bytes is None:
-            return None
-        if not media_kind or media_info is None or not getattr(media_info, "is_image_like", False):
-            return None
-        result = await self.ai_classifier.classify_image(media_bytes)
-        if result.tag != "OK":
-            return result
-        return None
-
-    async def _classify_duplicate_media(
-        self,
-        media_kind: str | None,
-        media_info: Any,
-        media_bytes: bytes | None,
-        repo: Any | None,
-        cfg: dict[str, Any] | None,
-        message_id: int | None,
-    ) -> TagResult | None:
-        if repo is None or cfg is None or message_id is None:
-            return None
-        if not bool(cfg.get("duplicates", {}).get("enabled", True)):
-            return None
-        if media_kind == "sticker":
-            return None
-        if media_bytes is None:
-            return None
-        if media_info is None or not getattr(media_info, "is_image_like", False):
-            return None
-
-        sender_block_days = int(cfg.get("duplicates", {}).get("sender_block_retention_days", 3))
-        try:
-            hash_value = compute_media_hash(media_bytes)
-            first_seen_at = await repo.first_media_hash_seen_at(hash_value)
-            if first_seen_at is not None:
-                await repo.set_message_media_hash(message_id, hash_value, first_seen_at)
-                logger.info(
-                    "Duplicate media detected message_id=%s media_kind=%s",
-                    message_id,
-                    media_kind,
-                )
-                if await repo.media_hash_seen_within(hash_value, sender_block_days):
-                    return TagResult("DUPLICATE", "duplicate-media")
-                await repo.add_media_hash(hash_value)
-                return None
-            await repo.add_media_hash(hash_value)
-            await repo.set_message_media_hash(message_id, hash_value, None)
-        except Exception:
-            logger.exception("Failed duplicate media check message_id=%s", message_id)
+    def _invite_result(self, text: str) -> str | None:
+        for match in _INVITE_RE.finditer(text):
+            target = (match.group(1) or match.group(2) or "").lstrip("/")
+            if not target or target.startswith(_EXCLUDED_INVITE_PREFIXES):
+                continue
+            remaining = (text[: match.start()] + text[match.end() :]).strip()
+            meaningful = re.sub(r"\W+", "", remaining)
+            return "described" if len(meaningful) >= 3 else "blocked"
         return None

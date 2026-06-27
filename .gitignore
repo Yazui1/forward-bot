@@ -2,3 +2,6 @@ __pycache__
 venv
 data/*.db
 model.keras
+e2e/telethon_config.yml
+e2e/.sessions/
+e2e/.runtime/

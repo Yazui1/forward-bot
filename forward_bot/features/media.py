@@ -1,263 +1,241 @@
 from __future__ import annotations
 
-import time
+import asyncio
 import logging
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
 
 from PIL import Image, ImageFilter
-
-logger = logging.getLogger(__name__)
-
-
-def _named_image(data: bytes, name: str = "image.jpg") -> BytesIO:
-    stream = BytesIO(data)
-    stream.seek(0)
-    stream.name = name
-    return stream
+from telegram import Bot, Message
 
 
-@dataclass(frozen=True)
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
 class MediaInspection:
-    file_id: str
-    media_kind: str
-    is_image_like: bool
+    preview_bytes: bytes | None = None
     width: int | None = None
     height: int | None = None
     byte_size: int | None = None
-    thumbnail_file_id: str | None = None
-    mime_type: str | None = None
-    preview_bytes: bytes | None = None
+    image_like: bool = False
+    empty_preview: bool = False
 
 
 class MediaService:
-    def __init__(self, ttl_seconds: int = 900, max_size: int = 512) -> None:
-        self.ttl_seconds = ttl_seconds
-        self.max_size = max_size
-        self._inspections: dict[str, tuple[MediaInspection, float]] = {}
-        self._blurred: dict[str, tuple[bytes, float]] = {}
+    def __init__(self) -> None:
+        self._preview_cache: dict[int, bytes] = {}
+        self._blur_cache: dict[int, bytes] = {}
 
-    async def inspect(
-        self,
-        bot: Any,
-        file_id: str | None,
-        media_kind: str | None,
-        thumbnail_file_id: str | None = None,
-        mime_type: str | None = None,
-        is_animated: bool | None = None,
-        is_video: bool | None = None,
-    ) -> MediaInspection | None:
-        if not file_id or not media_kind:
-            return None
-        key = f"{media_kind}:{file_id}:{thumbnail_file_id or ''}:{mime_type or ''}:{is_animated}:{is_video}"
-        cached = self._get(self._inspections, key)
-        if cached is not None:
-            return cached
-
-        width = None
-        height = None
-        byte_size = None
-        preview = await self.preview_bytes(
-            bot,
-            file_id,
-            media_kind,
-            thumbnail_file_id,
-            mime_type=mime_type,
-            is_animated=is_animated,
-            is_video=is_video,
-        )
-        is_image_like = preview is not None
-        if preview is not None:
-            try:
-                byte_size = len(preview)
-                with Image.open(BytesIO(preview)) as image:
-                    width, height = image.size
-            except Exception:
-                is_image_like = False
-
-        inspection = MediaInspection(
-            file_id=file_id,
-            media_kind=media_kind,
-            is_image_like=is_image_like,
+    async def inspect(self, bot: Bot, message_id: int, payload: dict[str, Any]) -> MediaInspection:
+        file_id = _preview_file_id(payload)
+        if not file_id:
+            return MediaInspection()
+        content_type = payload.get("content_type")
+        try:
+            tg_file = await bot.get_file(file_id)
+            data = bytes(await tg_file.download_as_bytearray())
+        except Exception:
+            return MediaInspection(empty_preview=True)
+        self._preview_cache[message_id] = data
+        width = height = None
+        image_like = False
+        try:
+            with Image.open(BytesIO(data)) as img:
+                width, height = img.size
+                image_like = True
+        except Exception:
+            image_like = content_type in {"photo", "sticker"}
+        return MediaInspection(
+            preview_bytes=data,
             width=width,
             height=height,
-            byte_size=byte_size,
-            thumbnail_file_id=thumbnail_file_id,
-            mime_type=mime_type,
-            preview_bytes=preview,
+            byte_size=len(data),
+            image_like=image_like,
+            empty_preview=not bool(data),
         )
-        self._set(
-            self._inspections,
-            key,
-            MediaInspection(
-                file_id=file_id,
-                media_kind=media_kind,
-                is_image_like=is_image_like,
-                width=width,
-                height=height,
-                byte_size=byte_size,
-                thumbnail_file_id=thumbnail_file_id,
-                mime_type=mime_type,
-                preview_bytes=None,
-            ),
+
+    async def blurred_preview(self, message_id: int) -> bytes | None:
+        if message_id in self._blur_cache:
+            return self._blur_cache[message_id]
+        data = self._preview_cache.get(message_id)
+        if not data:
+            return None
+        try:
+            with Image.open(BytesIO(data)) as img:
+                img = img.convert("RGB").filter(ImageFilter.GaussianBlur(radius=18))
+                out = BytesIO()
+                img.save(out, format="JPEG", quality=70)
+                blurred = out.getvalue()
+                self._blur_cache[message_id] = blurred
+                return blurred
+        except Exception:
+            return None
+
+    def release(self, message_id: int) -> None:
+        self._preview_cache.pop(message_id, None)
+        self._blur_cache.pop(message_id, None)
+
+
+class AIClassifier:
+    def __init__(self, config: dict[str, Any]):
+        self.config = config
+        self._model: Any = None
+        self._model_path: str | None = None
+        self._lock = asyncio.Lock()
+
+    def update_config(self, config: dict[str, Any]) -> None:
+        if config.get("model_path") != self._model_path:
+            self._model = None
+            self._model_path = None
+        self.config = config
+
+    async def classify(self, preview_bytes: bytes | None) -> tuple[str, str | None]:
+        if not self.config.get("enabled") or not preview_bytes:
+            return "OK", None
+        timeout = float(self.config.get("timeout_seconds", 2.0) or 2.0)
+        try:
+            score = await asyncio.wait_for(self._predict_score(preview_bytes), timeout=timeout)
+        except Exception as exc:
+            LOGGER.debug("AI classifier failed open: %s", exc)
+            return "OK", None
+        block_threshold = self.config.get("block_threshold")
+        question_threshold = self.config.get("question_threshold")
+        if block_threshold is not None and score >= float(block_threshold):
+            return "BLOCKED", f"ai-score:{score:.4f}"
+        if question_threshold is not None and score >= float(question_threshold):
+            return "QUESTIONABLE", f"ai-score:{score:.4f}"
+        return "OK", None
+
+    async def _predict_score(self, preview_bytes: bytes) -> float:
+        async with self._lock:
+            model = await self._load_model()
+            if model is None:
+                return 0.0
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, self._predict_sync, model, preview_bytes)
+
+    async def _load_model(self) -> Any:
+        model_path = str(self.config.get("model_path") or "")
+        if self._model is not None and self._model_path == model_path:
+            return self._model
+        if not model_path:
+            return None
+        loop = asyncio.get_running_loop()
+        self._model = await loop.run_in_executor(None, _load_keras_model, model_path)
+        self._model_path = model_path
+        return self._model
+
+    def _predict_sync(self, model: Any, preview_bytes: bytes) -> float:
+        import numpy as np
+
+        size = int(self.config.get("image_size", 224) or 224)
+        with Image.open(BytesIO(preview_bytes)) as img:
+            img = img.convert("RGB").resize((size, size))
+            arr = np.asarray(img, dtype="float32") / 255.0
+        pred = model.predict(arr[None, ...], verbose=0)
+        return float(np.asarray(pred).reshape(-1)[0])
+
+
+def _load_keras_model(model_path: str) -> Any:
+    try:
+        from tensorflow import keras
+        return keras.models.load_model(model_path)
+    except Exception:
+        try:
+            import keras
+            return keras.models.load_model(model_path)
+        except Exception as exc:
+            raise RuntimeError(f"failed to load AI model {model_path}: {exc}") from exc
+
+
+def extract_payload(message: Message) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "content_type": "text",
+        "text": message.text or message.caption or "",
+        "media_file_id": None,
+        "thumbnail_file_id": None,
+        "media_kind": None,
+        "mime_type": None,
+        "sticker_set_name": None,
+        "is_animated": False,
+        "is_video": False,
+        "parse_mode": None,
+        "forward_from_chat_id": None,
+        "forward_from_message_id": None,
+    }
+    origin = getattr(message, "forward_origin", None)
+    origin_name = origin.__class__.__name__.lower() if origin else ""
+    if origin and not getattr(message, "has_protected_content", False) and "hidden" not in origin_name:
+        payload["forward_from_chat_id"] = message.chat_id
+        payload["forward_from_message_id"] = message.message_id
+    if message.photo:
+        largest = message.photo[-1]
+        payload.update(
+            content_type="photo",
+            media_file_id=largest.file_id,
+            thumbnail_file_id=message.photo[0].file_id if len(message.photo) > 1 else largest.file_id,
+            media_kind="photo",
+            text=message.caption or "",
         )
-        return inspection
+    elif message.video:
+        payload.update(
+            content_type="video",
+            media_file_id=message.video.file_id,
+            thumbnail_file_id=message.video.thumbnail.file_id if message.video.thumbnail else None,
+            media_kind="video",
+            mime_type=message.video.mime_type,
+            text=message.caption or "",
+        )
+    elif message.animation:
+        payload.update(
+            content_type="animation",
+            media_file_id=message.animation.file_id,
+            thumbnail_file_id=message.animation.thumbnail.file_id if message.animation.thumbnail else None,
+            media_kind="animation",
+            mime_type=message.animation.mime_type,
+            text=message.caption or "",
+        )
+    elif message.sticker:
+        payload.update(
+            content_type="sticker",
+            media_file_id=message.sticker.file_id,
+            thumbnail_file_id=message.sticker.thumbnail.file_id if message.sticker.thumbnail else None,
+            media_kind="sticker",
+            sticker_set_name=message.sticker.set_name,
+            is_animated=bool(message.sticker.is_animated),
+            is_video=bool(message.sticker.is_video),
+            text="",
+        )
+    elif message.document:
+        payload.update(
+            content_type="document",
+            media_file_id=message.document.file_id,
+            thumbnail_file_id=message.document.thumbnail.file_id if message.document.thumbnail else None,
+            media_kind="document",
+            mime_type=message.document.mime_type,
+            text=message.caption or "",
+        )
+    elif message.video_note:
+        payload.update(
+            content_type="video_note",
+            media_file_id=message.video_note.file_id,
+            thumbnail_file_id=message.video_note.thumbnail.file_id if message.video_note.thumbnail else None,
+            media_kind="video_note",
+            text="",
+        )
+    elif message.text:
+        payload["text"] = message.text
+    return payload
 
-    async def blur_photo(self, bot: Any, file_id: str) -> BytesIO | None:
-        return await self.blur_image(bot, file_id)
 
-    async def preview_bytes(
-        self,
-        bot: Any,
-        file_id: str | None,
-        media_kind: str | None,
-        thumbnail_file_id: str | None = None,
-        mime_type: str | None = None,
-        is_animated: bool | None = None,
-        is_video: bool | None = None,
-    ) -> bytes | None:
-        if not file_id or not media_kind:
-            return None
-
-        if thumbnail_file_id:
-            try:
-                raw = await self.fetch_bytes(bot, thumbnail_file_id, purpose="preview-thumbnail")
-                preview = self._image_preview(raw)
-                if preview is not None:
-                    return preview
-            except Exception:
-                logger.debug(
-                    "Could not use Telegram thumbnail for media preview file_id=%s kind=%s",
-                    file_id,
-                    media_kind,
-                    exc_info=True,
-                )
-
-        if not self._may_download_original_preview(media_kind, mime_type, is_animated, is_video):
-            logger.debug(
-                "Skipping original media download for preview file_id=%s kind=%s mime_type=%s",
-                file_id,
-                media_kind,
-                mime_type,
-            )
-            return None
-
-        try:
-            raw = await self.fetch_bytes(bot, file_id, purpose="preview-original")
-        except Exception:
-            logger.debug("Could not fetch media for preview file_id=%s kind=%s", file_id, media_kind, exc_info=True)
-            return None
-
-        preview = self._image_preview(raw)
-        return preview
-
-    def seed_blurred_image(self, file_id: str | None, image_bytes: bytes | None) -> None:
-        if not file_id or not image_bytes:
-            return
-        if self._get(self._blurred, file_id) is not None:
-            return
-        blurred = self._blur_bytes(image_bytes)
-        if blurred is not None:
-            self._set(self._blurred, file_id, blurred)
-
-    async def blur_image(self, bot: Any, file_id: str) -> BytesIO | None:
-        cached = self._get(self._blurred, file_id)
-        if cached is not None:
-            return _named_image(cached, "blurred.jpg")
-        try:
-            raw = await self.fetch_bytes(bot, file_id, purpose="blur")
-            data = self._blur_bytes(raw)
-            if data is None:
-                return None
-            self._set(self._blurred, file_id, data)
-            return _named_image(data, "blurred.jpg")
-        except Exception:
-            return None
-
-    async def fetch_bytes(self, bot: Any, file_id: str, purpose: str = "media") -> bytes:
-        logger.debug("Downloading media bytes purpose=%s file_id=%s", purpose, file_id)
-        tg_file = await bot.get_file(file_id)
-        return bytes(await tg_file.download_as_bytearray())
-
-    def _blur_bytes(self, raw: bytes) -> bytes | None:
-        try:
-            with Image.open(BytesIO(raw)) as image:
-                try:
-                    image.seek(0)
-                except EOFError:
-                    pass
-                image = image.convert("RGB").filter(ImageFilter.GaussianBlur(radius=18))
-                out = BytesIO()
-                image.save(out, format="JPEG", quality=82)
-                return out.getvalue()
-        except Exception:
-            return None
-
-    def release_media(
-        self,
-        file_id: str | None,
-        media_kind: str | None,
-        thumbnail_file_id: str | None = None,
-        mime_type: str | None = None,
-        is_animated: bool | None = None,
-        is_video: bool | None = None,
-    ) -> None:
-        if not file_id or not media_kind:
-            return
-        inspection_key = f"{media_kind}:{file_id}:{thumbnail_file_id or ''}:{mime_type or ''}:{is_animated}:{is_video}"
-        self._inspections.pop(inspection_key, None)
-        self._blurred.pop(file_id, None)
-        if thumbnail_file_id:
-            self._blurred.pop(thumbnail_file_id, None)
-
-    def _image_preview(self, raw: bytes) -> bytes | None:
-        try:
-            with Image.open(BytesIO(raw)) as image:
-                try:
-                    image.seek(0)
-                except EOFError:
-                    pass
-                image = image.convert("RGB")
-                out = BytesIO()
-                image.save(out, format="JPEG", quality=88)
-                return out.getvalue()
-        except Exception:
-            return None
-
-    def _may_download_original_preview(
-        self,
-        media_kind: str,
-        mime_type: str | None,
-        is_animated: bool | None,
-        is_video: bool | None,
-    ) -> bool:
-        mime = (mime_type or "").lower()
-        if media_kind == "photo":
-            return True
-        if media_kind == "document":
-            return False
-        if media_kind == "animation":
-            return False
-        if media_kind == "sticker":
-            return not bool(is_animated) and not bool(is_video)
-        return False
-
-    def _get(self, cache: dict[str, tuple[Any, float]], key: str) -> Any | None:
-        self._evict(cache)
-        item = cache.get(key)
-        if item is None:
-            return None
-        return item[0]
-
-    def _set(self, cache: dict[str, tuple[Any, float]], key: str, value: Any) -> None:
-        cache[key] = (value, time.time())
-        self._evict(cache)
-        while len(cache) > self.max_size:
-            cache.pop(next(iter(cache)))
-
-    def _evict(self, cache: dict[str, tuple[Any, float]]) -> None:
-        cutoff = time.time() - self.ttl_seconds
-        for key, (_, created_at) in list(cache.items()):
-            if created_at < cutoff:
-                cache.pop(key, None)
+def _preview_file_id(payload: dict[str, Any]) -> str | None:
+    content_type = payload.get("content_type")
+    thumbnail = payload.get("thumbnail_file_id")
+    media = payload.get("media_file_id")
+    if content_type in {"video", "animation", "video_note", "document"}:
+        return thumbnail
+    if content_type == "sticker" and (payload.get("is_animated") or payload.get("is_video")):
+        return thumbnail
+    return thumbnail or media

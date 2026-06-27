@@ -1,142 +1,113 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from dataclasses import dataclass
-import logging
-from typing import Any
-
-from telegram.error import Forbidden, TelegramError, TimedOut
-
-from forward_bot.crypto.obfuscation import temporal_id
-
-logger = logging.getLogger(__name__)
-
-
-def as_utc(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+import hashlib
+import html
+import math
+import random
+import re
+import secrets
+import unicodedata
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Iterable
 
 
-async def resolve_forwarded_sender(repo: Any, viewer_id: int, replied_message_id: int) -> tuple[int, int] | None:
-    return await repo.sender_by_delivery(viewer_id, replied_message_id)
+def now_utc() -> datetime:
+    return datetime.now(UTC).replace(microsecond=0)
 
 
-async def resolve_whisper_sender(repo: Any, viewer_id: int, replied_message_id: int) -> int | None:
-    return await repo.whisper_sender_by_reply(viewer_id, replied_message_id)
+def iso(dt: datetime | None = None) -> str:
+    return (dt or now_utc()).astimezone(UTC).replace(microsecond=0).isoformat()
 
 
-async def safe_send_message(bot: Any, repo: Any, chat_id: int, **kwargs: Any) -> Any | None:
+def parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
     try:
-        return await bot.send_message(chat_id=chat_id, **kwargs)
-    except Forbidden:
-        logger.info("Direct send failed; marking user left chat_id=%s", chat_id)
-        if repo is not None:
-            await repo.mark_left(int(chat_id))
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
         return None
-    except TimedOut:
-        logger.warning("Direct send timed out chat_id=%s", chat_id)
-        return None
-    except TelegramError as exc:
-        logger.warning("Direct send failed chat_id=%s error=%s", chat_id, exc)
-        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
-async def safe_reply_text(message: Any, repo: Any, text: str, **kwargs: Any) -> Any | None:
-    chat_id = getattr(message, "chat_id", None)
-    try:
-        return await message.reply_text(text, **kwargs)
-    except Forbidden:
-        logger.info("Reply failed; marking user left chat_id=%s", chat_id)
-        if repo is not None and chat_id is not None:
-            await repo.mark_left(int(chat_id))
-        return None
-    except TimedOut:
-        logger.warning("Reply timed out chat_id=%s", chat_id)
-        return None
-    except TelegramError as exc:
-        logger.warning("Reply failed chat_id=%s error=%s", chat_id, exc)
-        return None
+def today_key() -> str:
+    return now_utc().date().isoformat()
 
 
-@dataclass(frozen=True)
-class TargetResolution:
-    user: Any | None
-    consumed: int = 0
-    error: str | None = None
-    source_message_id: int | None = None
+def round_credits(value: float | Decimal) -> float:
+    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-async def resolve_reply_target(repo: Any, viewer_id: int, replied_message_id: int) -> TargetResolution:
-    lookup = await repo.sender_by_delivery(viewer_id, replied_message_id)
-    if lookup is not None:
-        message_id, sender_id = lookup
-        return TargetResolution(await repo.get_user(sender_id), source_message_id=message_id)
-    whisper = await repo.whisper_context_by_reply(viewer_id, replied_message_id)
-    if whisper is not None:
-        sender_id = int(whisper["sender_id"])
-        return TargetResolution(await repo.get_user(sender_id), source_message_id=-int(whisper["id"]))
-    return TargetResolution(None, error="Message is not in cache anymore")
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 
-async def resolve_user_reference(
-    repo: Any,
-    cfg: dict[str, Any],
-    caller: Any,
-    args: list[str],
-) -> TargetResolution:
-    if not args:
-        return TargetResolution(None, error="Missing user reference.")
-
-    token = args[0].strip()
-    if not token:
-        return TargetResolution(None, error="Missing user reference.")
-
-    if token.startswith("@"):
-        if not getattr(caller, "is_admin", False):
-            return TargetResolution(None, error="Only admins can resolve @usernames.")
-        user = await repo.get_user_by_username(token[1:])
-        return TargetResolution(user, consumed=1, error=None if user else "User not found.")
-
-    trip = _parse_tripcode_reference(args)
-    if trip is not None:
-        name, code, consumed = trip
-        user = await _find_tripcode_user(repo, name, code)
-        return TargetResolution(user, consumed=consumed, error=None if user else "User not found.")
-
-    salt = str(cfg["bot"]["global_salt"])
-    wanted = token.upper()
-    for user in await repo.list_users():
-        if temporal_id(user.telegram_id, salt) == wanted:
-            return TargetResolution(user, consumed=1)
-    return TargetResolution(None, error="User not found.")
+def html_escape(value: str | None) -> str:
+    return html.escape(value or "", quote=False)
 
 
-def _parse_tripcode_reference(args: list[str]) -> tuple[str, str, int] | None:
-    first = args[0].strip()
-    if "!" in first:
-        name, code = first.split("!", 1)
-        name = name.strip()
-        code = code.strip()
-        if name and code:
-            return name, code, 1
-    if len(args) >= 2 and args[1].strip().startswith("!"):
-        name = first
-        code = args[1].strip()[1:]
-        if name and code:
-            return name, code, 2
-    return None
+def normalize_emoji(value: str) -> str:
+    return unicodedata.normalize("NFC", value).replace("\ufe0f", "")
 
 
-async def _find_tripcode_user(repo: Any, name: str, code: str) -> Any | None:
-    normalized_name = name.casefold()
-    normalized_code = code[:6].casefold()
-    for user in await repo.list_users():
-        if not getattr(user, "tripcode_enabled", False):
-            continue
-        if not user.tripcode_name or not user.tripcode_hash:
-            continue
-        if str(user.tripcode_name).casefold() == normalized_name and str(user.tripcode_hash)[:6].casefold() == normalized_code:
-            return user
-    return None
+def random_token(size: int = 12) -> str:
+    return secrets.token_urlsafe(size).replace("-", "").replace("_", "")[:size]
+
+
+def temporal_id(telegram_id: int, salt: str, day: str | None = None) -> str:
+    day = day or today_key()
+    payload = f"{salt}:{day}:{telegram_id}".encode()
+    digest = hashlib.blake2s(payload, digest_size=5).hexdigest()
+    return digest.upper()
+
+
+def parse_duration_seconds(text: str | None, default: int) -> tuple[int, str]:
+    if not text:
+        return default, ""
+    parts = text.strip().split(maxsplit=1)
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", parts[0], re.I)
+    if not m:
+        return default, text.strip()
+    amount = float(m.group(1))
+    unit = m.group(2).lower() or "s"
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    reason = parts[1].strip() if len(parts) > 1 else ""
+    return max(1, int(amount * mult)), reason
+
+
+def seconds_left(until: datetime | str | None) -> int:
+    if isinstance(until, str):
+        until = parse_dt(until)
+    if not until:
+        return 0
+    return max(0, int((until - now_utc()).total_seconds()))
+
+
+def human_seconds(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{math.ceil(seconds / 60)}m"
+    if seconds < 86400:
+        return f"{math.ceil(seconds / 3600)}h"
+    return f"{math.ceil(seconds / 86400)}d"
+
+
+def mean_median(values: list[float]) -> tuple[float, float, float]:
+    if not values:
+        return 0.0, 0.0, 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        med = ordered[mid]
+    else:
+        med = (ordered[mid - 1] + ordered[mid]) / 2
+    return ordered[0], med, ordered[-1]
+
+
+def pick_random(items: Iterable[str]) -> str | None:
+    seq = list(items)
+    return random.choice(seq) if seq else None

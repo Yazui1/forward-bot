@@ -1,22 +1,37 @@
 from __future__ import annotations
 
-import time
 from collections import defaultdict, deque
+from datetime import timedelta
+
+from forward_bot.utils import now_utc
 
 
 class RateLimiter:
-    def __init__(self, limit: int, window_seconds: int) -> None:
-        self.limit = limit
-        self.window_seconds = window_seconds
-        self._hits: dict[int, deque[float]] = defaultdict(deque)
+    def __init__(self, limit: int, window_seconds: int):
+        self.limit = max(1, int(limit))
+        self.window = timedelta(seconds=max(1, int(window_seconds)))
+        self.events: dict[int, deque] = defaultdict(deque)
+
+    def update_config(self, limit: int, window_seconds: int) -> None:
+        self.limit = max(1, int(limit))
+        self.window = timedelta(seconds=max(1, int(window_seconds)))
 
     def check(self, user_id: int) -> tuple[bool, int]:
-        now = time.time()
-        q = self._hits[user_id]
-        while q and now - q[0] > self.window_seconds:
+        q = self.events[user_id]
+        now = now_utc()
+        while q and q[0] + self.window < now:
             q.popleft()
         if len(q) >= self.limit:
-            retry = max(1, int(self.window_seconds - (now - q[0])))
-            return False, retry
+            retry = int((q[0] + self.window - now).total_seconds()) + 1
+            return False, max(1, retry)
         q.append(now)
         return True, 0
+
+    def remaining_seconds(self, user_id: int) -> int:
+        q = self.events[user_id]
+        now = now_utc()
+        while q and q[0] + self.window < now:
+            q.popleft()
+        if len(q) < self.limit:
+            return 0
+        return max(1, int((q[0] + self.window - now).total_seconds()) + 1)

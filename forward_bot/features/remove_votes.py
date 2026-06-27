@@ -1,54 +1,126 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+import logging
 
-from forward_bot.utils import as_utc
+from telegram import Bot
+from telegram.error import TelegramError
+
+from forward_bot.cache.transient import TransientStore
+from forward_bot.config import Config
+from forward_bot.db.repository import Repository, User
+from forward_bot.features.tombstones import mark_for_moderation_action, remove_message
+from forward_bot.logging_utils import log_telegram_error
 
 
-async def check_remove_vote_allowed(repo: Any, cfg: dict[str, Any], voter_id: int) -> tuple[bool, str | None]:
-    cooldown = await repo.get_active_cooldown(voter_id)
-    if cooldown is not None:
+LOGGER = logging.getLogger(__name__)
+
+
+async def vote_to_remove(
+    bot: Bot,
+    repo: Repository,
+    store: TransientStore,
+    config: Config,
+    message_id: int,
+    voter: User,
+) -> tuple[bool, str]:
+    msg = store.get_message(message_id)
+    if not msg:
+        return False, "Message is not in cache anymore."
+    if msg.sender_id == voter.telegram_id:
+        return False, "You cannot vote to remove your own message."
+    if voter.active_cooldown_seconds > 0:
+        return False, "You cannot vote while in cooldown."
+    min_percentile = config.get("vote_to_remove.voter_min_top_credit_percentile", None)
+    if min_percentile is not None:
+        cutoff = repo.credit_percentile_cutoff(float(min_percentile))
+        if voter.credits < cutoff:
+            return False, "You need enough credits relative to other users to remove-vote."
+    cd = int(config.get("vote_to_remove.user_vote_cooldown_seconds", 300) or 300)
+    left = store.latest_remove_vote_seconds_left(voter.telegram_id, cd)
+    if left > 0:
+        return False, f"Remove vote cooldown: {left}s."
+    user_window = int(config.get("vote_to_remove.user_remove_cooldown_seconds", 3600) or 3600)
+    user_limit = int(config.get("vote_to_remove.user_remove_limit", 3) or 3)
+    if store.recent_remove_votes_by_user(voter.telegram_id, user_window) >= user_limit:
+        return False, "You reached the remove-vote limit."
+    global_window = int(config.get("vote_to_remove.global_cooldown_seconds", 3600) or 3600)
+    global_limit = int(config.get("vote_to_remove.global_limit", 6) or 6)
+    if store.recent_global_removals(global_window) >= global_limit:
+        return False, "Community remove-vote limit reached."
+    ok, count = store.add_remove_vote(message_id, voter.telegram_id)
+    if not ok:
+        return False, f"You already voted. Current votes: {count}."
+    repo.touch_activity(voter.telegram_id)
+    await mark_for_moderation_action(bot, repo, store, config, message_id)
+    threshold = int(config.get("vote_to_remove.threshold", 3) or 3)
+    if count < threshold:
+        return True, f"Remove vote recorded ({count}/{threshold})."
+    voters = list(store.remove_votes.get(message_id, set()))
+    voter_reply_targets = _voter_reply_targets(store, message_id, voters)
+    store.record_global_removal()
+    await remove_message(
+        bot,
+        repo,
+        store,
+        config,
+        message_id,
+        reason="community remove vote threshold reached",
+        voter_ids=voters,
+    )
+    await _notify_voters(bot, voter_reply_targets, "Remove vote threshold reached. Message removed.")
+    await _remove_collateral(bot, repo, store, config, message_id)
+    return True, "Remove vote threshold reached. Message removed."
+
+
+def _voter_reply_targets(store: TransientStore, message_id: int, voter_ids: list[int]) -> dict[int, int | None]:
+    targets: dict[int, int | None] = {}
+    deliveries = {delivery.recipient_id: delivery for delivery in store.deliveries_for_message(message_id)}
+    for voter_id in voter_ids:
+        delivery = deliveries.get(voter_id)
+        targets[voter_id] = delivery.telegram_message_id if delivery else None
+    return targets
+
+
+async def _notify_voters(bot: Bot, reply_targets: dict[int, int | None], text: str) -> None:
+    for voter_id, reply_to in reply_targets.items():
         try:
-            until = as_utc(str(cooldown["until_at"]))
-            wait = max(0, int((until - datetime.now(timezone.utc)).total_seconds()))
-            return False, f"You are currently cooled down. Remaining: {wait}s."
-        except ValueError:
-            return False, "You are currently cooled down."
-
-    voter = await repo.get_user(voter_id)
-    if voter is None:
-        return False, "User not found."
-    top_fraction = float(cfg["vote_to_remove"].get("voter_min_top_credit_percentile", -1))
-    if top_fraction > 1:
-        top_fraction = top_fraction / 100.0
-    if top_fraction >= 0:
-        cutoff = await repo.credit_cutoff_for_top_fraction(top_fraction)
-        if float(voter.credits) < cutoff:
-            pct = int(top_fraction * 100)
-            return False, f"Remove voting requires at least {cutoff:.2f} credits (top {pct}% cutoff)."
-
-    user_vote_cd = int(cfg["vote_to_remove"]["user_vote_cooldown_seconds"])
-    last_vote = await repo.user_last_remove_vote_at(voter_id)
-    if last_vote:
-        try:
-            last_vote_at = as_utc(last_vote)
-            wait = user_vote_cd - int((datetime.now(timezone.utc) - last_vote_at).total_seconds())
-            if wait > 0:
-                return False, f"Remove vote cooldown active ({wait}s)."
-        except ValueError:
+            await bot.send_message(
+                voter_id,
+                text,
+                reply_to_message_id=reply_to,
+            )
+        except TelegramError as exc:
+            queue = getattr(store, "delivery_queue", None)
+            aggregate = getattr(queue, "_aggregate_logger", None)
+            repo = getattr(getattr(store, "delivery_queue", None), "repo", None)
+            log_telegram_error(LOGGER, "remove_vote.notify_voter", exc, aggregate=aggregate, repo=repo, user_id=voter_id, reply_to=reply_to)
             pass
 
-    user_remove_limit = int(cfg["vote_to_remove"]["user_remove_limit"])
-    user_remove_window = int(cfg["vote_to_remove"]["user_remove_cooldown_seconds"])
-    used = await repo.count_user_remove_votes_in_window(voter_id, user_remove_window)
-    if used >= user_remove_limit:
-        return False, "Your remove-vote limit is reached for now."
 
-    global_limit = int(cfg["vote_to_remove"]["global_limit"])
-    global_window = int(cfg["vote_to_remove"]["global_cooldown_seconds"])
-    global_used = await repo.count_global_removals_in_window(global_window)
-    if global_used >= global_limit:
-        return False, "Global remove limit reached. Try later."
-
-    return True, None
+async def _remove_collateral(bot: Bot, repo: Repository, store: TransientStore, config: Config, pivot_id: int) -> None:
+    pivot = store.get_message(pivot_id)
+    if not pivot or not pivot.sender_id:
+        return
+    amount = int(config.get("vote_to_remove.collateral_remove_amount", 0) or 0)
+    if amount <= 0:
+        return
+    before = [
+        m for m in store.messages.values()
+        if m.sender_id == pivot.sender_id and m.id < pivot_id and not m.deleted
+    ]
+    after = [
+        m for m in store.messages.values()
+        if m.sender_id == pivot.sender_id and m.id > pivot_id and not m.deleted
+    ]
+    before.sort(key=lambda m: m.id, reverse=True)
+    after.sort(key=lambda m: m.id)
+    neighbors = []
+    while len(neighbors) < amount and (before or after):
+        if before:
+            neighbors.append(before.pop(0))
+            if len(neighbors) >= amount:
+                break
+        if after:
+            neighbors.append(after.pop(0))
+    for msg in neighbors:
+        await remove_message(bot, repo, store, config, msg.id, reason="collateral removal", notify_sender=False)

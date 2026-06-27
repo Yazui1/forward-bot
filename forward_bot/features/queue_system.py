@@ -1,667 +1,462 @@
 from __future__ import annotations
 
 import asyncio
-import random
-import time
+import heapq
+import itertools
 import logging
-from collections import Counter, deque
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+import random
+from collections import defaultdict, deque
+from dataclasses import dataclass, replace
+from datetime import timedelta
+from io import BytesIO
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError, TimedOut
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.error import BadRequest, ChatMigrated, Forbidden, RetryAfter, TelegramError
 
-from forward_bot.features.credits import interpolate_loss_rate
-from forward_bot.messages import Messages as Msg
-from forward_bot.utils import as_utc
+from forward_bot.cache.transient import TransientMessage, TransientStore
+from forward_bot.config import Config
+from forward_bot.db.repository import Repository, User
+from forward_bot.features.credits import loss_rate
+from forward_bot.features.media import MediaService
+from forward_bot.features.tombstone_media import removed_photo_media
+from forward_bot.logging_utils import AggregateLogger, log_telegram_error
+from forward_bot.utils import html_escape, now_utc, parse_dt
 
-logger = logging.getLogger(__name__)
+
+LOGGER = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class DeliveryItem:
-    priority: int
     message_id: int
-    sender_id: int
+    sender_id: int | None
     recipient_id: int
+    priority: float
     content_type: str
-    text_content: str | None
+    text: str | None
     media_file_id: str | None
-    media_kind: str | None
     thumbnail_file_id: str | None
+    media_kind: str | None
+    mime_type: str | None
+    sticker_set_name: str | None
     is_system: bool
-    is_forward: bool = False
-    forward_from_chat_id: int | None = None
-    forward_message_id: int | None = None
-    media_hash: str | None = None
-    media_hash_first_seen_at: str | None = None
-    mime_type: str | None = None
-    is_animated: bool | None = None
-    is_video: bool | None = None
-    reply_to_message_id: int | None = None
-    include_remove_button: bool = False
-    parse_mode: str | None = None
-    urgent: bool = False
+    urgent: bool
+    reply_to_message_id: int | None
+    parse_mode: str | None
+    remove_buttons: bool
+    media_hash: str | None
+    forward_from_chat_id: int | None
+    forward_from_message_id: int | None
+    system_html: bool = False
+    cancelled: bool = False
+    started: bool = False
 
 
 class DeliveryQueue:
-    def __init__(self, repo: Any, cfg: dict[str, Any], media_service: Any | None = None) -> None:
+    def __init__(self, config: Config, repo: Repository, store: TransientStore, media: MediaService, aggregate_logger: AggregateLogger | None = None):
+        self.config = config
         self.repo = repo
-        self.cfg = cfg
-        self.media_service = media_service
-        self.queue: asyncio.PriorityQueue[tuple[int,
-                                                int, DeliveryItem]] = asyncio.PriorityQueue()
-        self._counter = 0
-        self._last_send = 0.0
-        self._min_interval = 1 / \
-            max(1, int(cfg["delivery"]["telegram_rate_limit_per_second"]))
-        self._running = False
-        self._bot: Any | None = None
-        self._inactivity_notified: set[int] = set()
-        self._recipient_locks: dict[int, asyncio.Lock] = {}
-        self._recipient_pending: dict[int, deque[DeliveryItem]] = {}
+        self.store = store
+        self.media = media
+        self.rate_per_second = float(config.get("delivery.telegram_rate_limit_per_second", 25) or 25)
+        self.active_window = timedelta(hours=float(config.get("delivery.active_window_hours", 72) or 72))
+        self.worker_count = int(config.get("delivery.worker_count", 1) or 1)
+        self._bot: Bot | None = None
+        self._aggregate_logger = aggregate_logger
+        self._queue: list[tuple[float, int, DeliveryItem]] = []
+        self._event = asyncio.Event()
+        self._seq = itertools.count()
+        self._recipient_pending: dict[int, deque[DeliveryItem]] = defaultdict(deque)
         self._recipient_queued: set[int] = set()
-        self._recipient_queue_lock = asyncio.Lock()
-        self._message_pending_counts: dict[int, int] = {}
-        self._message_release_items: dict[int, DeliveryItem] = {}
-        self._message_stats: dict[int, Counter[str]] = {}
-        self._message_started_at: dict[int, float] = {}
-        self._send_rate_lock = asyncio.Lock()
+        self._recipient_heap_item: dict[int, DeliveryItem] = {}
+        self._recipient_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._rate_lock = asyncio.Lock()
+        self._workers: list[asyncio.Task] = []
+        self._stopping = False
+        self._last_send = 0.0
+        self._pending_counts: dict[int, int] = defaultdict(int)
+        self._completed_counts: dict[int, int] = defaultdict(int)
+        self._recipient_hashes: set[tuple[int, str]] = set()
 
-    def update_config(self, cfg: dict[str, Any]) -> None:
-        self.cfg = cfg
-        self._min_interval = 1 / \
-            max(1, int(cfg["delivery"]["telegram_rate_limit_per_second"]))
+    def update_config(self, config: Config) -> None:
+        self.config = config
+        self.rate_per_second = float(config.get("delivery.telegram_rate_limit_per_second", 25) or 25)
+        self.active_window = timedelta(hours=float(config.get("delivery.active_window_hours", 72) or 72))
 
-    async def enqueue_batch(
-        self,
-        message_id: int,
-        sender_id: int,
-        recipients: list[Any],
-        content_type: str,
-        text_content: str | None,
-        media_file_id: str | None,
-        media_kind: str | None,
-        thumbnail_file_id: str | None = None,
-        is_system: bool = False,
-        reply_to_message_id: int | None = None,
-        include_remove_button: bool = False,
-        parse_mode: str | None = None,
-        urgent: bool | None = None,
-        is_forward: bool = False,
-        forward_from_chat_id: int | None = None,
-        forward_message_id: int | None = None,
-        media_hash: str | None = None,
-        media_hash_first_seen_at: str | None = None,
-        mime_type: str | None = None,
-        is_animated: bool | None = None,
-        is_video: bool | None = None,
-    ) -> None:
-        is_urgent = is_system if urgent is None else urgent
-        logger.debug(
-            "Enqueue delivery batch message_id=%s sender_id=%s recipients=%s content_type=%s is_system=%s urgent=%s reply_to=%s",
-            message_id,
-            sender_id,
-            len(recipients),
-            content_type,
-            is_system,
-            is_urgent,
-            reply_to_message_id,
-        )
-        items = self._build_batch_items(
-            message_id=message_id,
-            sender_id=sender_id,
-            recipients=recipients,
-            content_type=content_type,
-            text_content=text_content,
-            media_file_id=media_file_id,
-            media_kind=media_kind,
-            thumbnail_file_id=thumbnail_file_id,
-            is_system=is_system,
-            reply_to_message_id=reply_to_message_id,
-            include_remove_button=include_remove_button,
-            parse_mode=parse_mode,
-            urgent=is_urgent,
-            is_forward=is_forward,
-            forward_from_chat_id=forward_from_chat_id,
-            forward_message_id=forward_message_id,
-            media_hash=media_hash,
-            media_hash_first_seen_at=media_hash_first_seen_at,
-            mime_type=mime_type,
-            is_animated=is_animated,
-            is_video=is_video,
-        )
-        if not items:
-            if self.media_service is not None:
-                self.media_service.release_media(
-                    media_file_id,
-                    media_kind,
-                    thumbnail_file_id,
-                    mime_type=mime_type,
-                    is_animated=is_animated,
-                    is_video=is_video,
-                )
-            return
-        if is_urgent:
-            await self._enqueue_urgent_items(items)
-            return
-        self._track_message_lifetime(message_id, items)
-        await self._enqueue_items(items)
+    async def start(self, bot: Bot) -> None:
+        self._bot = bot
+        self._stopping = False
+        self._workers = [asyncio.create_task(self._worker(), name=f"delivery-{i}") for i in range(self.worker_count)]
 
-    def _build_batch_items(
-        self,
-        message_id: int,
-        sender_id: int,
-        recipients: list[Any],
-        content_type: str,
-        text_content: str | None,
-        media_file_id: str | None,
-        media_kind: str | None,
-        thumbnail_file_id: str | None = None,
-        is_system: bool = False,
-        reply_to_message_id: int | None = None,
-        include_remove_button: bool = False,
-        parse_mode: str | None = None,
-        urgent: bool = False,
-        is_forward: bool = False,
-        forward_from_chat_id: int | None = None,
-        forward_message_id: int | None = None,
-        media_hash: str | None = None,
-        media_hash_first_seen_at: str | None = None,
-        mime_type: str | None = None,
-        is_animated: bool | None = None,
-        is_video: bool | None = None,
-    ) -> list[DeliveryItem]:
-        items: list[DeliveryItem] = []
-        for user in recipients:
+    async def stop(self) -> None:
+        self._stopping = True
+        self._event.set()
+        for task in self._workers:
+            task.cancel()
+        await asyncio.gather(*self._workers, return_exceptions=True)
+
+    def enqueue_message(self, message: TransientMessage, recipients: list[User]) -> int:
+        if not recipients:
+            self.media.release(message.id)
+            return 0
+        self._pending_counts[message.id] += len(recipients)
+        for recipient in recipients:
             item = DeliveryItem(
-                priority=self._priority_for(user, urgent),
-                message_id=message_id,
-                sender_id=sender_id,
-                recipient_id=user.telegram_id,
-                content_type=content_type,
-                text_content=text_content,
-                media_file_id=media_file_id,
-                media_kind=media_kind,
-                thumbnail_file_id=thumbnail_file_id,
-                is_system=is_system,
-                is_forward=is_forward,
-                forward_from_chat_id=forward_from_chat_id,
-                forward_message_id=forward_message_id,
-                media_hash=media_hash,
-                media_hash_first_seen_at=media_hash_first_seen_at,
-                mime_type=mime_type,
-                is_animated=is_animated,
-                is_video=is_video,
-                reply_to_message_id=reply_to_message_id,
-                include_remove_button=include_remove_button,
-                parse_mode=parse_mode,
-                urgent=urgent,
+                message_id=message.id,
+                sender_id=message.sender_id,
+                recipient_id=recipient.telegram_id,
+                priority=self._priority(recipient, urgent=message.urgent or message.is_system),
+                content_type=message.content_type,
+                text=message.text,
+                media_file_id=message.media_file_id,
+                thumbnail_file_id=message.thumbnail_file_id,
+                media_kind=message.media_kind,
+                mime_type=message.mime_type,
+                sticker_set_name=message.sticker_set_name,
+                is_system=message.is_system,
+                urgent=message.urgent or message.is_system,
+                reply_to_message_id=message.reply_to_message_id,
+                parse_mode=message.parse_mode,
+                remove_buttons=message.remove_buttons,
+                media_hash=message.media_hash,
+                forward_from_chat_id=message.metadata.get("forward_from_chat_id"),
+                forward_from_message_id=message.metadata.get("forward_from_message_id"),
+                system_html=bool(message.metadata.get("system_html")),
             )
-            items.append(item)
-        return items
+            if item.urgent and self._bot:
+                self._enqueue_urgent(item)
+            else:
+                self._enqueue_ordered(item)
+        return len(recipients)
 
-    def _track_message_lifetime(self, message_id: int, items: list[DeliveryItem]) -> None:
-        if not items:
-            return
-        item = items[0]
-        self._message_pending_counts[message_id] = self._message_pending_counts.get(message_id, 0) + len(items)
-        self._message_stats.setdefault(message_id, Counter())["queued"] += len(items)
-        self._message_started_at.setdefault(message_id, time.time())
-        if self.media_service is not None and item.media_file_id and item.media_kind:
-            self._message_release_items[message_id] = item
+    def promote_deleted_message(self, message_id: int) -> None:
+        urgent_priority = -1_000_000_000.0
+        touched = False
+        for item in self._recipient_heap_item.values():
+            if item.message_id == message_id and not item.started and not item.cancelled:
+                item.priority = urgent_priority
+                item.urgent = True
+                touched = True
+        if touched:
+            self._queue = [
+                (urgent_priority if item.message_id == message_id and not item.started and not item.cancelled else priority, seq, item)
+                for priority, seq, item in self._queue
+            ]
+            heapq.heapify(self._queue)
+            self._event.set()
 
-    def _priority_for(self, user: Any, urgent: bool) -> int:
-        if urgent:
-            return -1_000_000_000
-        active_window_seconds = int(
-            float(self.cfg["delivery"]["active_window_hours"]) * 3600
-        )
-        if not user.last_activity:
-            return active_window_seconds * 2
-        try:
-            last_active = as_utc(user.last_activity)
-        except ValueError:
-            return active_window_seconds * 2
-        age_seconds = max(
-            0,
-            int((datetime.now(timezone.utc) - last_active).total_seconds()),
-        )
-        if age_seconds > active_window_seconds:
-            return active_window_seconds + age_seconds
-        return age_seconds
+    def _priority(self, recipient: User, *, urgent: bool) -> float:
+        last = parse_dt(recipient.last_activity)
+        if not last:
+            base = 1_000_000.0
+            return base - 0.5 if urgent else base
+        age = now_utc() - last
+        if age <= self.active_window:
+            base = age.total_seconds()
+        else:
+            base = 500_000.0 + age.total_seconds()
+        return base - 0.5 if urgent else base
 
-    async def _enqueue_items(self, items: list[DeliveryItem]) -> None:
-        for item in items:
-            await self._enqueue_ordered_item(item)
+    def _enqueue_ordered(self, item: DeliveryItem) -> None:
+        pending = self._recipient_pending[item.recipient_id]
+        pending.append(item)
+        if item.recipient_id not in self._recipient_queued:
+            self._queue_one_for_recipient(item.recipient_id)
 
-    async def _enqueue_urgent_items(self, items: list[DeliveryItem]) -> None:
-        message_ids = {item.message_id for item in items}
-        logger.debug(
-            "Queueing urgent delivery batch messages=%s recipients=%s",
-            len(message_ids),
-            len(items),
-        )
-        self._track_message_lifetime(items[0].message_id, items)
-        await self._enqueue_items(items)
+    def _enqueue_urgent(self, item: DeliveryItem) -> None:
+        pending = self._recipient_pending[item.recipient_id]
+        queued = self._recipient_heap_item.get(item.recipient_id)
+        if queued and not queued.urgent and not queued.cancelled and not queued.started:
+            queued.cancelled = True
+            self._recipient_queued.discard(item.recipient_id)
+            pending.appendleft(replace(queued, cancelled=False))
+        pending.appendleft(item)
+        if item.recipient_id not in self._recipient_queued:
+            self._queue_one_for_recipient(item.recipient_id)
 
-    async def _enqueue_ordered_item(self, item: DeliveryItem) -> None:
-        async with self._recipient_queue_lock:
-            pending = self._recipient_pending.setdefault(
-                item.recipient_id, deque()
-            )
-            pending.append(item)
-            if item.recipient_id not in self._recipient_queued:
-                await self._queue_next_recipient_item_locked(item.recipient_id)
-
-    async def _queue_next_recipient_item_locked(self, recipient_id: int) -> None:
+    def _queue_one_for_recipient(self, recipient_id: int) -> None:
         pending = self._recipient_pending.get(recipient_id)
         if not pending:
-            self._recipient_pending.pop(recipient_id, None)
             self._recipient_queued.discard(recipient_id)
             return
         item = pending.popleft()
         self._recipient_queued.add(recipient_id)
-        self._counter += 1
-        await self.queue.put((item.priority, self._counter, item))
+        self._recipient_heap_item[recipient_id] = item
+        heapq.heappush(self._queue, (item.priority, next(self._seq), item))
+        self._event.set()
 
-    async def _complete_ordered_item(self, item: DeliveryItem, status: str = "unknown") -> None:
-        async with self._recipient_queue_lock:
+    async def _worker(self) -> None:
+        while not self._stopping:
+            if not self._queue:
+                self._event.clear()
+                await self._event.wait()
+                continue
+            _, _, item = heapq.heappop(self._queue)
+            if item.cancelled:
+                continue
+            item.started = True
+            status = await self._send_with_backoff(item)
+            self._finish_item(item, status)
+
+    async def _send_urgent(self, item: DeliveryItem) -> None:
+        status = await self._send_with_backoff(item)
+        self._finish_item(item, status, ordered=False)
+
+    def _finish_item(self, item: DeliveryItem, status: str, *, ordered: bool = True) -> None:
+        if self._aggregate_logger:
+            self._aggregate_logger.increment(f"delivery.{status}")
+        self.store.record_delivery_status(item.message_id, status)
+        self._completed_counts[item.message_id] += 1
+        if ordered:
             self._recipient_queued.discard(item.recipient_id)
-            self._mark_message_delivery_complete_locked(item, status)
-            await self._queue_next_recipient_item_locked(item.recipient_id)
+            if self._recipient_heap_item.get(item.recipient_id) is item:
+                self._recipient_heap_item.pop(item.recipient_id, None)
+            self._queue_one_for_recipient(item.recipient_id)
+        if self._pending_counts[item.message_id] <= self._completed_counts[item.message_id]:
+            self.media.release(item.message_id)
+            self._pending_counts.pop(item.message_id, None)
+            self._completed_counts.pop(item.message_id, None)
 
-    def _mark_message_delivery_complete_locked(self, item: DeliveryItem, status: str) -> None:
-        count = self._message_pending_counts.get(item.message_id)
-        if count is None:
-            return
-        self._message_stats.setdefault(item.message_id, Counter())[status] += 1
-        count -= 1
-        if count > 0:
-            self._message_pending_counts[item.message_id] = count
-            return
-        self._message_pending_counts.pop(item.message_id, None)
-        release_item = self._message_release_items.pop(item.message_id, item)
-        stats = self._message_stats.pop(item.message_id, Counter())
-        elapsed = time.time() - self._message_started_at.pop(item.message_id, time.time())
-        if self.media_service is not None:
-            self.media_service.release_media(
-                release_item.media_file_id,
-                release_item.media_kind,
-                release_item.thumbnail_file_id,
-                mime_type=release_item.mime_type,
-                is_animated=release_item.is_animated,
-                is_video=release_item.is_video,
-            )
-        logger.info(
-            "Delivery summary message_id=%s sender_id=%s content_type=%s queued=%s sent=%s blurred=%s not_delivered=%s inactive=%s duplicate_filtered=%s ineligible=%s reply_missing=%s errors=%s elapsed=%.2fs",
-            item.message_id,
-            item.sender_id,
-            item.content_type,
-            stats.get("queued", 0),
-            stats.get("sent", 0),
-            stats.get("sent_blurred", 0),
-            sum(
-                count
-                for key, count in stats.items()
-                if key not in {"queued", "sent", "sent_blurred"}
-            ),
-            stats.get("inactive_drop", 0),
-            stats.get("duplicate_filtered", 0),
-            stats.get("ineligible", 0),
-            stats.get("reply_missing", 0) + stats.get("reply_rejected", 0),
-            sum(
-                stats.get(key, 0)
-                for key in ("forbidden_left", "chat_not_found_left", "bad_request", "telegram_error", "unexpected_error")
-            ),
-            elapsed,
-        )
-
-    async def worker(self, bot: Any) -> None:
-        self._running = True
-        self._bot = bot
-        logger.debug("Delivery worker started")
-        while True:
-            _, _, item = await self.queue.get()
-            status = "unknown"
+    async def _send_with_backoff(self, item: DeliveryItem) -> str:
+        for _ in range(3):
             try:
-                status = await self._send_with_backoff(bot, item)
-            except Exception:
-                status = "unexpected_error"
-                logger.exception(
-                    "Unhandled delivery worker error message_id=%s recipient_id=%s",
-                    item.message_id,
-                    item.recipient_id,
-                )
-            finally:
-                await self._complete_ordered_item(item, status)
-                self.queue.task_done()
-
-    async def _send_urgent(self, bot: Any, item: DeliveryItem) -> None:
-        try:
-            await self._send_with_backoff(bot, item)
-        except Exception:
-            logger.exception(
-                "Unhandled urgent delivery error message_id=%s recipient_id=%s",
-                item.message_id,
-                item.recipient_id,
-            )
-
-    async def _send_with_backoff(self, bot: Any, item: DeliveryItem) -> str:
-        lock = self._recipient_locks.setdefault(
-            item.recipient_id, asyncio.Lock())
-        async with lock:
-            return await self._send_with_backoff_locked(bot, item)
-
-    async def _send_with_backoff_locked(self, bot: Any, item: DeliveryItem) -> str:
-        while True:
-            try:
-                await self._respect_api_interval()
-                return await self._deliver(bot, item)
-            except RetryAfter as e:
-                delay = float(e.retry_after) + 0.1
-                logger.warning(
-                    "Delivery sleeping after Telegram RetryAfter delay=%.2fs message_id=%s recipient_id=%s",
-                    delay,
-                    item.message_id,
-                    item.recipient_id,
-                )
-                await asyncio.sleep(delay)
-            except TimedOut:
-                delay = 0.5
-                logger.warning(
-                    "Delivery sleeping after Telegram timeout delay=%.2fs message_id=%s recipient_id=%s",
-                    delay,
-                    item.message_id,
-                    item.recipient_id,
-                )
-                await asyncio.sleep(delay)
-            except Forbidden:
-                await self.repo.mark_left(item.recipient_id)
+                return await self._send(item)
+            except RetryAfter as exc:
+                log_telegram_error(LOGGER, "delivery.retry_after", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id, retry_after=getattr(exc, "retry_after", None))
+                await asyncio.sleep(float(getattr(exc, "retry_after", 1) or 1))
+            except Forbidden as exc:
+                log_telegram_error(LOGGER, "delivery.forbidden", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id)
+                self.repo.mark_left(item.recipient_id)
                 return "forbidden_left"
-            except BadRequest as e:
-                if "chat not found" in str(e).lower():
-                    await self.repo.mark_left(item.recipient_id)
+            except ChatMigrated as exc:
+                log_telegram_error(LOGGER, "delivery.chat_migrated", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id)
+                self.repo.mark_left(item.recipient_id)
+                return "chat_not_found_left"
+            except BadRequest as exc:
+                log_telegram_error(LOGGER, "delivery.bad_request", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id)
+                msg = str(exc).lower()
+                if "chat not found" in msg or "bot was blocked" in msg:
+                    self.repo.mark_left(item.recipient_id)
                     return "chat_not_found_left"
-                if item.reply_to_message_id is not None:
-                    return "reply_rejected"
                 return "bad_request"
-            except TelegramError as e:
+            except TelegramError as exc:
+                log_telegram_error(LOGGER, "delivery.telegram_error", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id)
                 return "telegram_error"
             except Exception:
-                logger.exception(
-                    "Dropping delivery after unexpected error message_id=%s recipient_id=%s",
-                    item.message_id,
-                    item.recipient_id,
-                )
                 return "unexpected_error"
+        return "telegram_error"
 
-    async def _deliver(self, bot: Any, item: DeliveryItem) -> str:
-        recipient = await self.repo.get_user(item.recipient_id)
-        if recipient is None or recipient.is_banned or not recipient.has_started:
-            return "ineligible"
-        if self._drop_due_to_duplicate_filter(recipient, item):
-            return "duplicate_filtered"
-        if await self._drop_due_to_inactivity(bot, recipient, item):
-            return "inactive_drop"
+    async def _send(self, item: DeliveryItem) -> str:
+        if not self._bot:
+            return "telegram_error"
+        async with self._recipient_locks[item.recipient_id]:
+            await self._respect_global_rate()
+            recipient = self.repo.get_user(item.recipient_id)
+            if not recipient or recipient.is_banned or not recipient.has_started:
+                return "ineligible"
+            current_message = self.store.get_message(item.message_id)
+            if not current_message:
+                return "ineligible"
+            reply_to = None
+            if item.reply_to_message_id:
+                reply_to = self._reply_to_for_recipient(item, recipient.telegram_id)
+                if not reply_to:
+                    return "reply_missing"
+            if current_message.deleted:
+                try:
+                    return await self._send_deleted_tombstone(item, reply_to)
+                except BadRequest as exc:
+                    if reply_to and _is_reply_rejection(exc):
+                        log_telegram_error(LOGGER, "delivery.reply_rejected", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id, reply_to=reply_to)
+                        return "reply_rejected"
+                    raise
 
-        reply_markup = None
-        if item.include_remove_button and not item.is_system and recipient.vote_buttons_enabled:
-            reply_markup = InlineKeyboardMarkup(
-                [[InlineKeyboardButton(
-                    Msg.VOTE_TO_REMOVE_BUTTON, callback_data=f"rm:{item.message_id}")]]
-            )
-        reply_to_message_id = None
-        if item.reply_to_message_id is not None:
-            if await self.repo.get_message(item.reply_to_message_id) is None:
-                return "reply_missing"
-            reply_to_message_id = await self.repo.delivery_message_for_recipient(
-                item.reply_to_message_id,
-                item.recipient_id,
-            )
-            if reply_to_message_id is None:
-                return "reply_missing"
+            if item.media_hash and recipient.filter_duplicates and not recipient.is_mod_or_admin:
+                key = (recipient.telegram_id, item.media_hash)
+                if key in self._recipient_hashes:
+                    return "duplicate_filtered"
+                self._recipient_hashes.add(key)
 
-        if item.is_forward and item.forward_from_chat_id is not None and item.forward_message_id is not None:
-            sent = await self._try_forward(bot, item)
-            if sent is not None:
-                await self.repo.add_delivery(item.message_id, item.recipient_id, sent.message_id, is_blurred=False)
-                return "sent"
+            if self._inactive_drop(recipient, item):
+                return "inactive_drop"
 
-        if item.content_type == "text":
-            is_blurred = False
-            sent = await bot.send_message(
-                chat_id=item.recipient_id,
-                text=item.text_content or "",
-                reply_markup=reply_markup,
-                reply_to_message_id=reply_to_message_id,
-                parse_mode=item.parse_mode,
-            )
-        elif item.content_type == "photo" and item.media_file_id:
-            if (not recipient.is_admin and not recipient.is_moderator) and self._should_blur(recipient.credits):
-                is_blurred = True
-                blurred = None
-                if self.media_service is not None:
-                    blurred = await self.media_service.blur_photo(bot, item.thumbnail_file_id or item.media_file_id)
-                caption = self._blur_caption(
-                    item.text_content, recipient.credits)
-                if blurred is not None:
-                    sent = await bot.send_photo(
-                        chat_id=item.recipient_id,
-                        photo=blurred,
-                        caption=caption,
-                        reply_markup=reply_markup,
-                        reply_to_message_id=reply_to_message_id,
-                        parse_mode=item.parse_mode,
-                    )
-                else:
-                    sent = await bot.send_message(
-                        chat_id=item.recipient_id,
-                        text=caption,
-                        reply_markup=reply_markup,
-                        reply_to_message_id=reply_to_message_id,
-                        parse_mode=item.parse_mode,
-                    )
-            else:
-                is_blurred = False
-                sent = await bot.send_photo(
-                    chat_id=item.recipient_id,
-                    photo=item.media_file_id,
-                    caption=item.text_content or "",
-                    reply_markup=reply_markup,
-                    reply_to_message_id=reply_to_message_id,
-                    parse_mode=item.parse_mode,
-                )
-        elif item.content_type in {"video", "animation"} and item.media_file_id:
-            if (not recipient.is_admin and not recipient.is_moderator) and self._should_blur(recipient.credits):
-                is_blurred = True
-                sent = await self._send_blurred_thumbnail_or_notice(bot, item, reply_markup, reply_to_message_id, recipient.credits)
-            elif item.content_type == "video":
-                is_blurred = False
-                sent = await bot.send_video(
-                    chat_id=item.recipient_id,
-                    video=item.media_file_id,
-                    caption=item.text_content or "",
-                    reply_markup=reply_markup,
-                    reply_to_message_id=reply_to_message_id,
-                    parse_mode=item.parse_mode,
-                )
-            else:
-                is_blurred = False
-                sent = await bot.send_animation(
-                    chat_id=item.recipient_id,
-                    animation=item.media_file_id,
-                    caption=item.text_content or "",
-                    reply_markup=reply_markup,
-                    reply_to_message_id=reply_to_message_id,
-                    parse_mode=item.parse_mode,
-                )
-        elif item.content_type == "video_note" and item.media_file_id:
-            if (not recipient.is_admin and not recipient.is_moderator) and self._should_blur(recipient.credits):
-                is_blurred = True
-                sent = await self._send_blurred_thumbnail_or_notice(bot, item, reply_markup, reply_to_message_id, recipient.credits)
-            else:
-                is_blurred = False
-                sent = await bot.send_video_note(
-                    chat_id=item.recipient_id,
-                    video_note=item.media_file_id,
-                    reply_markup=reply_markup,
-                    reply_to_message_id=reply_to_message_id,
-                )
-        elif item.content_type == "sticker" and item.media_file_id:
-            if (not recipient.is_admin and not recipient.is_moderator) and self._should_blur(recipient.credits):
-                is_blurred = True
-                sent = await self._send_blurred_thumbnail_or_notice(bot, item, reply_markup, reply_to_message_id, recipient.credits)
-            else:
-                is_blurred = False
-                sent = await bot.send_sticker(
-                    chat_id=item.recipient_id,
-                    sticker=item.media_file_id,
-                    reply_markup=reply_markup,
-                    reply_to_message_id=reply_to_message_id,
-                )
-        elif item.content_type == "document" and item.media_file_id:
-            if (
-                item.thumbnail_file_id
-                and (not recipient.is_admin and not recipient.is_moderator)
-                and self._should_blur(recipient.credits)
-            ):
-                is_blurred = True
-                sent = await self._send_blurred_thumbnail_or_notice(bot, item, reply_markup, reply_to_message_id, recipient.credits)
-            else:
-                is_blurred = False
-                sent = await bot.send_document(
-                    chat_id=item.recipient_id,
-                    document=item.media_file_id,
-                    caption=item.text_content or "",
-                    reply_markup=reply_markup,
-                    reply_to_message_id=reply_to_message_id,
-                    parse_mode=item.parse_mode,
-                )
-        else:
-            is_blurred = False
-            sent = await bot.send_message(
-                chat_id=item.recipient_id,
-                text=item.text_content or "",
-                reply_markup=reply_markup,
-                reply_to_message_id=reply_to_message_id,
-                parse_mode=item.parse_mode,
-            )
+            blurred = await self._should_blur(recipient, item)
+            markup = self._reply_markup(item, recipient)
+            try:
+                sent = await self._send_content(item, reply_to, markup, blurred)
+            except BadRequest as exc:
+                if reply_to and _is_reply_rejection(exc):
+                    log_telegram_error(LOGGER, "delivery.reply_rejected", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id, reply_to=reply_to)
+                    return "reply_rejected"
+                raise
+            if not sent:
+                return "bad_request"
+            delivery = self.store.add_delivery(item.message_id, recipient.telegram_id, sent.message_id, blurred=blurred)
+            if self._message_deleted(item.message_id):
+                await self._tombstone_existing_delivery(delivery, reply_to, item.content_type)
+                return "deleted_tombstone"
+            return "sent_blurred" if blurred else "sent"
 
-        await self.repo.add_delivery(item.message_id, item.recipient_id, sent.message_id, is_blurred=is_blurred)
-        return "sent_blurred" if is_blurred else "sent"
+    async def _send_deleted_tombstone(self, item: DeliveryItem, reply_to: int | None) -> str:
+        assert self._bot is not None
+        sent = await self._bot.send_message(
+            chat_id=item.recipient_id,
+            text="<i>Message removed.</i>",
+            parse_mode="HTML",
+            reply_to_message_id=reply_to,
+        )
+        delivery = self.store.add_delivery(item.message_id, item.recipient_id, sent.message_id)
+        self.store.mark_delivery_deleted(delivery.id, tombstone_message_id=sent.message_id, kind="queued_tombstone")
+        return "deleted_tombstone"
 
-    async def _try_forward(self, bot: Any, item: DeliveryItem) -> Any | None:
+    async def _tombstone_existing_delivery(self, delivery, reply_to: int | None, content_type: str) -> None:
+        assert self._bot is not None
         try:
-            return await bot.forward_message(
-                chat_id=item.recipient_id,
-                from_chat_id=item.forward_from_chat_id,
-                message_id=item.forward_message_id,
-            )
-        except BadRequest as exc:
-            text = str(exc).lower()
-            if "message to forward not found" in text or "message can't be forwarded" in text or "message is protected" in text:
-                return None
-            raise
-
-    def _drop_due_to_duplicate_filter(self, recipient: Any, item: DeliveryItem) -> bool:
-        if recipient.is_admin or recipient.is_moderator:
-            return False
-        if not recipient.filter_duplicates:
-            return False
-        if not item.media_hash or not item.media_hash_first_seen_at:
-            return False
-        if not recipient.created_at:
-            return True
+            if content_type == "text":
+                await self._bot.edit_message_text(
+                    chat_id=delivery.recipient_id,
+                    message_id=delivery.telegram_message_id,
+                    text="<i>Message removed.</i>",
+                    parse_mode="HTML",
+                )
+            elif content_type in {"photo", "video", "animation", "document"}:
+                await self._bot.edit_message_media(
+                    chat_id=delivery.recipient_id,
+                    message_id=delivery.telegram_message_id,
+                    media=removed_photo_media("<i>Message removed.</i>"),
+                )
+            else:
+                raise TelegramError("content type cannot be tombstoned in-place")
+            self.store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id, kind="media_edited" if content_type != "text" else "edited")
+            return
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "delivery.tombstone_edit", exc, aggregate=self._aggregate_logger, recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
+            pass
+        if content_type in {"photo", "video", "animation", "document"}:
+            try:
+                await self._bot.edit_message_caption(
+                    chat_id=delivery.recipient_id,
+                    message_id=delivery.telegram_message_id,
+                    caption="<i>Message removed.</i>",
+                    parse_mode="HTML",
+                )
+                self.store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id, kind="caption_edited")
+                return
+            except TelegramError as exc:
+                log_telegram_error(LOGGER, "delivery.tombstone_caption", exc, aggregate=self._aggregate_logger, recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
+                pass
         try:
-            joined_at = as_utc(str(recipient.created_at))
-            first_seen_at = as_utc(str(item.media_hash_first_seen_at))
-        except ValueError:
-            return True
-        return joined_at <= first_seen_at
+            await self._bot.delete_message(delivery.recipient_id, delivery.telegram_message_id)
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "delivery.tombstone_delete", exc, aggregate=self._aggregate_logger, recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
+            pass
+        self.store.mark_delivery_deleted(delivery.id, tombstone_message_id=None, kind="deleted")
 
-    async def _drop_due_to_inactivity(self, bot: Any, recipient: Any, item: DeliveryItem) -> bool:
-        if recipient.is_admin or recipient.is_moderator:
+    def _message_deleted(self, message_id: int) -> bool:
+        message = self.store.get_message(message_id)
+        return bool(message and message.deleted)
+
+    async def _respect_global_rate(self) -> None:
+        async with self._rate_lock:
+            loop = asyncio.get_running_loop()
+            min_gap = 1.0 / max(1.0, self.rate_per_second)
+            now = loop.time()
+            wait = self._last_send + min_gap - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_send = loop.time()
+
+    def _inactive_drop(self, recipient: User, item: DeliveryItem) -> bool:
+        if item.is_system or recipient.is_mod_or_admin:
             return False
-        last_activity = recipient.last_activity
-        if not last_activity:
+        period_days = float(self.config.get("inactivity.period_days", 4) or 4)
+        last = parse_dt(recipient.last_activity)
+        if not last or now_utc() - last <= timedelta(days=period_days):
+            self.store.inactive_notified.discard(recipient.telegram_id)
             return False
-        try:
-            dt = as_utc(last_activity)
-        except ValueError:
-            return False
-        inactive_days = int(self.cfg["inactivity"]["period_days"])
-        inactive = datetime.now(timezone.utc) - \
-            dt > timedelta(days=inactive_days)
-        if not inactive:
-            self._inactivity_notified.discard(recipient.telegram_id)
-            return False
-        if item.is_system:
-            return False
-        await self._send_inactivity_notice_once(bot, recipient.telegram_id)
+        if recipient.telegram_id not in self.store.inactive_notified and self._bot:
+            self.store.inactive_notified.add(recipient.telegram_id)
+            asyncio.create_task(self._bot.send_message(recipient.telegram_id, "You are inactive. Text is paused and media is sampled until you use the bot again."))
         if item.content_type == "text":
             return True
-        chance = float(self.cfg["inactivity"]["non_system_receive_chance"])
+        chance = float(self.config.get("inactivity.non_system_receive_chance", 0.05) or 0.05)
         return random.random() > chance
 
-    async def _send_inactivity_notice_once(self, bot: Any, recipient_id: int) -> None:
-        if recipient_id in self._inactivity_notified:
-            return
-        self._inactivity_notified.add(recipient_id)
-        try:
-            await bot.send_message(chat_id=recipient_id, text=Msg.INACTIVITY_NOTICE)
-        except Exception:
-            logger.debug(
-                "Failed to send inactivity notice recipient_id=%s", recipient_id, exc_info=True)
+    async def _should_blur(self, recipient: User, item: DeliveryItem) -> bool:
+        if item.is_system or recipient.is_mod_or_admin or item.content_type == "text":
+            return False
+        return random.random() < loss_rate(self.config, recipient.credits)
 
-    def _should_blur(self, credits: float) -> bool:
-        loss_rate = interpolate_loss_rate(
-            self.cfg["loss_rate"]["schedule"], credits)
-        return random.random() < max(0.0, min(1.0, loss_rate))
+    def _reply_markup(self, item: DeliveryItem, recipient: User) -> InlineKeyboardMarkup | None:
+        if item.is_system or not item.remove_buttons or not recipient.vote_buttons_enabled:
+            return None
+        return InlineKeyboardMarkup([[InlineKeyboardButton("Vote remove", callback_data=f"rm:{item.message_id}")]])
 
-    def _blur_caption(self, original: str | None, credits: float) -> str:
-        loss_rate = interpolate_loss_rate(
-            self.cfg["loss_rate"]["schedule"], credits) * 100.0
-        notice = Msg.blurred_notice(loss_rate)
-        return f"{original}\n\n{notice}" if original else notice
+    async def _send_content(self, item: DeliveryItem, reply_to: int | None, markup: InlineKeyboardMarkup | None, blurred: bool):
+        assert self._bot is not None
+        kwargs = {"chat_id": item.recipient_id, "reply_to_message_id": reply_to, "reply_markup": markup}
+        if item.is_system:
+            kwargs["parse_mode"] = "HTML"
+        elif item.parse_mode:
+            kwargs["parse_mode"] = item.parse_mode
+        if item.forward_from_chat_id and item.forward_from_message_id and not item.is_system and not blurred and not reply_to and not markup:
+            try:
+                return await self._bot.forward_message(
+                    chat_id=item.recipient_id,
+                    from_chat_id=item.forward_from_chat_id,
+                    message_id=item.forward_from_message_id,
+                )
+            except BadRequest as exc:
+                log_telegram_error(LOGGER, "delivery.forward_fallback", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id)
+                pass
+        if blurred:
+            preview = await self.media.blurred_preview(item.message_id)
+            notice = "Media blurred due to current credit loss rate."
+            if preview:
+                caption = f"{item.text}\n\n{notice}" if item.text else notice
+                return await self._bot.send_photo(photo=InputFile(BytesIO(preview), filename="blurred.jpg"), caption=caption, **kwargs)
+            text = f"{item.text}\n\n{notice}" if item.text else notice
+            return await self._bot.send_message(text=text, **kwargs)
+        if item.content_type == "text":
+            return await self._bot.send_message(text=_render_text(item.text, item.is_system, fallback="Message unavailable.", trusted_html=item.system_html), **kwargs)
+        if item.content_type == "photo":
+            return await self._bot.send_photo(photo=item.media_file_id, caption=_render_text(item.text, item.is_system), **kwargs)
+        if item.content_type == "video":
+            return await self._bot.send_video(video=item.media_file_id, caption=_render_text(item.text, item.is_system), **kwargs)
+        if item.content_type == "animation":
+            return await self._bot.send_animation(animation=item.media_file_id, caption=_render_text(item.text, item.is_system), **kwargs)
+        if item.content_type == "sticker":
+            return await self._bot.send_sticker(sticker=item.media_file_id, **{k: v for k, v in kwargs.items() if k != "parse_mode"})
+        if item.content_type == "document":
+            return await self._bot.send_document(document=item.media_file_id, caption=_render_text(item.text, item.is_system), **kwargs)
+        if item.content_type == "video_note":
+            return await self._bot.send_video_note(video_note=item.media_file_id, **{k: v for k, v in kwargs.items() if k != "parse_mode"})
+        return await self._bot.send_message(text=_render_text(item.text, item.is_system, fallback="[unsupported message]", trusted_html=item.system_html), **kwargs)
 
-    async def _send_blurred_thumbnail_or_notice(
-        self,
-        bot: Any,
-        item: DeliveryItem,
-        reply_markup: Any,
-        reply_to_message_id: int | None,
-        recipient_credits: float,
-    ) -> Any:
-        blurred = None
-        if self.media_service is not None and item.thumbnail_file_id:
-            blurred = await self.media_service.blur_image(bot, item.thumbnail_file_id)
-        if blurred is not None:
-            return await bot.send_photo(
-                chat_id=item.recipient_id,
-                photo=blurred,
-                caption=self._blur_caption(
-                    item.text_content, recipient_credits),
-                reply_markup=reply_markup,
-                reply_to_message_id=reply_to_message_id,
-                parse_mode=item.parse_mode,
-            )
-        return await bot.send_message(
-            chat_id=item.recipient_id,
-            text=self._blur_caption(item.text_content, recipient_credits),
-            reply_markup=reply_markup,
-            reply_to_message_id=reply_to_message_id,
-            parse_mode=item.parse_mode,
-        )
+    def _reply_to_for_recipient(self, item: DeliveryItem, recipient_id: int) -> int | None:
+        if not item.reply_to_message_id:
+            return None
+        prior = self.store.delivery_for_recipient(item.reply_to_message_id, recipient_id)
+        if prior:
+            return prior.telegram_message_id
+        original = self.store.get_message(item.reply_to_message_id)
+        if original and original.sender_id == recipient_id and original.source_chat_id == recipient_id:
+            return original.source_message_id
+        return None
 
-    async def _respect_api_interval(self) -> None:
-        async with self._send_rate_lock:
-            now = time.time()
-            delta = now - self._last_send
-            if delta < self._min_interval:
-                delay = self._min_interval - delta
-                if delay >= 1.0:
-                    logger.debug("Delivery rate limiter sleeping delay=%.2fs", delay)
-                await asyncio.sleep(delay)
-            self._last_send = time.time()
+
+def _is_reply_rejection(exc: BadRequest) -> bool:
+    text = str(exc).lower()
+    return "reply" in text and ("not found" in text or "message to be replied" in text or "invalid" in text)
+
+
+def _render_text(text: str | None, is_system: bool, *, fallback: str | None = None, trusted_html: bool = False) -> str | None:
+    value = text or fallback
+    if value is None:
+        return None
+    if is_system:
+        if trusted_html:
+            return f"<i>{value}</i>"
+        return f"<i>{html_escape(value)}</i>"
+    return value

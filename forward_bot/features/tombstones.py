@@ -1,509 +1,480 @@
 from __future__ import annotations
 
-import html
 import logging
-from typing import Any
+import re
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError
 
-from forward_bot.crypto.obfuscation import temporal_id
-from forward_bot.messages import Messages as Msg
+try:
+    from telegram import ReactionTypeEmoji
+except Exception:  # pragma: no cover
+    ReactionTypeEmoji = None
 
-logger = logging.getLogger(__name__)
-
-
-def tombstone(reason: str | None = None) -> str:
-    return Msg.TOMBSTONE
-
-
-def _identity_for_viewer(user: Any | None, user_id: int, viewer: Any, salt: str) -> str:
-    anon = temporal_id(user_id, salt)
-    if user is None:
-        return anon
-    trip = (
-        f"<b>{html.escape(str(user.tripcode_name))}</b> !{str(user.tripcode_hash)[:6]}"
-        if user.tripcode_name and user.tripcode_hash
-        else None
-    )
-    if viewer.is_admin:
-        parts = [anon]
-        if trip:
-            parts.append(trip)
-        if user.username:
-            parts.append(f"@{html.escape(user.username)}")
-        return " ".join(parts)
-    return trip or anon
+from forward_bot.cache.transient import TransientDelivery, TransientStore
+from forward_bot.config import Config
+from forward_bot.db.repository import Repository, User
+from forward_bot.features.credits import apply_credit, maybe_apply_negative_cooldown
+from forward_bot.features.tombstone_media import removed_photo_media
+from forward_bot.identity import display_identity_html
+from forward_bot.logging_utils import log_telegram_error
+from forward_bot.utils import html_escape, round_credits
 
 
-async def remove_message_with_tombstones(
-    context: Any,
-    repo: Any,
-    cfg: dict[str, Any],
+LOGGER = logging.getLogger(__name__)
+
+
+async def remove_message(
+    bot: Bot,
+    repo: Repository,
+    store: TransientStore,
+    config: Config,
     message_id: int,
-    sender_id: int,
+    *,
     reason: str,
-    notify_mods: bool = True,
+    remove_for_mods: bool = False,
     notify_sender: bool = True,
-) -> None:
-    first_mod_note_message_id = None
-
-    if notify_mods:
-        first_mod_note_message_id = await _send_moderation_notes(context, repo, cfg, message_id, sender_id, reason)
-        if first_mod_note_message_id is not None:
-            await repo.set_message_tombstone_mod_message(message_id, first_mod_note_message_id)
-
-    message = await repo.get_message(message_id)
-    if notify_sender and message is not None and message.get("source_chat_id") and message.get("source_message_id"):
-        source_chat_id = int(message["source_chat_id"])
-        source_message_id = int(message["source_message_id"])
-        await _notify_sender_pending_moderation(
-            context,
-            source_chat_id,
-            source_message_id,
-            reason,
-        )
-
-    deliveries = await repo.list_deliveries_for_message(message_id)
-    for delivery in deliveries:
-        recipient_id = int(delivery["recipient_id"])
-        telegram_message_id = int(delivery["telegram_message_id"])
-        recipient = await repo.get_user(recipient_id)
-        is_mod = bool(recipient and (
-            recipient.is_moderator or recipient.is_admin))
-        if is_mod:
-            continue
-        text = tombstone(reason)
-        tombstone_message_id, tombstone_kind = await _replace_or_send_tombstone(
-            context,
-            recipient_id,
-            telegram_message_id,
-            text,
-            str(message.get("content_type") or "") if message is not None else "",
-            preserve_reference=False,
-        )
-        await repo.mark_delivery_tombstoned(int(delivery["id"]), tombstone_message_id, tombstone_kind)
-
-    await update_message_for_mods(
-        context,
-        repo,
-        message_id,
-        "This message was removed and is pending moderation action",
-    )
-    await repo.set_message_deleted(message_id, reason)
-    await repo.add_audit_event("message_removed", target_user_id=sender_id, message_id=message_id, details=reason)
-
-
-async def _notify_sender_pending_moderation(context: Any, chat_id: int, message_id: int, reason: str) -> None:
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=Msg.removed_pending(reason),
-            reply_to_message_id=message_id,
-        )
-    except Exception as exc:
-        logger.debug(
-            "Failed to notify removed-message sender chat_id=%s message_id=%s: %s", chat_id, message_id, exc)
-
-
-async def remove_message_for_mods(
-    context: Any,
-    repo: Any,
-    cfg: dict[str, Any],
-    message_id: int,
-    sender_id: int,
-    reason: str,
+    voter_ids: list[int] | None = None,
 ) -> int:
-    salt = cfg["bot"]["global_salt"]
-    deliveries = await repo.list_deliveries_for_message(message_id)
-    message = await repo.get_message(message_id)
-    content_type = str((message or {}).get("content_type") or "")
-    removed = 0
-    for delivery in deliveries:
-        recipient_id = int(delivery["recipient_id"])
-        telegram_message_id = int(delivery["telegram_message_id"])
-        recipient = await repo.get_user(recipient_id)
-        is_mod = bool(recipient and (
-            recipient.is_moderator or recipient.is_admin))
-        if not is_mod:
-            continue
-        text = tombstone(reason)
-        tombstone_message_id, tombstone_kind = await _replace_or_send_tombstone(
-            context,
-            recipient_id,
-            telegram_message_id,
-            text,
-            content_type,
-            preserve_reference=True,
-        )
-        await repo.mark_delivery_tombstoned(int(delivery["id"]), tombstone_message_id, tombstone_kind)
-        removed += 1
-    await repo.add_audit_event("message_removed_for_mods", target_user_id=sender_id, message_id=message_id, details=reason)
-    return removed
-
-
-async def append_action_info_to_message_for_mods(
-    context: Any,
-    repo: Any,
-    message_id: int,
-    action_info: str,
-) -> int:
-    message = await repo.get_message(message_id)
-    if message is None:
+    msg = store.get_message(message_id)
+    if not msg or msg.deleted and not remove_for_mods:
         return 0
-    base = str(message.get("text_content") or "")
-    if base.endswith(action_info):
-        return 0
-    separator = "\n\n" if base else ""
-    updated_text = f"{base}{separator}{action_info}"
-    await repo.update_message_text_content(message_id, updated_text)
-    return await update_message_for_mods(context, repo, message_id, None, reaction_status=action_info)
-
-
-async def update_message_for_mods(
-    context: Any,
-    repo: Any,
-    message_id: int,
-    status: str | None,
-    reaction_status: str | None = None,
-) -> int:
-    message = await repo.get_message(message_id)
-    if message is None:
-        return 0
-    deliveries = await repo.list_deliveries_for_message(message_id)
-    updated = 0
-    text_status = f"\n\n<b><i>{html.escape(status)}</i></b>" if status else ""
-    plain_status = f"\n\n{status}" if status else ""
-    for delivery in deliveries:
-        recipient_id = int(delivery["recipient_id"])
-        telegram_message_id = int(delivery["telegram_message_id"])
-        recipient = await repo.get_user(recipient_id)
-        is_mod = bool(recipient and (
-            recipient.is_moderator or recipient.is_admin))
-        if not is_mod:
-            continue
-        content_type = str(message.get("content_type") or "")
-        base = str(message.get("text_content") or "")
-        base_html = base if str(message.get(
-            "parse_mode") or "").upper() == "HTML" else html.escape(base)
+    msg.deleted = True
+    msg.deletion_reason = reason
+    queue = getattr(store, "delivery_queue", None)
+    if queue is not None:
         try:
-            if content_type == "text":
-                await context.bot.edit_message_text(
-                    chat_id=recipient_id,
-                    message_id=telegram_message_id,
-                    text=f"{base_html}{text_status}" if base_html else (
-                        text_status.lstrip() or ""),
-                    parse_mode="HTML",
-                )
-            else:
-                await context.bot.edit_message_caption(
-                    chat_id=recipient_id,
-                    message_id=telegram_message_id,
-                    caption=f"{base_html}{text_status}" if base_html else (
-                        text_status.lstrip() or ""),
-                    parse_mode="HTML",
-                )
+            queue.promote_deleted_message(message_id)
+        except Exception:
+            pass
+    if remove_for_mods:
+        msg.removed_for_mods = True
+    sender = repo.get_user(msg.sender_id) if msg.sender_id else None
+    updated = 0
+    for delivery in store.deliveries_for_message(message_id):
+        user = repo.get_user(delivery.recipient_id)
+        if not user or delivery.deleted:
+            continue
+        if user.is_mod_or_admin and not remove_for_mods:
+            continue
+        if await _tombstone_delivery(bot, store, delivery, "<i>Message removed.</i>", content_type=msg.content_type):
             updated += 1
-        except Exception as exc:
-            logger.debug(
-                "HTML status append failed message_id=%s recipient_id=%s telegram_message_id=%s content_type=%s reason=%s detail=%s",
-                message_id,
-                recipient_id,
-                telegram_message_id,
-                content_type,
-                _telegram_edit_failure_reason(exc),
-                exc,
+    if notify_sender and sender:
+        try:
+            await bot.send_message(
+                sender.telegram_id,
+                f"Your message was removed: {html_escape(reason)}",
+                parse_mode="HTML",
+                reply_to_message_id=_sender_source_reply(msg),
             )
-            try:
-                if content_type == "text":
-                    await context.bot.edit_message_text(
-                        chat_id=recipient_id,
-                        message_id=telegram_message_id,
-                        text=f"{base}{plain_status}" if base else (
-                            status or ""),
-                    )
-                else:
-                    await context.bot.edit_message_caption(
-                        chat_id=recipient_id,
-                        message_id=telegram_message_id,
-                        caption=f"{base}{plain_status}" if base else (
-                            status or ""),
-                    )
-                updated += 1
-            except Exception as fallback_exc:
-                logger.debug(
-                    "Failed to append mod-visible message status message_id=%s recipient_id=%s telegram_message_id=%s content_type=%s reason=%s detail=%s",
-                    message_id,
-                    recipient_id,
-                    telegram_message_id,
-                    content_type,
-                    _telegram_edit_failure_reason(fallback_exc),
-                    fallback_exc,
-                )
-                if await _set_mod_status_reaction(
-                    context,
-                    recipient_id,
-                    telegram_message_id,
-                    reaction_status or status,
-                ):
-                    updated += 1
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "tombstone.notify_sender", exc, aggregate=_aggregate(store), repo=repo, user_id=sender.telegram_id, message_id=message_id)
+            pass
+    await send_mod_notes(bot, repo, store, config, message_id, reason=reason, voter_ids=voter_ids or [])
     return updated
 
 
-def _telegram_edit_failure_reason(exc: Exception) -> str:
-    text = str(exc).lower()
-    if isinstance(exc, BadRequest):
-        if "message can't be edited" in text or "message can not be edited" in text:
-            return "telegram says this message cannot be edited; common causes are media without editable caption, protected/forwarded messages, old messages, or unsupported message type"
-        if "message is not modified" in text:
-            return "message already has the requested content"
-        if "message to edit not found" in text:
-            return "message no longer exists or is no longer visible to the bot"
-    return type(exc).__name__
-
-
-async def _set_mod_status_reaction(
-    context: Any,
-    chat_id: int,
-    message_id: int,
-    status: str | None,
-) -> bool:
-    emoji = _reaction_for_status(context, status)
-    if not emoji:
-        return False
-    try:
-        await context.bot.set_message_reaction(
-            chat_id=chat_id,
-            message_id=message_id,
-            reaction=[emoji],
-        )
-        logger.debug(
-            "Applied mod-visible status reaction chat_id=%s message_id=%s emoji=%s status=%s",
-            chat_id,
-            message_id,
-            emoji,
-            status,
-        )
-        return True
-    except Exception as exc:
-        logger.debug(
-            "Failed to apply mod-visible status reaction chat_id=%s message_id=%s emoji=%s reason=%s detail=%s",
-            chat_id,
-            message_id,
-            emoji,
-            type(exc).__name__,
-            exc,
-        )
-        return False
-
-
-def _reaction_for_status(context: Any, status: str | None) -> str | None:
-    cfg = getattr(getattr(context, "application", None), "bot_data", {}).get("cfg", {})
-    reactions = cfg.get("moderation", {}).get("status_reactions", {})
-    text = (status or "").lower()
-    if "confirmed" in text:
-        return str(reactions.get("confirmed", "👍"))
-    if "removed" in text and "pending" not in text:
-        return str(reactions.get("removed", "👌"))
-    if "revert" in text or "did not confirm" in text:
-        return str(reactions.get("reverted", "👎"))
-    if "pending" in text or "moderation action" in text:
-        return str(reactions.get("pending", "🤔"))
-    return None
-
-
-async def _replace_or_send_tombstone(
-    context: Any,
-    chat_id: int,
-    message_id: int,
-    text: str,
-    content_type: str,
-    preserve_reference: bool = False,
-) -> tuple[int | None, str]:
-    if content_type == "text":
-        try:
-            edited = await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                parse_mode="HTML",
-            )
-            logger.debug("Edited tombstone chat_id=%s message_id=%s",
-                         chat_id, message_id)
-            return edited.message_id, "edited"
-        except Exception as exc:
-            logger.debug(
-                "Edit tombstone failed chat_id=%s message_id=%s: %s", chat_id, message_id, exc)
-
-    if content_type != "text" and preserve_reference:
-        logger.debug(
-            "Delete-for-mods requested for media; media cannot become a text tombstone, deleting original chat_id=%s message_id=%s content_type=%s",
-            chat_id,
-            message_id,
-            content_type,
-        )
-
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        logger.debug(
-            "Deleted message before tombstone chat_id=%s message_id=%s", chat_id, message_id)
-        if content_type != "text":
-            return None, "deleted_uneditable_media"
-    except Exception as exc:
-        logger.debug(
-            "Delete before tombstone failed chat_id=%s message_id=%s: %s", chat_id, message_id, exc)
-
-    try:
-        sent = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-        logger.debug("Sent tombstone chat_id=%s original_message_id=%s tombstone_id=%s",
-                     chat_id, message_id, sent.message_id)
-        return sent.message_id, "sent"
-    except Exception as exc:
-        logger.warning(
-            "Failed to send tombstone chat_id=%s message_id=%s: %s", chat_id, message_id, exc)
-        return None, "failed"
-
-
-async def _send_moderation_notes(
-    context: Any,
-    repo: Any,
-    cfg: dict[str, Any],
-    message_id: int,
-    sender_id: int,
-    reason: str,
-) -> int | None:
-    mods = await repo.list_mod_and_admin_users()
-    salt = cfg["bot"]["global_salt"]
-    first_message_id = None
-    for mod in mods:
-        try:
-            text, buttons = await moderation_note_text_and_markup(repo, cfg, message_id, sender_id, reason, mod)
-            reply_to = await repo.delivery_message_for_recipient(message_id, mod.telegram_id)
-            if reply_to is None:
-                reply_to = await repo.delivery_or_tombstone_message_for_recipient(message_id, mod.telegram_id)
-            sent = await context.bot.send_message(
-                chat_id=mod.telegram_id,
-                text=text,
-                reply_markup=buttons,
-                reply_to_message_id=reply_to,
-                parse_mode="HTML",
-            )
-            if first_message_id is None:
-                first_message_id = sent.message_id
-            await repo.add_moderation_note(
-                message_id=message_id,
-                sender_id=sender_id,
-                moderator_id=mod.telegram_id,
-                telegram_message_id=sent.message_id,
-                reason=reason,
-                note_type="removal",
-            )
-        except Exception:
-            await repo.add_audit_event(
-                "moderation_note_failed",
-                target_user_id=mod.telegram_id,
-                message_id=message_id,
-                details=reason,
-            )
-    return first_message_id
-
-
-async def moderation_note_text_and_markup(
-    repo: Any,
-    cfg: dict[str, Any],
-    message_id: int,
-    sender_id: int,
-    reason: str,
-    viewer: Any,
-) -> tuple[str, InlineKeyboardMarkup | None]:
-    salt = cfg["bot"]["global_salt"]
-    sender_user = await repo.get_user(sender_id)
-    sender_label = _identity_for_viewer(sender_user, sender_id, viewer, salt)
-
-    voters = await repo.list_remove_voters(message_id)
-    voter_lines = []
-    for voter_id in voters:
-        voter = await repo.get_user(voter_id)
-        voter_lines.append(
-            f"- {_identity_for_viewer(voter, voter_id, viewer, salt)}")
-
-    message = await repo.get_message(message_id)
-    status_lines = []
-    headline = Msg.IN_MODERATION_ACTION
-    confirmed = bool(message.get("punishment_confirmed")
-                     ) if message is not None else False
-    reverted = bool(message.get("reverted")) if message is not None else False
-    if message is not None:
-        if confirmed:
-            headline = Msg.CONFIRMED_REMOVAL
-        if bool(message.get("removed_for_mods")):
-            status_lines.append("Removed for mods: yes")
-        if reverted:
-            status_lines.append("Reverted: yes")
-        if await _has_deleted_uneditable_mod_delivery(repo, message_id):
-            status_lines.append(
-                "Remove for mods deleted the referenced media because Telegram cannot edit media into a text-only tombstone."
-            )
-
-    lines = [
-        headline,
-        f"Reason: {html.escape(reason)}",
-        f"Sender: {sender_label}"
-    ]
-    if voter_lines:
-        lines.append("Voters:")
-        lines.extend(voter_lines)
-    if status_lines:
-        lines.append("")
-        lines.extend(status_lines)
-
-    if message is not None and bool(message.get("punishment_confirmed")) and bool(message.get("removed_for_mods")):
-        return "\n".join(lines), None
-
-    buttons = []
-    row = []
-    if not confirmed and not reverted:
-        row.append(InlineKeyboardButton(
-            "Punish", callback_data=f"mconf:{message_id}:{sender_id}"))
-    if not reverted and (message is None or not bool(message.get("removed_for_mods"))):
-        row.append(InlineKeyboardButton("Remove for mods",
-                   callback_data=f"mrm:{message_id}:{sender_id}"))
-    if voter_lines and not reverted and not confirmed:
-        row.append(InlineKeyboardButton(
-            "Revert", callback_data=f"mrev:{message_id}:{sender_id}"))
-    if row:
-        buttons.append(row)
-    return "\n".join(lines), InlineKeyboardMarkup(buttons) if buttons else None
-
-
-async def _has_deleted_uneditable_mod_delivery(repo: Any, message_id: int) -> bool:
-    for delivery in await repo.list_deliveries_for_message(message_id):
-        if delivery.get("tombstone_kind") != "deleted_uneditable_media":
+async def mark_for_moderation_action(bot: Bot, repo: Repository, store: TransientStore, config: Config, message_id: int) -> None:
+    if ReactionTypeEmoji is None:
+        return
+    msg = store.get_message(message_id)
+    if not msg:
+        return
+    emoji = str(config.get("moderation.delete_reaction_emoji", "✍️") or "✍️")
+    for user in repo.list_users():
+        if not user.has_started or not user.is_mod_or_admin:
             continue
-        recipient = await repo.get_user(int(delivery["recipient_id"]))
-        if recipient is not None and (recipient.is_moderator or recipient.is_admin):
+        delivery = store.delivery_for_recipient(message_id, user.telegram_id)
+        if not delivery or delivery.deleted:
+            continue
+        try:
+            await bot.set_message_reaction(
+                chat_id=user.telegram_id,
+                message_id=delivery.telegram_message_id,
+                reaction=[ReactionTypeEmoji(emoji)],
+            )
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "moderation.mark_reaction", exc, aggregate=_aggregate(store), repo=repo, user_id=user.telegram_id, message_id=message_id)
+            pass
+
+
+async def _tombstone_delivery(
+    bot: Bot,
+    store: TransientStore,
+    delivery: TransientDelivery,
+    text: str,
+    *,
+    content_type: str = "text",
+) -> bool:
+    try:
+        if content_type == "text":
+            await bot.edit_message_text(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, text=text, parse_mode="HTML")
+        elif content_type in {"photo", "video", "animation", "document"}:
+            await bot.edit_message_media(
+                chat_id=delivery.recipient_id,
+                message_id=delivery.telegram_message_id,
+                media=removed_photo_media(text),
+            )
+        else:
+            raise TelegramError("content type cannot be tombstoned in-place")
+        store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id, kind="media_edited" if content_type != "text" else "edited")
+        return True
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "tombstone.edit", exc, aggregate=_aggregate(store), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
+        pass
+    if content_type in {"photo", "video", "animation", "document"}:
+        try:
+            await bot.edit_message_caption(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, caption=text, parse_mode="HTML")
+            store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id, kind="caption_edited")
             return True
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "tombstone.caption", exc, aggregate=_aggregate(store), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
+            pass
+    try:
+        await bot.delete_message(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id)
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "tombstone.delete", exc, aggregate=_aggregate(store), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
+        pass
+    store.mark_delivery_deleted(delivery.id, tombstone_message_id=None, kind="deleted")
     return False
 
 
-async def refresh_moderation_notes(context: Any, repo: Any, cfg: dict[str, Any], message_id: int, sender_id: int) -> None:
-    message = await repo.get_message(message_id)
-    reason = str(message.get("deletion_reason")
-                 or "removed") if message is not None else "removed"
-    notes = await repo.list_moderation_notes_for_message(message_id)
-    for note in notes:
-        viewer = await repo.get_user(int(note["moderator_id"]))
-        if viewer is None:
-            continue
-        text, markup = await moderation_note_text_and_markup(repo, cfg, message_id, sender_id, reason, viewer)
-        try:
-            await context.bot.edit_message_text(
-                chat_id=int(note["moderator_id"]),
-                message_id=int(note["telegram_message_id"]),
-                text=text,
-                reply_markup=markup,
-                parse_mode="HTML",
+async def send_mod_notes(
+    bot: Bot,
+    repo: Repository,
+    store: TransientStore,
+    config: Config,
+    message_id: int,
+    *,
+    reason: str,
+    voter_ids: list[int] | None = None,
+) -> None:
+    msg = store.get_message(message_id)
+    if not msg:
+        return
+    sender = repo.get_user(msg.sender_id) if msg.sender_id else None
+    voter_users = [repo.get_user(voter_id) for voter_id in (voter_ids or sorted(store.remove_votes.get(message_id, set())))]
+    existing_notes = list(store.mod_notes.get(message_id, []))
+    tombstone_note = _tombstone_note_text(store, msg)
+    if existing_notes:
+        for recipient_id, note_message_id in existing_notes:
+            user = repo.get_user(recipient_id)
+            if not user or not user.has_started or not user.is_mod_or_admin:
+                continue
+            text = _mod_note_text(
+                config,
+                sender,
+                reason,
+                [v for v in voter_users if v],
+                msg.punishment_confirmed,
+                msg.removed_for_mods,
+                msg.reverted,
+                viewer=user,
+                actions=list(msg.metadata.get("mod_actions", [])),
+                tombstone_note=tombstone_note,
             )
-        except Exception as exc:
-            logger.debug("Failed to refresh moderation note message_id=%s moderator_id=%s: %s",
-                         message_id, note["moderator_id"], exc)
+            await _edit_mod_note(bot, config, user.telegram_id, note_message_id, text, _mod_note_markup(user, msg, bool(voter_users)))
+        return
+    for user in repo.list_users():
+        if not user.has_started or not user.is_mod_or_admin:
+            continue
+        markup = _mod_note_markup(user, msg, bool(voter_users))
+        text = _mod_note_text(
+            config,
+            sender,
+            reason,
+            [v for v in voter_users if v],
+            msg.punishment_confirmed,
+            msg.removed_for_mods,
+            msg.reverted,
+            viewer=user,
+            actions=list(msg.metadata.get("mod_actions", [])),
+            tombstone_note=tombstone_note,
+        )
+        reply_to = None
+        delivery = store.delivery_for_recipient(message_id, user.telegram_id)
+        if delivery:
+            reply_to = delivery.telegram_message_id
+        try:
+            sent = await bot.send_message(user.telegram_id, text, parse_mode="HTML", reply_to_message_id=reply_to, reply_markup=markup)
+            store.add_mod_note(message_id, user.telegram_id, sent.message_id)
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "moderation.note_send", exc, aggregate=_aggregate(store), repo=repo, user_id=user.telegram_id, message_id=message_id, reply_to=reply_to)
+            if not reply_to:
+                continue
+            try:
+                sent = await bot.send_message(
+                    user.telegram_id,
+                    text + "\nNote: The referenced message had to be deleted or is unavailable, so this moderation note could not reply to it.",
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+                store.add_mod_note(message_id, user.telegram_id, sent.message_id)
+            except TelegramError as fallback_exc:
+                log_telegram_error(LOGGER, "moderation.note_send_fallback", fallback_exc, aggregate=_aggregate(store), repo=repo, user_id=user.telegram_id, message_id=message_id)
+                pass
+
+
+def _mod_note_markup(user: User, msg, has_voters: bool) -> InlineKeyboardMarkup | None:
+    buttons = []
+    if not msg.punishment_confirmed and not msg.reverted:
+        buttons.append(InlineKeyboardButton("Punish", callback_data=f"mconf:{msg.id}:{msg.sender_id or 0}"))
+    if not msg.removed_for_mods and not msg.reverted:
+        buttons.append(InlineKeyboardButton("Remove for mods", callback_data=f"mrm:{msg.id}:{msg.sender_id or 0}"))
+    if has_voters and not msg.punishment_confirmed and not msg.reverted:
+        buttons.append(InlineKeyboardButton("Revert", callback_data=f"mrev:{msg.id}:{msg.sender_id or 0}"))
+    if user.is_admin and msg.sender_id:
+        buttons.append(InlineKeyboardButton("Ban", callback_data=f"mban:{msg.id}:{msg.sender_id}"))
+    return InlineKeyboardMarkup([buttons]) if buttons else None
+
+
+async def _edit_mod_note(bot: Bot, config: Config, chat_id: int, message_id: int, text: str, markup: InlineKeyboardMarkup | None) -> None:
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML", reply_markup=markup)
+        return
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "moderation.note_edit_html", exc, chat_id=chat_id, message_id=message_id)
+        pass
+    plain = _plain_text(text)
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=plain, reply_markup=markup)
+        return
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "moderation.note_edit_plain", exc, chat_id=chat_id, message_id=message_id)
+        pass
+    emoji = _status_emoji(config, text)
+    if emoji and ReactionTypeEmoji is not None:
+        try:
+            await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[ReactionTypeEmoji(emoji)])
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "moderation.note_reaction", exc, chat_id=chat_id, message_id=message_id)
+            pass
+
+
+def _status_emoji(config: Config, text: str) -> str | None:
+    statuses = config.section("moderation.status_reactions")
+    lowered = text.lower()
+    if "reverted" in lowered:
+        return statuses.get("reverted")
+    if "removed for mods" in lowered:
+        return statuses.get("removed")
+    if "punished" in lowered:
+        return statuses.get("confirmed")
+    return statuses.get("pending")
+
+
+def _plain_text(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text)
+
+
+def _mod_note_text(
+    config: Config,
+    sender: User | None,
+    reason: str,
+    voters: list[User],
+    punished: bool,
+    removed_for_mods: bool,
+    reverted: bool,
+    *,
+    viewer: User,
+    actions: list[str] | None = None,
+    tombstone_note: str | None = None,
+) -> str:
+    sender_id = display_identity_html(sender, config, viewer=viewer)
+    voter_text = ", ".join(display_identity_html(v, config, viewer=viewer) for v in voters) if voters else "none"
+    flags = []
+    if punished:
+        flags.append("punished")
+    if removed_for_mods:
+        flags.append("removed for mods")
+    if reverted:
+        flags.append("reverted")
+    flag_text = ", ".join(flags) if flags else "pending"
+    text = (
+        "<b>Moderation removal</b>\n"
+        f"Status: {html_escape(flag_text)}\n"
+        f"Reason: {html_escape(reason)}\n"
+        f"Sender: {sender_id}\n"
+        f"Voters: {voter_text}"
+    )
+    if tombstone_note:
+        text += f"\nNote: {html_escape(tombstone_note)}"
+    if actions:
+        text += "\nActions:\n" + "\n".join(f"- {html_escape(action)}" for action in actions[-5:])
+    return text
+
+
+def _tombstone_note_text(store: TransientStore, msg) -> str | None:
+    if msg.content_type == "text":
+        return None
+    kinds = {delivery.tombstone_kind for delivery in store.deliveries_for_message(msg.id)}
+    if "deleted" in kinds:
+        return "The referenced message had to be deleted because Telegram could not tombstone it in place."
+    if "caption_edited" in kinds:
+        return "Some copies could only be captioned because Telegram could not replace their media in place."
+    return None
+
+
+async def punish_sender(bot: Bot, repo: Repository, store: TransientStore, config: Config, message_id: int, moderator_id: int | None = None) -> str:
+    msg = store.get_message(message_id)
+    if not msg or msg.sender_id is None:
+        return "Message is not in cache anymore."
+    if msg.punishment_confirmed or msg.removed_for_mods or msg.reverted:
+        return "This moderation action is already resolved."
+    sender = repo.get_user(msg.sender_id)
+    if not sender:
+        return "Sender not found."
+    percent = float(config.get("vote_to_remove.punishment_credit_tax_percent", 0.8) or 0.8)
+    minimum = float(config.get("vote_to_remove.punishment_credit_minimum", 10.0) or 10.0)
+    penalty = -round_credits(max(sender.credits * percent, minimum))
+    _, updated = repo.apply_credit_change(sender.telegram_id, penalty, "remove_punishment", daily_caps=None)
+    maybe_apply_negative_cooldown(repo, config, updated)
+    cooldown = int(config.get("vote_to_remove.punishment_cooldown_seconds", 3600) or 3600)
+    if cooldown > 0:
+        repo.set_cooldown(sender.telegram_id, cooldown, "moderation punishment", moderator_id, stack=False)
+    msg.punishment_confirmed = True
+    _append_mod_action(msg, f"Punished sender for {abs(penalty):.2f} credits")
+    try:
+        await bot.send_message(
+            sender.telegram_id,
+            f"Moderation confirmed. Penalty: {abs(penalty):.2f} credits. Balance: {updated.credits:.2f}.",
+            reply_to_message_id=_sender_source_reply(msg),
+        )
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "moderation.punish_notify", exc, aggregate=_aggregate(store), repo=repo, user_id=sender.telegram_id, message_id=message_id)
+        pass
+    await send_mod_notes(bot, repo, store, config, message_id, reason=msg.deletion_reason or "moderation confirmed", voter_ids=list(store.remove_votes.get(message_id, set())))
+    return "Punishment applied."
+
+
+async def remove_for_moderators(bot: Bot, repo: Repository, store: TransientStore, config: Config, message_id: int, moderator_id: int | None = None) -> str:
+    msg = store.get_message(message_id)
+    if not msg:
+        return "Message is not in cache anymore."
+    if msg.reverted or msg.removed_for_mods:
+        return "This moderation action is already resolved."
+    if not msg.punishment_confirmed:
+        result = await punish_sender(bot, repo, store, config, message_id, moderator_id)
+        if result != "Punishment applied.":
+            return result
+    count = await remove_message(bot, repo, store, config, message_id, reason=msg.deletion_reason or "removed for moderators", remove_for_mods=True, notify_sender=False)
+    msg.removed_for_mods = True
+    _append_mod_action(msg, f"Removed {count} moderator copies")
+    await send_mod_notes(bot, repo, store, config, message_id, reason=msg.deletion_reason or "removed for moderators", voter_ids=list(store.remove_votes.get(message_id, set())))
+    return f"Removed {count} moderator copies."
+
+
+async def revert_remove_vote(bot: Bot, repo: Repository, store: TransientStore, config: Config, message_id: int) -> str:
+    msg = store.get_message(message_id)
+    if not msg:
+        return "Message is not in cache anymore."
+    if msg.reverted or msg.punishment_confirmed:
+        return "This moderation action is already resolved."
+    voters = list(store.remove_votes.get(message_id, set()))
+    if not voters:
+        return "No voters to reverse."
+    percent = float(config.get("vote_to_remove.reversal_punishment_credit_tax_percent", 0.05) or 0.05)
+    minimum = float(config.get("vote_to_remove.reversal_punishment_credit_minimum", 10.0) or 10.0)
+    for voter_id in voters:
+        voter = repo.get_user(voter_id)
+        if not voter:
+            continue
+        penalty = -round_credits(max(voter.credits * percent, minimum))
+        _, updated = repo.apply_credit_change(voter_id, penalty, "remove_reversal", daily_caps=None)
+        maybe_apply_negative_cooldown(repo, config, updated)
+        reply_to = _delivery_reply_for_user(store, message_id, voter_id)
+        try:
+            await bot.send_message(
+                voter_id,
+                f"Your remove vote was reversed by moderators. Penalty: {abs(penalty):.2f} credits. Balance: {updated.credits:.2f}.",
+                reply_to_message_id=reply_to,
+            )
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "moderation.revert_voter_notify", exc, aggregate=_aggregate(store), repo=repo, user_id=voter_id, message_id=message_id, reply_to=reply_to)
+            pass
+    if msg.sender_id:
+        try:
+            await bot.send_message(
+                msg.sender_id,
+                "Moderators did not confirm wrongdoing for your removed message.",
+                reply_to_message_id=_sender_source_reply(msg),
+            )
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "moderation.revert_sender_notify", exc, aggregate=_aggregate(store), repo=repo, user_id=msg.sender_id, message_id=message_id)
+            pass
+    msg.reverted = True
+    _append_mod_action(msg, f"Reverted remove vote; punished {len(voters)} voter(s)")
+    await send_mod_notes(bot, repo, store, config, message_id, reason="remove vote reverted", voter_ids=voters)
+    return "Remove vote reverted."
+
+
+async def remove_whisper(bot: Bot, repo: Repository, store: TransientStore, whisper_id: int, reason: str) -> int:
+    whisper = store.whispers.get(whisper_id)
+    if not whisper:
+        return 0
+    count = 0
+    for delivery in store.deliveries_for_whisper(whisper_id):
+        if delivery.deleted:
+            continue
+        user = repo.get_user(delivery.recipient_id)
+        if user and user.is_mod_or_admin:
+            text = f"<b>Removed whisper</b>\nReason: {html_escape(reason)}\n\n{whisper.text}"
+            try:
+                await bot.edit_message_text(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, text=text, parse_mode="HTML")
+            except TelegramError as exc:
+                log_telegram_error(LOGGER, "whisper.remove_mod_edit_html", exc, aggregate=_aggregate(store), repo=repo, user_id=delivery.recipient_id, whisper_id=whisper_id)
+                try:
+                    await bot.edit_message_text(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, text=_plain_text(text))
+                except TelegramError as fallback_exc:
+                    log_telegram_error(LOGGER, "whisper.remove_mod_edit_plain", fallback_exc, aggregate=_aggregate(store), repo=repo, user_id=delivery.recipient_id, whisper_id=whisper_id)
+                    pass
+            delivery.deleted = True
+            count += 1
+            continue
+        try:
+            await bot.edit_message_text(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, text="Whisper removed.")
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "whisper.remove_recipient_edit", exc, aggregate=_aggregate(store), repo=repo, user_id=delivery.recipient_id, whisper_id=whisper_id)
+            try:
+                await bot.delete_message(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id)
+            except TelegramError as fallback_exc:
+                log_telegram_error(LOGGER, "whisper.remove_recipient_delete", fallback_exc, aggregate=_aggregate(store), repo=repo, user_id=delivery.recipient_id, whisper_id=whisper_id)
+                pass
+        delivery.deleted = True
+        count += 1
+    whisper.deleted = True
+    try:
+        await bot.send_message(
+            whisper.sender_id,
+            f"Your whisper was removed: {html_escape(reason)}",
+            parse_mode="HTML",
+            reply_to_message_id=_whisper_reply_for_user(store, whisper_id, whisper.sender_id),
+        )
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "whisper.remove_sender_notify", exc, aggregate=_aggregate(store), repo=repo, user_id=whisper.sender_id, whisper_id=whisper_id)
+        pass
+    return count
+
+
+def _sender_source_reply(msg) -> int | None:
+    return msg.source_message_id if msg.source_chat_id == msg.sender_id else None
+
+
+def _delivery_reply_for_user(store: TransientStore, message_id: int, user_id: int) -> int | None:
+    delivery = store.delivery_for_recipient(message_id, user_id)
+    return delivery.telegram_message_id if delivery else None
+
+
+def _whisper_reply_for_user(store: TransientStore, whisper_id: int, user_id: int) -> int | None:
+    delivery = next((d for d in store.deliveries_for_whisper(whisper_id) if d.recipient_id == user_id), None)
+    return delivery.telegram_message_id if delivery else None
+
+
+def _append_mod_action(msg, text: str) -> None:
+    actions = msg.metadata.setdefault("mod_actions", [])
+    actions.append(text)
+
+
+def _aggregate(store: TransientStore):
+    queue = getattr(store, "delivery_queue", None)
+    return getattr(queue, "_aggregate_logger", None)

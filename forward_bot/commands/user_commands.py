@@ -1,1446 +1,818 @@
 from __future__ import annotations
 
 import math
-import random
-import secrets
-import html
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any
+import random
+import re
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import CommandHandler, ContextTypes
+from telegram.error import TelegramError
+from telegram.ext import ContextTypes
 
-from forward_bot.crypto import hash_tripcode, temporal_id
-from forward_bot.features.credits import adjust_credits_with_daily_limit, apply_negative_credit_cooldown, interpolate_loss_rate, interpolate_tax_rate, round_credit
-from forward_bot.features.remove_votes import check_remove_vote_allowed
-from forward_bot.features.tagging import TELEGRAM_INVITE_RE
-from forward_bot.features.tombstones import remove_message_with_tombstones
-from forward_bot.utils import as_utc, resolve_reply_target, resolve_user_reference, safe_reply_text, safe_send_message
-from forward_bot.commands.help_registry import register_command
-from forward_bot.messages import Messages as Msg
-
-logger = logging.getLogger(__name__)
-
-
-def register_user_commands(app: Any, repo: Any, cfg: dict[str, Any]) -> None:
-    def add(cmd: str, handler: Any, desc: Any) -> None:
-        register_command(
-            app, f"/{cmd}", CommandHandler(cmd, handler), "User", desc)
-
-    add("start", _start(repo, cfg), lambda cfg: "start receiving messages")
-    add("stop", _stop(repo), lambda cfg: "stop receiving messages")
-    add("help", _help(), lambda cfg: "show this help message")
-    add("about", _about(repo, cfg), lambda cfg: "show about message")
-    add("toggleconfirmation", _toggle_confirmation(repo),
-        lambda cfg: "toggle questionable confirmation")
-    add("togglevotebutton", _toggle_vote_button(repo),
-        lambda cfg: "show/hide vote buttons on messages you receive")
-    add("togglepotentiallyunwanted", _toggle_potentially_unwanted(repo),
-        lambda cfg: "hide/show potentially unwanted messages")
-    add("toggledups", _toggle_duplicates(repo),
-        lambda cfg: "hide/show duplicate media you already saw")
-    add("togglesign", _toggle_sign(repo, cfg),
-        lambda cfg: "enable/disable persistent signed style")
-    add("toggletripcode", _toggle_tripcode(repo, cfg),
-        lambda cfg: "enable/disable persistent tripcode")
-    add("block", _block(repo), lambda cfg: "block sender from replied message")
-    add("unblock", _unblock(repo),
-        lambda cfg: "unblock your most recently blocked sender")
-    add("credit", _credit(repo, cfg), lambda cfg: "transfer credits")
-    add("creditstats", _creditstats(repo, cfg),
-        lambda cfg: "credit leaderboard and stats")
-    add("gamble", _gamble(repo, cfg), lambda cfg: "50/50 credit gamble")
-    add("t", _tripcode_send(repo, cfg), lambda cfg: "send tripcoded message")
-    add("settripcode", _set_tripcode(repo, cfg),
-        lambda cfg: "set tripcode (<name#secret>)")
-    add("unsettripcode", _unset_tripcode(repo),
-        lambda cfg: "clear your configured tripcode")
-    add("s", _signed_send(repo, cfg), lambda cfg: "send signed message")
-    add("sendinvite", _send_invite_message(repo, cfg),
-        lambda cfg: "send a Telegram invite with required description")
-    add("sauce", _sauce(repo, cfg),
-        lambda cfg: "reverse image search replied media with SauceNAO")
-    add("invite", _invite(repo, cfg), lambda cfg: "show your invite link")
-    add("unsend", _unsend(repo, cfg),
-        lambda cfg: f"remove your latest sent message (cost {float(cfg['credits']['unsend_cost']):.2f})")
-    add("deletevote", _delete_vote(repo, cfg),
-        lambda cfg: "vote to remove a replied message")
-    add("reactions", _noop_help(),
-        lambda cfg: f"react 👍, 🔥 or ❤️ to upvote (cost {float(cfg['credits']['upvote_cost']):.2f}) or 👎 to downvote (starts at {float(cfg['credits']['downvote_start_cost']):.2f})")
-    add("w", _w(repo, cfg),
-        lambda cfg: f"send whisper (cost {float(cfg['credits']['whisper_cost']):.2f}, unlock {float(cfg['credits']['whisper_unlock_credits']):.2f})")
-    add("wmods", _whisper_mod(repo),
-        lambda cfg: "whisper all moderators")
-    add("fight", _fight(repo, cfg),
-        lambda cfg: f"request fight (fee {float(cfg['fights']['initiation_fee_percent']) * 100.0:.0f}% of stake, min {float(cfg['fights']['initiation_fee_min']):.2f}, max {float(cfg['fights']['initiation_fee_max']):.2f})")
-    add("togglefight", _toggle_fight(repo),
-        lambda cfg: "enable/disable fight requests")
-    add("users", _users(repo, cfg), lambda cfg: "show user counts")
+from forward_bot.commands.common import (
+    args_text,
+    command_reply,
+    display_identity,
+    display_identity_html,
+    ensure_user,
+    get_config,
+    get_repo,
+    get_store,
+    is_admin,
+    reply_to_for_target,
+    resolve_message_from_reply,
+    resolve_replied_sender,
+    resolve_target_user,
+    resolve_user_reference,
+)
+from forward_bot.commands.help_registry import HelpRegistry
+from forward_bot.crypto.tripcode import make_tripcode
+from forward_bot.features.credits import apply_credit, daily_caps, loss_rate, maybe_apply_negative_cooldown, tax_rate
+from forward_bot.features.remove_votes import vote_to_remove
+from forward_bot.features.tombstones import remove_message
+from forward_bot.logging_utils import log_telegram_error
+from forward_bot.utils import html_escape, human_seconds, mean_median, random_token, round_credits
 
 
-def _noop_help():
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is not None:
-            await update.message.reply_text(Msg.REACT_USAGE)
-
-    return handler
+LOGGER = logging.getLogger(__name__)
 
 
-def _start(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user = update.effective_user
-        if user is None or update.message is None:
-            return
-        admin_ids = set(int(x) for x in cfg["bot"].get("admin_ids", []))
-        existing = await repo.get_user(user.id)
-        first_seen = existing is None
-        joining_now = first_seen or not existing.has_started
-        logger.debug(
-            "Start command user_id=%s first_seen=%s joining_now=%s args=%s",
-            user.id,
-            first_seen,
-            joining_now,
-            list(context.args or []),
-        )
-        db_user = await repo.get_or_create_user(
-            user.id,
-            user.username,
-            admin_ids,
-            starting_credits=float(cfg["credits"]["starting_balance"]),
-        )
-        await repo.update_started(user.id, True)
-        if not db_user.about_seen:
-            about = await repo.get_about()
-            sent = await safe_reply_text(update.message, repo, about or Msg.ABOUT_DEFAULT)
-            if sent is None:
-                return
-            await repo.set_about_seen(user.id, True)
-
-        # Invite credit flow. Only accounts the bot has never seen before may
-        # redeem, so restarting or rejoining cannot abuse invite rewards.
-        if first_seen and context.args:
-            code = context.args[0].strip()
-            prefix = str(cfg.get("invites", {}).get("start_prefix", "inv_"))
-            logger.debug(
-                "Invite start parameter received invitee_id=%s code=%s expected_prefix=%s",
-                user.id,
-                code,
-                prefix,
-            )
-            invite = await repo.invite_by_code(code)
-            if invite and int(invite["inviter_id"]) != user.id:
-                if await repo.redeem_invite_once(code, user.id):
-                    reward = float(cfg["credits"]["invite_reward"])
-                    inviter_id = int(invite["inviter_id"])
-                    balance, applied = await adjust_credits_with_daily_limit(
-                        repo,
-                        cfg,
-                        inviter_id,
-                        reward,
-                        "invite_reward",
-                    )
-                    await repo.clear_cooldown(inviter_id)
-                    sent = await safe_send_message(
-                        context.bot,
-                        repo,
-                        inviter_id,
-                        text=Msg.invite_used_cooldown_removed(applied, balance),
-                    )
-                    logger.info(
-                        "Invite redeemed code=%s inviter_id=%s invitee_id=%s awarded=%.2f balance=%.2f",
-                        code,
-                        inviter_id,
-                        user.id,
-                        applied,
-                        balance,
-                    )
-                    if sent is None:
-                        logger.warning(
-                            "Invite reward notification failed code=%s inviter_id=%s invitee_id=%s awarded=%.2f balance=%.2f",
-                            code,
-                            inviter_id,
-                            user.id,
-                            applied,
-                            balance,
-                        )
-                    else:
-                        logger.info(
-                            "Invite reward notification sent code=%s inviter_id=%s invitee_id=%s",
-                            code,
-                            inviter_id,
-                            user.id,
-                        )
-                else:
-                    logger.debug(
-                        "Invite redemption skipped code=%s invitee_id=%s reason=already-redeemed",
-                        code,
-                        user.id,
-                    )
-            else:
-                logger.debug(
-                    "Invite redemption skipped code=%s invitee_id=%s reason=%s expected_prefix=%s",
-                    code,
-                    user.id,
-                    "self-invite" if invite and int(invite["inviter_id"]) == user.id else "invalid-code-or-prefix-mismatch",
-                    prefix,
-                )
-        elif context.args:
-            logger.debug(
-                "Invite redemption ignored for known user_id=%s first_seen=%s joining_now=%s code=%s",
-                user.id,
-                first_seen,
-                joining_now,
-                context.args[0],
-            )
-
-        initial_cooldown = int(cfg.get("onboarding", {}).get(
-            "initial_cooldown_seconds", 0))
-        if joining_now and initial_cooldown > 0:
-            until = datetime.now(timezone.utc) + \
-                timedelta(seconds=initial_cooldown)
-            await repo.set_cooldown(user.id, until.isoformat(), "initial-join", 0)
-            minutes = max(1, math.ceil(initial_cooldown / 60))
-            await safe_reply_text(update.message, repo, Msg.initial_cooldown(minutes))
-
-    return handler
+def register_user_commands(registry: HelpRegistry) -> None:
+    add = registry.add
+    add("start", "Lifecycle", "Start receiving messages.", start)
+    add("stop", "Lifecycle", "Stop receiving messages.", stop)
+    add("help", "Info", "Show available commands.", help_cmd)
+    add("about", "Info", "Show bot rules/about text.", about)
+    add("users", "Info", "Show user counts.", users_cmd)
+    add("info", "Info", "Show your info, or target info for mods/admins.", info_cmd)
+    add("toggleconfirmation", "Preferences", "Toggle questionable-message confirmations.", toggle_confirmation)
+    add("togglevotebutton", "Preferences", "Toggle inline remove-vote buttons.", toggle_vote_button)
+    add("togglepotentiallyunwanted", "Preferences", "Toggle hiding potentially unwanted messages.", toggle_puw)
+    add("toggledups", "Preferences", "Toggle duplicate-media recipient filtering.", toggle_dups)
+    add("togglesign", "Identity", "Toggle persistent signing when enabled in config.", toggle_sign)
+    add("toggletripcode", "Identity", "Toggle persistent tripcode when enabled in config.", toggle_tripcode)
+    add("settripcode", "Identity", "Set tripcode with name#secret.", set_tripcode)
+    add("unsettripcode", "Identity", "Clear tripcode.", unset_tripcode)
+    add("s", "Identity", "Send one signed message.", signed_send)
+    add("t", "Identity", "Send one tripcoded message.", tripcode_send)
+    add("block", "Safety", "Block a sender by reply or visible user reference.", block)
+    add("unblock", "Safety", "Remove your most recent block.", unblock)
+    add("credit", "Credits", "Transfer credits by reply or reference.", credit)
+    add("creditstats", "Credits", "Show credit leaderboard and economy details.", creditstats)
+    add("gamble", "Credits", "Gamble credits with 50% odds.", gamble)
+    add("invite", "Invites", "Create or show your invite link.", invite)
+    add("sendinvite", "Invites", "Forward a described Telegram invite link.", sendinvite)
+    add("unsend", "Moderation", "Remove your own replied message for a cost.", unsend)
+    add("deletevote", "Moderation", "Vote to remove a replied message.", deletevote)
+    add("reactions", "Preferences", "Toggle vote reaction notifications.", reactions)
+    add("w", "Whispers", "Whisper to a user by reply or reference.", whisper)
+    add("wmods", "Whispers", "Whisper to moderators/admins.", wmods)
+    add("sauce", "Media", "Search source for replied media.", sauce)
+    add("fight", "Fights", "Challenge a user for credits.", fight)
+    add("togglefight", "Fights", "Toggle receiving fight requests.", togglefight)
 
 
-def _stop(repo: Any):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user = update.effective_user
-        if user is None or update.message is None:
-            return
-        await repo.update_started(user.id, False)
-        await safe_reply_text(update.message, repo, Msg.STOPPED)
-
-    return handler
-
-
-def _users(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        days = int(cfg.get("inactivity", {}).get("period_days", 7))
-        counts = await repo.user_counts(days)
-        text = "\n".join(
-            [
-                "Users:",
-                f"Total: {counts['total']}",
-                f"Active (<= {days}d): {counts['active']}",
-                f"Inactive (> {days}d): {counts['inactive']}",
-                f"Banned: {counts['blacklisted']}",
-                f"Left: {counts['left']}",
-            ]
-        )
-        await update.message.reply_text(text)
-
-    return handler
-
-
-def _help():
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        cfg = context.application.bot_data.get("cfg", {})
-        repo = context.application.bot_data.get("repo")
-        caller = await repo.get_user(update.effective_user.id) if repo is not None else None
-        can_view_mod_commands = bool(caller and (caller.is_moderator or caller.is_admin))
-        entries = context.application.bot_data.get("help_entries", [])
-        sections: list[str] = []
-        for entry in entries:
-            if entry.section == "Mod" and not can_view_mod_commands:
-                continue
-            if entry.section not in sections:
-                sections.append(entry.section)
-        lines: list[str] = []
-        for section in sections:
-            lines.append(f"{section} Commands:")
-            for entry in entries:
-                if entry.section != section:
-                    continue
-                if entry.section == "Mod" and not can_view_mod_commands:
-                    continue
-                desc = entry.description(cfg) if callable(
-                    entry.description) else str(entry.description)
-                lines.append(f"{entry.command} - {desc}")
-            lines.append("")
-        await update.message.reply_text("\n".join(lines).strip())
-
-    return handler
-
-
-def _about(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if context.args and user and user.is_admin:
-            text = " ".join(context.args).strip()
-            if text:
-                await repo.set_about(text)
-                await update.message.reply_text(Msg.ABOUT_UPDATED)
-                return
-        text = await repo.get_about()
-        await update.message.reply_text(text or Msg.ABOUT_DEFAULT)
-
-    return handler
-
-
-def _toggle_confirmation(repo: Any):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        new_state = not user.confirmation_enabled
-        await repo.set_confirmation_enabled(user.telegram_id, new_state)
-        await repo.touch_activity(user.telegram_id)
-        await update.message.reply_text(Msg.enabled("Questionable confirmation", new_state))
-
-    return handler
-
-
-def _toggle_vote_button(repo: Any):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        new_state = not user.vote_buttons_enabled
-        await repo.set_vote_buttons_enabled(user.telegram_id, new_state)
-        await repo.touch_activity(user.telegram_id)
-        await update.message.reply_text(Msg.enabled(Msg.VOTE_BUTTON_LABEL, new_state))
-
-    return handler
-
-
-def _toggle_potentially_unwanted(repo: Any):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        new_state = not user.hide_potentially_unwanted
-        await repo.set_hide_potentially_unwanted(user.telegram_id, new_state)
-        await repo.touch_activity(user.telegram_id)
-        await update.message.reply_text(Msg.enabled(Msg.POTENTIALLY_UNWANTED_FILTER_LABEL, new_state))
-
-    return handler
-
-
-def _toggle_duplicates(repo: Any):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        new_state = not user.filter_duplicates
-        await repo.set_filter_duplicates(user.telegram_id, new_state)
-        await repo.touch_activity(user.telegram_id)
-        text = Msg.enabled(Msg.DUPLICATE_FILTER_LABEL, new_state)
-        if user.is_moderator or user.is_admin:
-            text = f"{text}\n{Msg.MOD_EXEMPT_SETTING}"
-        await update.message.reply_text(text)
-
-    return handler
-
-
-def _toggle_sign(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        if not bool(cfg.get("identity", {}).get("allow_sign_toggle", False)):
-            await update.message.reply_text(Msg.SIGN_TOGGLE_DISABLED)
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        await repo.set_sign_enabled(user.telegram_id, not user.sign_enabled)
-        await repo.touch_activity(user.telegram_id)
-        await update.message.reply_text(Msg.enabled("Sign", not user.sign_enabled))
-
-    return handler
-
-
-def _toggle_fight(repo: Any):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        await repo.set_fights_enabled(user.telegram_id, not user.fights_enabled)
-        await repo.touch_activity(user.telegram_id)
-        await update.message.reply_text(Msg.enabled("Fight requests", not user.fights_enabled))
-
-    return handler
-
-
-def _block(repo: Any):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        if not update.message.reply_to_message:
-            await update.message.reply_text(Msg.BLOCK_USAGE)
-            return
-        lookup = await repo.sender_by_delivery(update.effective_user.id, update.message.reply_to_message.message_id)
-        if lookup is None:
-            await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
-            return
-        _, sender_id = lookup
-        if sender_id == update.effective_user.id:
-            await update.message.reply_text(Msg.CANNOT_BLOCK_SELF)
-            return
-        user = await repo.get_user(update.effective_user.id)
-        await repo.add_block(update.effective_user.id, sender_id)
-        await repo.touch_activity(update.effective_user.id)
-        text = Msg.BLOCKED_SENDER
-        if user is not None and (user.is_moderator or user.is_admin):
-            text = f"{text}\n{Msg.MOD_EXEMPT_SETTING}"
-        await update.message.reply_text(text)
-
-    return handler
-
-
-def _unblock(repo: Any):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        removed = await repo.remove_last_block(update.effective_user.id)
-        if removed is None:
-            await update.message.reply_text(Msg.UNBLOCK_EMPTY)
-            return
-        await repo.touch_activity(update.effective_user.id)
-        await update.message.reply_text(Msg.UNBLOCKED_LAST)
-
-    return handler
-
-
-def _credit(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        sender = await repo.get_user(update.effective_user.id)
-        if sender is None:
-            return
-        target = None
-        amount = None
-        source_message_id: int | None = None
-        target_reply_to: int | None = None
-        if update.message.reply_to_message and context.args:
-            try:
-                amount = round_credit(float(context.args[0]))
-            except ValueError:
-                amount = None
-            if amount is None or (amount <= 0 and not sender.is_admin):
-                await update.message.reply_text(Msg.CREDIT_USAGE_REPLY)
-                return
-            resolved = await resolve_reply_target(
-                repo,
-                update.effective_user.id,
-                update.message.reply_to_message.message_id,
-            )
-            if resolved.user is None:
-                await update.message.reply_text(resolved.error or Msg.MESSAGE_NOT_IN_CACHE)
-                return
-            source_message_id = resolved.source_message_id
-            target = resolved.user.telegram_id
-            if source_message_id is not None and source_message_id > 0:
-                target_reply_to = await repo.delivery_message_for_recipient(source_message_id, target)
-        elif len(context.args) >= 2:
-            resolved = await resolve_user_reference(repo, cfg, sender, context.args)
-            if resolved.user is None:
-                await update.message.reply_text(resolved.error or Msg.CREDIT_TARGET_NOT_FOUND)
-                return
-            try:
-                amount = round_credit(float(context.args[resolved.consumed]))
-            except IndexError:
-                await update.message.reply_text(Msg.CREDIT_USAGE_TARGET)
-                return
-            except ValueError:
-                amount = None
-            if amount is None:
-                await update.message.reply_text(Msg.CREDIT_USAGE_TARGET)
-                return
-            target = resolved.user.telegram_id
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
+    repo = get_repo(context)
+    config = get_config(context)
+    user, created = await ensure_user(update, context)
+    if not user:
+        return
+    first_seen = created
+    joining_now = not user.has_started
+    repo.set_started(user.telegram_id, True)
+    repo.touch_activity(user.telegram_id)
+    if not user.about_seen:
+        await msg.reply_text(repo.get_about())
+        repo.set_about_seen(user.telegram_id)
+    if first_seen and context.args:
+        invite_info = repo.redeem_invite(context.args[0], user.telegram_id)
+        if invite_info:
+            inviter_id = int(invite_info["inviter_id"])
+            reward, inviter = apply_credit(repo, config, inviter_id, float(config.get("credits.invite_reward", 5) or 5), "invite_reward")
+            repo.clear_cooldown(inviter_id)
+            if inviter and inviter.has_started:
+                try:
+                    await context.bot.send_message(inviter_id, f"Invite used. Reward: {reward:.2f} credits. Balance: {inviter.credits:.2f}. Cooldown cleared.")
+                except TelegramError as exc:
+                    log_telegram_error(LOGGER, "invite.notify_inviter", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=inviter_id)
+                    pass
+    if joining_now:
+        initial = int(config.get("onboarding.initial_cooldown_seconds", 0) or 0)
+        if initial > 0 and not user.is_mod_or_admin:
+            repo.set_cooldown(user.telegram_id, initial, "onboarding", None, stack=False)
+            await msg.reply_text(f"Started. Initial cooldown: {human_seconds(initial)}. Invites can clear inviter cooldowns.")
         else:
-            await update.message.reply_text(Msg.CREDIT_USAGE)
-            return
-
-        if target == sender.telegram_id:
-            await update.message.reply_text(Msg.CREDIT_TARGET_SELF)
-            return
-        if amount is None or amount == 0:
-            await update.message.reply_text(Msg.CREDIT_NONZERO)
-            return
-        if amount < 0 and not sender.is_admin:
-            await update.message.reply_text(Msg.CREDIT_NEGATIVE_ADMIN_ONLY)
-            return
-        if sender.is_admin:
-            if await repo.get_user(target) is None:
-                await update.message.reply_text(Msg.CREDIT_TRANSFER_INVALID_USER)
-                return
-            target_balance = await repo.adjust_credits(target, amount, "admin_credit")
-            await apply_negative_credit_cooldown(repo, cfg, target, target_balance, sender.telegram_id)
-            await repo.touch_activity(sender.telegram_id)
-            await _notify_credit_recipient(
-                context,
-                target,
-                amount,
-                target_balance,
-                target_reply_to,
-                admin_adjustment=True,
-            )
-            await update.message.reply_text(Msg.admin_credit_adjusted(amount, target_balance))
-        else:
-            success = await repo.credits_transfer(
-                sender_id=sender.telegram_id,
-                target_id=target,
-                amount=amount,
-                allow_negative_sender=False,
-            )
-            if not success:
-                await update.message.reply_text(Msg.CREDIT_TRANSFER_FAILED)
-                return
-            refreshed = await repo.get_user(sender.telegram_id)
-            if refreshed is not None:
-                await apply_negative_credit_cooldown(repo, cfg, refreshed.telegram_id, refreshed.credits, sender.telegram_id)
-            await repo.touch_activity(sender.telegram_id)
-            sender_balance = refreshed.credits if refreshed is not None else 0.0
-            target_user = await repo.get_user(target)
-            if target_user is not None:
-                await _notify_credit_recipient(
-                    context,
-                    target,
-                    amount,
-                    target_user.credits,
-                    target_reply_to,
-                    admin_adjustment=False,
-                )
-            await update.message.reply_text(Msg.credits_transferred(amount, sender_balance))
-
-    return handler
-
-
-async def _notify_credit_recipient(
-    context: ContextTypes.DEFAULT_TYPE,
-    target_id: int,
-    amount: float,
-    balance: float,
-    reply_to_message_id: int | None,
-    admin_adjustment: bool,
-) -> None:
-    if admin_adjustment and amount < 0:
-        text = f"Your credits were adjusted by {amount:.2f}. Balance: {balance:.2f}"
-    elif admin_adjustment:
-        text = f"You received {amount:.2f} credits from an admin adjustment. Balance: {balance:.2f}"
+            await msg.reply_text("Started.")
     else:
-        text = f"You received {amount:.2f} credits. Balance: {balance:.2f}"
-    if reply_to_message_id is not None:
-        text += "\nThis transfer is attached to the replied message."
+        await msg.reply_text("Receiving enabled.")
+
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    if user:
+        get_repo(context).set_started(user.telegram_id, False)
+    if update.effective_message:
+        await update.effective_message.reply_text("Receiving stopped. Use /start to re-enable.")
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    registry: HelpRegistry = context.application.bot_data["help_registry"]
+    await update.effective_message.reply_text(
+        registry.help_text(
+            include_mod=bool(user and user.is_mod_or_admin),
+            include_admin=bool(user and user.is_admin),
+            config=get_config(context),
+        )
+    )
+
+
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    repo = get_repo(context)
+    text = _command_payload(update, "about")
+    if text and is_admin(user):
+        repo.set_about(text)
+        await command_reply(update, context, "About text updated until reload/restart.")
+    elif text:
+        await command_reply(update, context, "Admin only.")
+    else:
+        await command_reply(update, context, repo.get_about(), prefer_target=False)
+
+
+def _command_payload(update: Update, command: str) -> str:
+    msg = update.effective_message
+    text = msg.text or msg.caption or "" if msg else ""
+    match = re.match(rf"^/{re.escape(command)}(?:@\w+)?(?:\s+([\s\S]*))?$", text)
+    return (match.group(1) or "").strip() if match else ""
+
+
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    repo = get_repo(context)
+    config = get_config(context)
+    period_days = float(config.get("inactivity.period_days", 4) or 4)
+    from forward_bot.utils import now_utc, parse_dt
+
+    users = repo.list_users()
+    active = inactive = banned = left = 0
+    for user in users:
+        if user.is_banned:
+            banned += 1
+        if not user.has_started:
+            left += 1
+        elif user.is_banned:
+            pass
+        else:
+            last = parse_dt(user.last_activity)
+            if last and (now_utc() - last).total_seconds() < period_days * 86400:
+                active += 1
+            else:
+                inactive += 1
+    await update.effective_message.reply_text(f"Total: {len(users)}\nActive: {active}\nInactive: {inactive}\nBanned: {banned}\nLeft: {left}")
+
+
+async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from forward_bot.commands.mod_commands import info as mod_info
+    await mod_info(update, context)
+
+
+async def _toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, column: str, label: str) -> None:
+    user, _ = await ensure_user(update, context)
+    if not user:
+        return
+    repo = get_repo(context)
+    new = not bool(getattr(user, column))
+    repo.set_preference(user.telegram_id, column, new)
+    repo.touch_activity(user.telegram_id)
+    await update.effective_message.reply_text(f"{label}: {'on' if new else 'off'}")
+
+
+async def toggle_confirmation(update, context): await _toggle(update, context, "confirmation_enabled", "Confirmations")
+async def toggle_vote_button(update, context): await _toggle(update, context, "vote_buttons_enabled", "Vote buttons")
+async def toggle_puw(update, context): await _toggle(update, context, "hide_potentially_unwanted", "Hide potentially unwanted")
+async def toggle_dups(update, context): await _toggle(update, context, "filter_duplicates", "Duplicate filtering")
+async def reactions(update, context): await _toggle(update, context, "votes_enabled", "Vote notifications")
+async def togglefight(update, context): await _toggle(update, context, "fights_enabled", "Fight requests")
+
+
+async def toggle_sign(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not get_config(context).get("identity.allow_sign_toggle", True):
+        await update.effective_message.reply_text("Persistent signing is disabled by config.")
+        return
+    await _toggle(update, context, "sign_enabled", "Persistent signing")
+
+
+async def toggle_tripcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not get_config(context).get("identity.allow_tripcode_toggle", True):
+        await update.effective_message.reply_text("Persistent tripcode is disabled by config.")
+        return
+    await _toggle(update, context, "tripcode_enabled", "Persistent tripcode")
+
+
+async def set_tripcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    if not user:
+        return
+    raw = args_text(context)
+    if "#" not in raw:
+        await update.effective_message.reply_text("Use /settripcode name#secret")
+        return
+    name, secret = raw.split("#", 1)
     try:
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=text,
-            reply_to_message_id=reply_to_message_id,
-        )
-    except Exception:
-        pass
+        name, code = make_tripcode(name, secret, str(get_config(context).get("bot.global_salt", "")))
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
+    get_repo(context).set_tripcode(user.telegram_id, name, code, True)
+    await update.effective_message.reply_html(f"Tripcode set: <b>{html_escape(name)}</b> !{html_escape(code)}")
 
 
-def _creditstats(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
+async def unset_tripcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    if user:
+        get_repo(context).set_tripcode(user.telegram_id, None, None, False)
+    await update.effective_message.reply_text("Tripcode cleared.")
+
+
+async def signed_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = args_text(context)
+    if not text:
+        await update.effective_message.reply_text("Use /s <message>")
+        return
+    from forward_bot.handlers.message_handlers import submit_text
+    await submit_text(update, context, text, identity_mode="signed")
+
+
+async def tripcode_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = args_text(context)
+    user, _ = await ensure_user(update, context)
+    if not text:
+        await update.effective_message.reply_text("Use /t <message>")
+        return
+    if not user or not user.tripcode_name or not user.tripcode_hash:
+        await update.effective_message.reply_text("Set a tripcode first with /settripcode name#secret.")
+        return
+    from forward_bot.handlers.message_handlers import submit_text
+    await submit_text(update, context, text, identity_mode="tripcode")
+
+
+async def block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    target, error, _ = await resolve_target_user(update, context, user)
+    if not user or not target:
+        await command_reply(update, context, error or "No target.")
+        return
+    if target.telegram_id == user.telegram_id:
+        await command_reply(update, context, "You cannot block yourself.")
+        return
+    repo = get_repo(context)
+    repo.add_block(user.telegram_id, target.telegram_id)
+    repo.touch_activity(user.telegram_id)
+    suffix = "\nModeration visibility is preserved for mods/admins." if user.is_mod_or_admin else ""
+    await command_reply(update, context, "Sender blocked." + suffix)
+
+
+async def unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    repo = get_repo(context)
+    removed = repo.remove_latest_block(user.telegram_id) if user else None
+    if user:
+        repo.touch_activity(user.telegram_id)
+    await update.effective_message.reply_text("Most recent block removed." if removed else "You have no blocked users.")
+
+
+async def credit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    repo = get_repo(context)
+    config = get_config(context)
+    if not user:
+        return
+    target = None
+    amount = None
+    if update.effective_message.reply_to_message and len(context.args or []) == 1:
+        target_id, error = await resolve_replied_sender(update, context)
+        target = repo.get_user(target_id) if target_id else None
+        amount = _parse_amount(context.args[0])
+    elif len(context.args or []) >= 2:
+        target = resolve_user_reference(repo, config, context.args[0], user)
+        amount = _parse_amount(context.args[1])
+    if not target or amount is None:
+        await command_reply(update, context, "Use /credit <amount> in reply, or /credit <user> <amount>.")
+        return
+    amount = round_credits(amount)
+    if amount == 0:
+        await command_reply(update, context, "Amount must be non-zero.")
+        return
+    if target.telegram_id == user.telegram_id:
+        await command_reply(update, context, "You cannot transfer to yourself.")
+        return
+    if not user.is_admin:
+        if amount <= 0:
+            await command_reply(update, context, "Normal users can only send positive amounts.")
             return
-        caller = await repo.get_user(update.effective_user.id)
-        if caller is None:
+        if user.credits < amount:
+            await command_reply(update, context, "Insufficient credits.")
             return
-        top_daily = await repo.list_top_credits(since_days=1, limit=10)
-        top_all = await repo.list_top_credits(since_days=None, limit=10)
-        min_c, med_c, max_c = await repo.get_credit_distribution()
-        supply = await repo.current_supply()
-        net_daily = await repo.net_issuance_since_days(1)
-        net_weekly = await repo.net_issuance_since_days(7)
-        start_daily = max(1e-9, supply - net_daily)
-        start_weekly = max(1e-9, supply - net_weekly)
-        inflation_daily = (net_daily / start_daily) * 100.0
-        inflation_weekly = (net_weekly / start_weekly) * 100.0
-        tax_rate = interpolate_tax_rate(
-            cfg["credits"]["tax_ramp"], caller.credits) * 100.0
-        expected = caller.credits * (1.0 - (tax_rate / 100.0))
-        loss_rate = interpolate_loss_rate(
-            cfg["loss_rate"]["schedule"], caller.credits) * 100.0
-
-        def ident(row: Any) -> str:
-            anon = html.escape(temporal_id(
-                int(row["telegram_id"]), cfg["bot"]["global_salt"]))
-            trip = None
-            if row["tripcode_enabled"] and row["tripcode_name"] and row["tripcode_hash"]:
-                name = html.escape(str(row["tripcode_name"]))
-                trip = f"<b>{name}</b> !{str(row['tripcode_hash'])[:6]}"
-            if caller.is_admin:
-                parts = [anon]
-                if trip:
-                    parts.append(trip)
-                if row["username"]:
-                    parts.append(f"@{html.escape(str(row['username']))}")
-                return " ".join(parts)
-            return trip or anon
-
-        def limit_label(key: str) -> str:
-            return html.escape(key.replace("_", " ").title())
-
-        limits = cfg["credits"].get("daily_earning_limits", {})
-        limit_lines = []
-        for k, v in limits.items():
-            value = float(v)
-            rendered = "unlimited" if value < 0 else f"{value:.2f}"
-            limit_lines.append(f"{limit_label(k)}: {rendered}")
-
-        cost_lines = [
-            f"Unsend: {float(cfg['credits']['unsend_cost']):.2f}",
-            f"Edit: {float(cfg['credits'].get('edit_cost', 2.0)):.2f}",
-            f"Whisper: {float(cfg['credits']['whisper_cost']):.2f}",
-            f"Upvote: {float(cfg['credits']['upvote_cost']):.2f}",
-            f"Downvote Start: {float(cfg['credits']['downvote_start_cost']):.2f}",
-            f"Downvote Penalty To Sender: {float(cfg['credits']['downvote_penalty']):.2f}",
-            f"Fight Fee: {float(cfg['fights']['initiation_fee_percent']) * 100.0:.2f}% "
-            f"(min {float(cfg['fights']['initiation_fee_min']):.2f}, max {float(cfg['fights']['initiation_fee_max']):.2f})",
-            f"Fight Win Tax: {float(cfg['fights']['win_tax_percent']) * 100.0:.2f}%",
-            f"Remove Punishment: {float(cfg['vote_to_remove']['punishment_credit_tax_percent']) * 100.0:.2f}% "
-            f"(min {float(cfg['vote_to_remove']['punishment_credit_minimum']):.2f})",
-            f"Revert Punishment: {float(cfg['vote_to_remove']['reversal_punishment_credit_tax_percent']) * 100.0:.2f}% "
-            f"(min {float(cfg['vote_to_remove']['reversal_punishment_credit_minimum']):.2f})",
-        ]
-        downvote_schedule = [
-            f"minute {x['minute']}: {float(x['cost']):.2f}"
-            for x in cfg["credits"].get("downvote_cost_schedule", [])
-        ]
-        loss_schedule = [
-            f"{float(x['credits']):.2f} credits: {float(x['loss_rate']) * 100.0:.2f}%"
-            for x in cfg["loss_rate"].get("schedule", [])
-        ]
-
-        daily_lines = [
-            f"{i+1}. {ident(r)} - {float(r['earned'] if 'earned' in r.keys() else r['credits']):.2f}"
-            for i, r in enumerate(top_daily)
-        ]
-        all_lines = [
-            f"{i+1}. {ident(r)} - {float(r['credits']):.2f}" for i, r in enumerate(top_all)]
-        text = "\n".join(
-            [
-                "<b>Top 10 All Time</b>",
-                *(all_lines or ["- none"]),
-                "",
-                "<b>Top 10 Daily</b>",
-                *(daily_lines or ["- none"]),
-                "",
-                "<b>Inflation</b>",
-                f"Daily: {inflation_daily:.2f}%",
-                f"Weekly: {inflation_weekly:.2f}%",
-                "",
-                "<b>Credit Summary</b>",
-                f"Minimum / Median / Maximum: {min_c:.2f} / {med_c:.2f} / {max_c:.2f}",
-                f"Your Current Balance: {caller.credits:.2f}",
-                f"Your Daily Tax Rate: {tax_rate:.2f}%",
-                f"Your Loss Rate: {loss_rate:.2f}%",
-                f"Your Expected Balance (1d): {expected:.2f}",
-                "",
-                "<b>Loss Rate Settings</b>",
-                *(loss_schedule or ["- none"]),
-                "",
-                "<b>Credit Config</b>",
-                f"Starting Balance: {float(cfg['credits']['starting_balance']):.2f}",
-                f"Text Reward: {float(cfg['credits']['text_message_reward']):.2f}",
-                f"Media Reward: {float(cfg['credits']['media_message_reward']):.2f}",
-                f"Upvote Reward: {float(cfg['credits']['upvote_reward']):.2f}",
-                f"Invite Reward: {float(cfg['credits']['invite_reward']):.2f}",
-                *(cost_lines or ["- none"]),
-                "",
-                "<b>Downvote Cost Schedule:</b>",
-                *(downvote_schedule or ["- none"]),
-                "",
-                "<b>Daily Limits:</b>",
-                *(limit_lines or ["- none"]),
-            ]
-        )
-        await update.message.reply_text(text, parse_mode="HTML")
-
-    return handler
-
-
-def _gamble(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        if not context.args:
-            await update.message.reply_text(Msg.GAMBLE_USAGE)
-            return
+        sender, target = repo.transfer_credits(user.telegram_id, target.telegram_id, amount)
+        repo.touch_activity(user.telegram_id)
+        await command_reply(update, context, f"Sent {amount:.2f} credits to {display_identity_html(target, config, viewer=user)}. Balance: {sender.credits:.2f}", parse_mode="HTML")
         try:
-            amount = round_credit(float(context.args[0]))
-        except ValueError:
-            await update.message.reply_text(Msg.AMOUNT_NUMERIC)
-            return
-        if amount < 0.01:
-            await update.message.reply_text(Msg.AMOUNT_MIN)
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        if amount > user.credits:
-            await update.message.reply_text(Msg.GAMBLE_TOO_MUCH)
-            return
-        if amount > float(cfg.get("gamble", {}).get("max_amount", 1000.0)):
-            await update.message.reply_text(Msg.GAMBLE_MAX)
-            return
-        if random.random() < 0.5:
-            bal, applied = await adjust_credits_with_daily_limit(repo, cfg, user.telegram_id, amount, "gamble_win")
-            await repo.touch_activity(user.telegram_id)
-            await update.message.reply_text(Msg.gamble_won(applied, bal))
-        else:
-            bal = await repo.adjust_credits(user.telegram_id, -amount, "gamble_loss")
-            await apply_negative_credit_cooldown(repo, cfg, user.telegram_id, bal, user.telegram_id)
-            await repo.touch_activity(user.telegram_id)
-            await update.message.reply_text(Msg.gamble_lost(amount, bal))
-
-    return handler
-
-
-def _set_tripcode(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        if not context.args:
-            await update.message.reply_text(Msg.TRIPCODESET_USAGE)
-            return
-        value = " ".join(context.args).strip()
-        if "#" not in value:
-            await update.message.reply_text(Msg.TRIPCODESET_USAGE)
-            return
-        name, secret = value.split("#", 1)
-        name = name.strip()
-        secret = secret.strip()
-        if not name or not secret:
-            await update.message.reply_text(Msg.TRIPCODESET_USAGE)
-            return
-        hashed = hash_tripcode(secret, cfg["bot"]["global_salt"])
-        await repo.set_tripcode(update.effective_user.id, True, name, hashed)
-        await repo.touch_activity(update.effective_user.id)
-        await update.message.reply_text(
-            Msg.tripcode_set(html.escape(name), hashed[:6]),
-            parse_mode="HTML",
-        )
-
-    return handler
-
-
-def _unset_tripcode(repo: Any):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        await repo.set_tripcode(update.effective_user.id, False, None, None)
-        await repo.touch_activity(update.effective_user.id)
-        await update.message.reply_text(Msg.TRIPCODE_UNSET)
-
-    return handler
-
-
-def _tripcode_send(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        if not context.args:
-            await update.message.reply_text(Msg.TRIPCODE_SEND_USAGE)
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        if not user.tripcode_name or not user.tripcode_hash:
-            await update.message.reply_text(Msg.TRIPCODE_SET_FIRST)
-            return
-        msg = _apply_identity_text(user, " ".join(
-            context.args).strip(), mode="tripcode")
-        if await _dispatch_user_message(context, repo, cfg, user.telegram_id, msg, update.message, parse_mode="HTML"):
-            await update.message.reply_text(Msg.TRIPCODE_SENT)
-
-    return handler
-
-
-def _toggle_tripcode(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        if not bool(cfg.get("identity", {}).get("allow_tripcode_toggle", False)):
-            await update.message.reply_text(Msg.TRIPCODE_TOGGLE_DISABLED)
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        enabled = not user.tripcode_enabled
-        await repo.set_tripcode(update.effective_user.id, enabled, user.tripcode_name, user.tripcode_hash)
-        await repo.touch_activity(update.effective_user.id)
-        await update.message.reply_text(Msg.enabled("Tripcode", enabled))
-
-    return handler
-
-
-async def _dispatch_user_message(
-    context: ContextTypes.DEFAULT_TYPE,
-    repo: Any,
-    cfg: dict[str, Any],
-    sender_id: int,
-    text: str,
-    source_message: Any | None = None,
-    parse_mode: str | None = None,
-    include_remove_button: bool = False,
-) -> bool:
-    queue = context.application.bot_data["queue"]
-    source_chat_id = getattr(source_message, "chat_id", None)
-    source_message_id = getattr(source_message, "message_id", None)
-    reply_to_message_id = None
-    if source_message is not None and getattr(source_message, "reply_to_message", None):
-        reply_msg = source_message.reply_to_message
-        lookup = await repo.sender_by_delivery(sender_id, reply_msg.message_id)
-        if lookup is None:
-            source = await repo.message_by_source(reply_msg.chat_id, reply_msg.message_id)
-            if source is None:
-                await source_message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
-                return False
-            reply_to_message_id = int(source["id"])
-        else:
-            reply_to_message_id, _ = lookup
-    message_id = await repo.create_message(
-        sender_id,
-        "text",
-        text,
-        None,
-        None,
-        source_chat_id,
-        source_message_id,
-        reply_to_message_id,
-        parse_mode,
-    )
-    await repo.set_message_tag(message_id, "OK", None)
-    recipients = await repo.list_eligible_recipients(sender_id)
-    await queue.enqueue_batch(
-        message_id,
-        sender_id,
-        recipients,
-        "text",
-        text,
-        None,
-        None,
-        is_system=False,
-        reply_to_message_id=reply_to_message_id,
-        include_remove_button=include_remove_button,
-        parse_mode=parse_mode,
-    )
-    await adjust_credits_with_daily_limit(
-        repo,
-        cfg,
-        sender_id,
-        float(cfg["credits"]["text_message_reward"]),
-        "text_message_reward",
-    )
-    await repo.touch_activity(sender_id)
-    return True
-
-
-def _apply_identity_text(user: Any, text: str, mode: str = "default") -> str:
-    body = html.escape(text)
-    if mode == "sign" or (mode == "default" and user.sign_enabled):
-        label = f"@{html.escape(user.username)}" if user.username else "signed"
-        return f"{body} <i><b>~ {label}</b></i>"
-    if (mode == "tripcode" or (mode == "default" and user.tripcode_enabled)) and user.tripcode_name and user.tripcode_hash:
-        name = html.escape(str(user.tripcode_name))
-        return f"<b>{name}</b> !{str(user.tripcode_hash)[:6]}\n{body}"
-    return body
-
-
-def _whisper_html(text: str, label: str = "Whisper", text_is_html: bool = False) -> str:
-    body = text if text_is_html else html.escape(text)
-    return f"<i><b>{label}:</b></i> {body}"
-
-
-def _signed_send(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        if not context.args:
-            await update.message.reply_text(Msg.SIGN_SEND_USAGE)
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        msg = _apply_identity_text(user, " ".join(
-            context.args).strip(), mode="sign")
-        if await _dispatch_user_message(context, repo, cfg, user.telegram_id, msg, update.message, parse_mode="HTML"):
-            await update.message.reply_text(Msg.SIGNED_SENT)
-
-    return handler
-
-
-def _send_invite_message(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        text = " ".join(context.args).strip()
-        match = TELEGRAM_INVITE_RE.search(text)
-        if match is None:
-            await update.message.reply_text(Msg.SENDINVITE_USAGE)
-            return
-        description = (text[:match.start()] + " " + text[match.end():]).strip()
-        if len(description) < 3:
-            await update.message.reply_text(Msg.SENDINVITE_USAGE)
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        if await _dispatch_user_message(
-            context,
-            repo,
-            cfg,
-            user.telegram_id,
-            text,
-            update.message,
-            include_remove_button=True,
-        ):
-            await update.message.reply_text(Msg.SENDINVITE_SENT)
-
-    return handler
-
-
-def _invite(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        prefix = str(cfg.get("invites", {}).get("start_prefix", "inv_"))
-        existing = await repo.invite_by_inviter(update.effective_user.id)
-        if existing is not None:
-            code = str(existing["invite_code"])
-        else:
-            while True:
-                code = f"{prefix}{secrets.token_urlsafe(8)}"
-                if await repo.invite_by_code(code) is None:
-                    break
-            await repo.upsert_invite(update.effective_user.id, code)
-        await repo.touch_activity(update.effective_user.id)
-        me = await context.bot.get_me()
-        link = f"https://t.me/{me.username}?start={code}" if me.username else f"start code: {code}"
-        await update.message.reply_text(Msg.invite_link(link))
-
-    return handler
-
-
-def _unsend(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        cost = float(cfg["credits"]["unsend_cost"])
-        if user.credits < cost:
-            await update.message.reply_text(Msg.unsend_insufficient(cost, user.credits))
-            return
-        if update.message.reply_to_message is None:
-            await update.message.reply_text(Msg.UNSEND_USAGE)
-            return
-        target = await repo.message_by_source(
-            update.effective_user.id,
-            update.message.reply_to_message.message_id,
-        )
-        if target is None:
-            lookup = await repo.sender_by_delivery(update.effective_user.id, update.message.reply_to_message.message_id)
-            if lookup is not None:
-                message_id, sender_id = lookup
-                if sender_id == user.telegram_id:
-                    target = await repo.get_message(message_id)
-        if target is None:
-            await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
-            return
-        if int(target["sender_id"]) != user.telegram_id:
-            await update.message.reply_text(Msg.UNSEND_OWN_ONLY)
-            return
-        message_id = int(target["id"])
-        if str(target["tag"]) == "BLOCKED":
-            await update.message.reply_text(Msg.UNSEND_NOT_SENT)
-            return
-        if not await repo.list_deliveries_for_message(message_id):
-            await update.message.reply_text(Msg.UNSEND_NOT_DELIVERED)
-            return
-        await remove_message_with_tombstones(
-            context,
-            repo,
-            cfg,
-            message_id,
-            user.telegram_id,
-            "unsent by sender",
-            notify_mods=True,
-            notify_sender=False,
-        )
-        balance = await repo.adjust_credits(user.telegram_id, -cost, "unsend_cost")
-        await repo.touch_activity(user.telegram_id)
-        await update.message.reply_text(
-            Msg.unsent(cost, balance),
-            reply_to_message_id=update.message.reply_to_message.message_id,
-        )
-
-    return handler
-
-
-def _delete_vote(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None or not update.message.reply_to_message:
-            if update.message:
-                await update.message.reply_text(Msg.DELETEVOTE_USAGE)
-            return
-        lookup = await repo.sender_by_delivery(update.effective_user.id, update.message.reply_to_message.message_id)
-        target_message = None
-        if lookup is None:
-            target_message = await repo.message_by_source(
-                update.effective_user.id,
-                update.message.reply_to_message.message_id,
-            )
-            if target_message is not None:
-                lookup = (int(target_message["id"]), int(
-                    target_message["sender_id"]))
-        if lookup is None:
-            await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
-            return
-        message_id, sender_id = lookup
-        if target_message is None:
-            target_message = await repo.get_message(message_id)
-        if target_message is None:
-            await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
-            return
-        caller = await repo.get_user(update.effective_user.id)
-        if caller is None:
-            return
-        if sender_id == update.effective_user.id:
-            await update.message.reply_text(Msg.DELETEVOTE_OWN)
-            return
-        allowed, reason = await check_remove_vote_allowed(repo, cfg, update.effective_user.id)
-        if not allowed:
-            await update.message.reply_text(reason or "Remove vote unavailable.")
-            return
-        if not await repo.add_remove_vote(message_id, update.effective_user.id):
-            await update.message.reply_text(Msg.DELETEVOTE_ALREADY)
-            return
-        await repo.touch_activity(update.effective_user.id)
-        count = await repo.count_remove_votes(message_id)
-        threshold = int(cfg["vote_to_remove"]["threshold"])
-        if count < threshold:
-            await update.message.reply_text(Msg.remove_vote_counted(count, threshold))
-            return
-        await remove_message_with_tombstones(context, repo, cfg, message_id, sender_id, "community vote threshold reached")
-        await _notify_delete_vote_participants(context, repo, message_id)
-        collateral = int(cfg["vote_to_remove"]["collateral_remove_amount"])
-        if collateral > 0:
-            neighbors = await repo.list_neighbor_messages_by_sender(sender_id, message_id, collateral)
-            for n in neighbors:
-                await remove_message_with_tombstones(
-                    context,
-                    repo,
-                    cfg,
-                    int(n["id"]),
-                    sender_id,
-                    "collateral removal",
-                )
-
-    return handler
-
-
-async def _notify_delete_vote_participants(
-    context: ContextTypes.DEFAULT_TYPE,
-    repo: Any,
-    message_id: int,
-) -> None:
-    for voter_id in await repo.list_remove_voters(message_id):
-        reply_to = await repo.delivery_or_tombstone_message_for_recipient(message_id, voter_id)
+            await context.bot.send_message(target.telegram_id, f"You received {amount:.2f} credits.", reply_to_message_id=await reply_to_for_target(update, context, target.telegram_id))
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "credit.notify_target", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=target.telegram_id)
+            pass
+    else:
+        applied, target = repo.apply_credit_change(target.telegram_id, amount, "admin_adjustment", daily_caps=None)
+        maybe_apply_negative_cooldown(repo, config, target)
+        await command_reply(update, context, f"Adjusted {display_identity_html(target, config, viewer=user)} by {applied:.2f}. Balance: {target.credits:.2f}", parse_mode="HTML")
         try:
-            await context.bot.send_message(
-                chat_id=voter_id,
-                text=Msg.DELETEVOTE_DELETED_NOTIFY,
-                reply_to_message_id=reply_to,
-            )
-        except Exception:
+            await context.bot.send_message(target.telegram_id, f"Admin credit adjustment: {applied:.2f}. Balance: {target.credits:.2f}", reply_to_message_id=await reply_to_for_target(update, context, target.telegram_id))
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "credit.admin_notify_target", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=target.telegram_id)
             pass
 
 
-def _sauce(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None or not update.message.reply_to_message:
-            if update.message:
-                await update.message.reply_text(Msg.SAUCE_USAGE)
-            return
-        sauce_cfg = cfg.get("saucenao", {})
-        api_key = str(sauce_cfg.get("api_key") or "").strip()
-        if api_key.startswith("${"):
-            api_key = ""
-        if not bool(sauce_cfg.get("enabled", True)) or not api_key:
-            await update.message.reply_text(Msg.SAUCE_DISABLED)
-            return
-        user = await repo.get_user(update.effective_user.id)
-        if user is None:
-            return
-        fraction = float(sauce_cfg.get("top_credit_percentile", -1))
-        if fraction > 1:
-            fraction = fraction / 100.0
-        if fraction >= 0:
-            required = await repo.credit_cutoff_for_top_fraction(fraction)
-            if user.credits < required:
-                await update.message.reply_text(Msg.sauce_credit_required(required, user.credits))
-                return
-        per_user_limit = int(sauce_cfg.get("per_user_daily_limit", 3))
-        if per_user_limit >= 0 and await repo.sauce_usage_count(user.telegram_id) >= per_user_limit:
-            await update.message.reply_text(Msg.SAUCE_LIMITED)
-            return
-        global_limit = int(sauce_cfg.get("global_daily_limit", 95))
-        if global_limit >= 0 and await repo.sauce_total_usage_count() >= global_limit:
-            await update.message.reply_text(Msg.SAUCE_LIMITED)
-            return
-
-        lookup = await repo.sender_by_delivery(user.telegram_id, update.message.reply_to_message.message_id)
-        target = None
-        if lookup is not None:
-            target = await repo.get_message(lookup[0])
-        else:
-            target = await repo.message_by_source(user.telegram_id, update.message.reply_to_message.message_id)
-        if target is None:
-            await update.message.reply_text(Msg.MESSAGE_NOT_IN_CACHE)
-            return
-        message_id = int(target["id"])
-        delivery = await repo.delivery_for_recipient(message_id, user.telegram_id)
-        if delivery is not None and bool(delivery.get("is_blurred")):
-            await update.message.reply_text(Msg.SAUCE_BLURRED, reply_to_message_id=update.message.reply_to_message.message_id)
-            return
-        cached = await repo.get_sauce_cache(message_id)
-        if cached is not None:
-            await update.message.reply_text(_format_sauce_cache(cached, cached=True), reply_to_message_id=update.message.reply_to_message.message_id)
-            return
-
-        media_kind = str(target.get("media_kind") or "")
-        if media_kind in {"video", "animation", "video_note", "sticker"}:
-            file_id = target.get("thumbnail_file_id") or target.get("media_file_id")
-        else:
-            file_id = target.get("media_file_id") or target.get("thumbnail_file_id")
-        if not file_id:
-            await update.message.reply_text(Msg.SAUCE_NO_MEDIA)
-            return
-        try:
-            tg_file = await context.bot.get_file(str(file_id))
-            file_url = str(tg_file.file_path)
-            result = await _fetch_sauce(api_key, file_url, int(sauce_cfg.get("num_results", 6)))
-        except Exception:
-            logger.exception("SauceNAO lookup failed message_id=%s user_id=%s", message_id, user.telegram_id)
-            await update.message.reply_text(Msg.SAUCE_LOOKUP_FAILED)
-            return
-        await repo.add_sauce_usage(user.telegram_id)
-        if result is None:
-            await update.message.reply_text(Msg.SAUCE_NO_RESULTS, reply_to_message_id=update.message.reply_to_message.message_id)
-            return
-        await repo.set_sauce_cache(message_id, result)
-        await update.message.reply_text(_format_sauce_cache(result, cached=False), reply_to_message_id=update.message.reply_to_message.message_id)
-
-    return handler
-
-
-async def _fetch_sauce(api_key: str, file_url: str, num_results: int) -> dict[str, Any] | None:
-    from saucenao_api import AIOSauceNao  # type: ignore[import-not-found]
-
-    async with AIOSauceNao(api_key, numres=num_results) as sauce:
-        results = await sauce.from_url(file_url)
-    if not results:
+def _parse_amount(value: str) -> float | None:
+    try:
+        return float(value)
+    except Exception:
         return None
-    best = results[0]
-    return {
-        "title": str(getattr(best, "title", "") or ""),
-        "similarity": float(getattr(best, "similarity", 0.0) or 0.0),
-        "author": str(getattr(best, "author", "") or ""),
-        "urls": [str(x) for x in (getattr(best, "urls", None) or [])],
-        "thumbnail": str(getattr(best, "thumbnail", "") or ""),
-        "short_remaining": getattr(results, "short_remaining", None),
-        "long_remaining": getattr(results, "long_remaining", None),
-    }
 
 
-def _format_sauce_cache(result: dict[str, Any], cached: bool) -> str:
-    return Msg.sauce_result(
-        title=str(result.get("title") or ""),
-        similarity=float(result.get("similarity") or 0.0),
-        author=str(result.get("author") or "") or None,
-        urls=[str(x) for x in (result.get("urls") or [])],
-        cached=cached,
-        short_remaining=result.get("short_remaining"),
-        long_remaining=result.get("long_remaining"),
+async def creditstats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    repo = get_repo(context)
+    config = get_config(context)
+    values = repo.credit_values(started_only=True)
+    mn, med, mx = mean_median(values)
+    lines = ["<b>Credit Stats</b>", "", "<b>Leaderboards</b>", "Current balance:"]
+    for i, top in enumerate(repo.top_current_credits(10), 1):
+        lines.append(f"{i}. {display_identity_html(top, config, viewer=user)}: {top.credits:.2f}")
+    daily = repo.top_daily_earners(10)
+    lines.append("")
+    lines.append("Today's earners:")
+    lines.extend(
+        [f"{i}. {display_identity_html(top, config, viewer=user)}: +{earned:.2f}" for i, (top, earned) in enumerate(daily, 1)]
+        or ["No earnings recorded today."]
     )
+    caller = user.credits if user else 0
+    tr = tax_rate(config, caller)
+    lr = loss_rate(config, caller)
+    caps = daily_caps(config)
+    downvote_schedule = config.get("credits.downvote_cost_schedule", []) or []
+    loss_schedule = config.get("loss_rate.schedule", []) or []
+    lines.extend([
+        "",
+        "<b>Economy</b>",
+        f"Daily net issuance: {repo.net_issuance_since_days(1):.2f}",
+        f"Weekly net issuance: {repo.net_issuance_since_days(7):.2f}",
+        f"Started-user balances: min {mn:.2f}, median {med:.2f}, max {mx:.2f}",
+        "",
+        "<b>Your Account</b>",
+        f"Balance: {caller:.2f}",
+        f"Daily tax rate: {tr * 100:.2f}%",
+        f"Loss rate: {lr * 100:.2f}%",
+        f"Expected balance after one tax day: {caller - caller * tr:.2f}",
+        "",
+        "<b>Rewards</b>",
+        f"Text message: +{float(config.get('credits.text_message_reward', 0) or 0):.2f}",
+        f"Media message: +{float(config.get('credits.media_message_reward', 0) or 0):.2f}",
+        f"Upvote received: +{float(config.get('credits.upvote_reward', 0) or 0):.2f}",
+        f"Invite redeemed: +{float(config.get('credits.invite_reward', 0) or 0):.2f}",
+        "",
+        "<b>Costs and Penalties</b>",
+        f"Starting balance: {float(config.get('credits.starting_balance', 0) or 0):.2f}",
+        f"Upvote sent: -{float(config.get('credits.upvote_cost', 0) or 0):.2f}",
+        f"Downvote penalty to sender: -{float(config.get('credits.downvote_penalty', 0) or 0):.2f}",
+        f"Unsend: -{float(config.get('credits.unsend_cost', 0) or 0):.2f}",
+        f"Edit: -{float(config.get('credits.edit_cost', 0) or 0):.2f}",
+        f"Whisper: -{float(config.get('credits.whisper_cost', 0) or 0):.2f}",
+        f"Fight fee: {float(config.get('fights.initiation_fee_percent', 0) or 0) * 100:.2f}% of stake, min {float(config.get('fights.initiation_fee_min', 0) or 0):.2f}, max {float(config.get('fights.initiation_fee_max', 0) or 0):.2f}",
+        f"Fight win tax: {float(config.get('fights.win_tax_percent', 0) or 0) * 100:.2f}%",
+        "",
+        "<b>Daily Earning Caps</b>",
+    ])
+    lines.extend([f"{_credit_reason_label(reason)}: {'unlimited' if cap < 0 else f'{cap:.2f}'}" for reason, cap in sorted(caps.items())] or ["No caps configured."])
+    lines.append("")
+    lines.append("<b>Downvote Cost Schedule</b>")
+    lines.extend([f"After {item.get('minute')} minute(s): {float(item.get('cost', 0)):.2f}" for item in downvote_schedule] or ["No schedule configured."])
+    lines.append("")
+    lines.append("<b>Loss Rate Schedule</b>")
+    lines.extend([f"At {float(item.get('credits', 0)):.2f} credits: {float(item.get('loss_rate', 0)) * 100:.2f}%" for item in loss_schedule] or ["No schedule configured."])
+    await update.effective_message.reply_html("\n".join(lines))
 
 
-def _w(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            return
-        sender = await repo.get_user(update.effective_user.id)
-        if sender is None:
-            return
-        sender_is_privileged = bool(sender.is_moderator or sender.is_admin)
-        unlock = float(cfg["credits"]["whisper_unlock_credits"])
-        if not sender_is_privileged and sender.credits < unlock:
-            await update.message.reply_text(Msg.whisper_unlock_required(unlock))
-            return
-        target_id = None
-        text = None
-        reply_is_whisper = False
-        replied_message_id = None
-        replied_whisper_id = None
-        if update.message.reply_to_message and context.args:
-            resolved = await resolve_reply_target(
-                repo,
-                update.effective_user.id,
-                update.message.reply_to_message.message_id,
-            )
-            if resolved.user is None:
-                await update.message.reply_text(resolved.error or Msg.MESSAGE_NOT_IN_CACHE)
-                return
-            target_id = resolved.user.telegram_id
-            if resolved.source_message_id is not None and resolved.source_message_id < 0:
-                replied_whisper_id = -resolved.source_message_id
-                reply_is_whisper = True
-            else:
-                replied_message_id = resolved.source_message_id
-            text = " ".join(context.args).strip()
-        elif len(context.args) >= 2:
-            resolved = await resolve_user_reference(repo, cfg, sender, context.args)
-            if resolved.user is None:
-                await update.message.reply_text(resolved.error or Msg.WHISPER_USAGE)
-                return
-            target_id = resolved.user.telegram_id
-            text = " ".join(context.args[resolved.consumed:]).strip()
-        if target_id is None or not text:
-            await update.message.reply_text(Msg.WHISPER_USAGE)
-            return
-        if target_id == sender.telegram_id:
-            await update.message.reply_text(Msg.WHISPER_CANNOT_SELF)
-            return
-        identity_mode = "default"
-        if text.startswith("/s "):
-            identity_mode = "sign"
-            text = text[3:].strip()
-        elif text.startswith("/t "):
-            identity_mode = "tripcode"
-            text = text[3:].strip()
-            if not sender.tripcode_name or not sender.tripcode_hash:
-                await update.message.reply_text(Msg.TRIPCODE_SET_FIRST)
-                return
-        text = _apply_identity_text(sender, text, mode=identity_mode)
-        text_is_html = True
-        cost = 0.0 if sender_is_privileged else float(cfg["credits"]["whisper_cost"])
-        if cost > 0 and sender.credits < cost:
-            await update.message.reply_text(Msg.WHISPER_INSUFFICIENT_CREDITS)
-            return
-        balance = float(sender.credits)
-        if cost > 0:
-            balance = await repo.adjust_credits(sender.telegram_id, -cost, "whisper_cost")
-        await repo.touch_activity(sender.telegram_id)
-        whisper_id = await repo.create_whisper(sender.telegram_id, target_id, text, False)
-        if update.message is not None:
-            await repo.add_whisper_delivery(whisper_id, sender.telegram_id, update.message.message_id)
-        try:
-            reply_to = None
-            if replied_whisper_id is not None:
-                reply_to = await repo.whisper_delivery_message_id(replied_whisper_id, target_id)
-            elif replied_message_id is not None:
-                reply_to = await repo.delivery_or_tombstone_message_for_recipient(replied_message_id, target_id)
-            sent = await context.bot.send_message(
-                chat_id=target_id,
-                text=_whisper_html(text, text_is_html=text_is_html),
-                parse_mode="HTML",
-                reply_to_message_id=reply_to,
-            )
-            await repo.add_whisper_delivery(whisper_id, target_id, sent.message_id)
-        except Exception:
-            await update.message.reply_text(Msg.WHISPER_UNAVAILABLE)
-            return
-        mods = await repo.list_mod_and_admin_users()
-        for m in mods:
-            if m.telegram_id in {sender.telegram_id, target_id}:
-                continue
-            try:
-                mod_reply_to = None
-                if replied_whisper_id is not None:
-                    mod_reply_to = await repo.whisper_delivery_message_id(replied_whisper_id, m.telegram_id)
-                elif replied_message_id is not None:
-                    mod_reply_to = await repo.delivery_or_tombstone_message_for_recipient(replied_message_id, m.telegram_id)
-                sent = await context.bot.send_message(
-                    chat_id=m.telegram_id,
-                    text=_whisper_html(text, text_is_html=text_is_html),
-                    parse_mode="HTML",
-                    reply_to_message_id=mod_reply_to,
-                )
-                await repo.add_whisper_delivery(whisper_id, m.telegram_id, sent.message_id)
-            except Exception:
-                pass
-        await update.message.reply_text(Msg.whisper_sent(cost, balance))
-
-    return handler
+def _credit_reason_label(reason: str) -> str:
+    labels = {
+        "text_message_reward": "Text messages",
+        "media_message_reward": "Media messages",
+        "upvote_reward": "Upvotes received",
+        "invite_reward": "Invite rewards",
+        "gamble_win": "Gamble winnings",
+        "fight_win": "Fight winnings",
+        "admin_adjustment": "Admin adjustments",
+        "daily_tax": "Daily tax",
+        "upvote_cost": "Upvotes sent",
+        "downvote_cost": "Downvotes sent",
+        "downvote_penalty": "Downvotes received",
+        "whisper_cost": "Whispers",
+        "edit_cost": "Edits",
+        "unsend_cost": "Unsend",
+        "fight_fee": "Fight fees",
+        "fight_loss": "Fight losses",
+        "gamble_loss": "Gamble losses",
+    }
+    return labels.get(reason, reason.replace("_", " ").strip().capitalize())
 
 
-def _whisper_mod(repo: Any):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None or not context.args:
-            if update.message:
-                await update.message.reply_text(Msg.WHISPERMOD_USAGE)
-            return
-        sender = await repo.get_user(update.effective_user.id)
-        if sender is None:
-            return
-        text = " ".join(context.args).strip()
-        await repo.touch_activity(sender.telegram_id)
-        mods = await repo.list_mod_and_admin_users()
-        for m in mods:
-            if m.telegram_id == sender.telegram_id:
-                continue
-            try:
-                sent = await context.bot.send_message(chat_id=m.telegram_id, text=_whisper_html(text, "Modwhisper"), parse_mode="HTML")
-                wid = await repo.create_whisper(sender.telegram_id, m.telegram_id, text, True)
-                if update.message is not None:
-                    await repo.add_whisper_delivery(wid, sender.telegram_id, update.message.message_id)
-                await repo.add_whisper_delivery(wid, m.telegram_id, sent.message_id)
-            except Exception:
-                pass
-        await update.message.reply_text(Msg.WHISPERMOD_SENT)
-
-    return handler
+async def gamble(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    if not user or not context.args:
+        await update.effective_message.reply_text("Use /gamble <amount>")
+        return
+    amount = _parse_amount(context.args[0])
+    max_amount = float(get_config(context).get("gamble.max_amount", 1000) or 1000)
+    if amount is None or amount < 0.01 or amount > user.credits or amount > max_amount:
+        await update.effective_message.reply_text("Invalid gamble amount.")
+        return
+    repo = get_repo(context)
+    config = get_config(context)
+    if random.random() < 0.5:
+        applied, updated = apply_credit(repo, config, user.telegram_id, amount, "gamble_win")
+        result = f"Won {applied:.2f}"
+    else:
+        applied, updated = apply_credit(repo, config, user.telegram_id, -amount, "gamble_loss", cap_positive=False)
+        result = f"Lost {abs(applied):.2f}"
+    repo.touch_activity(user.telegram_id)
+    await update.effective_message.reply_text(f"{result}. Balance: {updated.credits:.2f}")
 
 
-def _fight(repo: Any, cfg: dict[str, Any]):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if update.message is None or update.effective_user is None:
-            if update.message:
-                await update.message.reply_text(Msg.FIGHT_USAGE)
+async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    if not user:
+        return
+    repo = get_repo(context)
+    config = get_config(context)
+    code = repo.get_invite_for_user(user.telegram_id)
+    if not code:
+        prefix = str(config.get("invites.start_prefix", "inv_"))
+        while True:
+            code = prefix + random_token(10)
+            if not repo.get_invite(code):
+                break
+        repo.create_invite(user.telegram_id, code)
+    repo.touch_activity(user.telegram_id)
+    try:
+        me = await context.bot.get_me()
+        text = f"https://t.me/{me.username}?start={code}" if me.username else code
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "invite.get_me", exc, aggregate=context.application.bot_data.get("aggregate_logger"), user_id=user.telegram_id)
+        text = code
+    await update.effective_message.reply_text(text)
+
+
+async def sendinvite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = args_text(context)
+    if not re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/", text, re.I):
+        await update.effective_message.reply_text("Use /sendinvite <Telegram invite link> <description>")
+        return
+    without_links = re.sub(r"https?://\S+|(?:t\.me|telegram\.me)/\S+", "", text, flags=re.I)
+    if len(re.sub(r"\W+", "", without_links)) < 3:
+        await update.effective_message.reply_text("Add a meaningful description to the invite link.")
+        return
+    from forward_bot.handlers.message_handlers import submit_text
+    await submit_text(update, context, text, force_remove_buttons=True)
+
+
+async def unsend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    msg, _, error = await resolve_message_from_reply(update, context)
+    if not user or not msg:
+        await command_reply(update, context, error or "No message.")
+        return
+    if msg.sender_id != user.telegram_id:
+        await command_reply(update, context, "You can only unsend your own messages.")
+        return
+    cost = float(get_config(context).get("credits.unsend_cost", 5) or 5)
+    if user.credits < cost and not user.is_admin:
+        await command_reply(update, context, "Insufficient credits.")
+        return
+    repo = get_repo(context)
+    if not user.is_admin:
+        apply_credit(repo, get_config(context), user.telegram_id, -cost, "unsend_cost", cap_positive=False)
+    count = await remove_message(context.bot, repo, get_store(context), get_config(context), msg.id, reason="unsent by sender", notify_sender=False, remove_for_mods=True)
+    updated = repo.get_user(user.telegram_id)
+    await command_reply(update, context, f"Unsent. Removed {count} copies. Cost: {cost:.2f}. Balance: {updated.credits:.2f}.")
+
+
+async def deletevote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    msg, _, error = await resolve_message_from_reply(update, context)
+    if not user or not msg:
+        await command_reply(update, context, error or "No message.")
+        return
+    ok, text = await vote_to_remove(context.bot, get_repo(context), get_store(context), get_config(context), msg.id, user)
+    await command_reply(update, context, text)
+
+
+async def whisper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    if not user:
+        return
+    raw = args_text(context)
+    repo = get_repo(context)
+    config = get_config(context)
+    store = get_store(context)
+    target = None
+    text = raw
+    reply_to_message_id = None
+    reply_to_whisper_id = None
+    if update.effective_message.reply_to_message:
+        target_id, error = await resolve_replied_sender(update, context)
+        target = repo.get_user(target_id) if target_id else None
+        text = raw
+        normal_msg, _, _ = await resolve_message_from_reply(update, context)
+        if normal_msg:
+            reply_to_message_id = normal_msg.id
+        wdel = store.resolve_whisper_delivery(user.telegram_id, update.effective_message.reply_to_message.message_id)
+        if wdel:
+            reply_to_whisper_id = wdel.whisper_id
+    elif len(context.args or []) >= 2:
+        target = resolve_user_reference(repo, config, context.args[0], user)
+        text = " ".join(context.args[1:])
+    if not target or not text:
+        await command_reply(update, context, "Use /w in reply <text>, or /w <user> <text>.")
+        return
+    await _send_whisper(update, context, user, target, text, reply_to_message_id=reply_to_message_id, reply_to_whisper_id=reply_to_whisper_id)
+
+
+async def _send_whisper(update: Update, context: ContextTypes.DEFAULT_TYPE, user, target, text: str, *, reply_to_message_id=None, reply_to_whisper_id=None, modwhisper=False) -> None:
+    repo = get_repo(context)
+    config = get_config(context)
+    store = get_store(context)
+    if target.telegram_id == user.telegram_id:
+        await command_reply(update, context, "You cannot whisper yourself.")
+        return
+    cost = 0.0 if user.is_mod_or_admin or modwhisper else float(config.get("credits.whisper_cost", 1) or 1)
+    unlock = float(config.get("credits.whisper_unlock_credits", 30) or 30)
+    if not user.is_mod_or_admin and not modwhisper and user.credits < unlock:
+        await command_reply(update, context, "You need more credits to unlock whispers.")
+        return
+    if user.credits < cost:
+        await command_reply(update, context, "Insufficient credits.")
+        return
+    identity_mode = None
+    if text.startswith("/s "):
+        identity_mode, text = "signed", text[3:]
+    elif text.startswith("/t "):
+        identity_mode, text = "tripcode", text[3:]
+    elif user.sign_enabled:
+        identity_mode = "signed"
+    elif user.tripcode_enabled:
+        identity_mode = "tripcode"
+    prefix = "Modwhisper" if modwhisper else "Whisper"
+    suffix_html = ""
+    if identity_mode == "signed":
+        suffix = f"~ @{user.username}" if user.username else "~ signed"
+        suffix_html = f"<i>{html_escape(suffix)}</i>"
+    elif identity_mode == "tripcode":
+        if not user.tripcode_name or not user.tripcode_hash:
+            await command_reply(update, context, "Set a tripcode first with /settripcode name#secret.")
             return
-        if not bool(cfg.get("fights", {}).get("enabled", True)):
-            await update.message.reply_text(Msg.FIGHTS_DISABLED)
-            return
-        sender = await repo.get_user(update.effective_user.id)
-        if sender is None:
-            return
-        target = None
-        amount_arg_idx = 0
-        if update.message.reply_to_message:
-            resolved = await resolve_reply_target(
-                repo,
-                sender.telegram_id,
-                update.message.reply_to_message.message_id,
-            )
-            if resolved.user is None:
-                await update.message.reply_text(resolved.error or Msg.MESSAGE_NOT_IN_CACHE)
-                return
-            target = resolved.user
-        elif context.args:
-            resolved = await resolve_user_reference(repo, cfg, sender, context.args)
-            if resolved.user is None:
-                await update.message.reply_text(resolved.error or Msg.FIGHT_UNAVAILABLE)
-                return
-            target = resolved.user
-            amount_arg_idx = resolved.consumed
+        suffix_html = f"<b>{html_escape(user.tripcode_name)}</b> !{html_escape(user.tripcode_hash)}"
+    if identity_mode == "tripcode":
+        body = f"<i><b>{prefix}:</b></i> {suffix_html}:\n{html_escape(text)}"
+    elif suffix_html:
+        body = f"<i><b>{prefix}:</b></i> {html_escape(text)}\n\n{suffix_html}"
+    else:
+        body = f"<i><b>{prefix}:</b></i> {html_escape(text)}"
+    reply_to = None
+    if reply_to_message_id:
+        prior_msg = store.get_message(reply_to_message_id)
+        if prior_msg and prior_msg.sender_id == target.telegram_id and prior_msg.source_chat_id == target.telegram_id:
+            reply_to = prior_msg.source_message_id
         else:
-            await update.message.reply_text(Msg.FIGHT_USAGE)
-            return
-        if target is None:
-            await update.message.reply_text(Msg.FIGHT_UNAVAILABLE)
-            return
-        if not target.fights_enabled:
-            await update.message.reply_text(Msg.FIGHT_UNAVAILABLE)
-            return
-        if target.telegram_id == sender.telegram_id:
-            await update.message.reply_text(Msg.FIGHT_SELF)
-            return
-
-        max_stake = float(cfg["fights"]["max_stake_cap"])
-        if len(context.args) > amount_arg_idx:
+            prior = store.delivery_for_recipient(reply_to_message_id, target.telegram_id)
+            reply_to = prior.telegram_message_id if prior else None
+    elif reply_to_whisper_id:
+        priorw = next((d for d in store.deliveries_for_whisper(reply_to_whisper_id) if d.recipient_id == target.telegram_id), None)
+        reply_to = priorw.telegram_message_id if priorw else None
+    if (reply_to_message_id or reply_to_whisper_id) and not reply_to:
+        await command_reply(update, context, "Reply target is not available for the recipient.")
+        return
+    try:
+        sent = await context.bot.send_message(target.telegram_id, body, parse_mode="HTML", reply_to_message_id=reply_to)
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "whisper.send_target", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=target.telegram_id)
+        await command_reply(update, context, "Recipient unavailable.")
+        return
+    whisper_obj = store.add_whisper(sender_id=user.telegram_id, target_id=target.telegram_id, text=body, is_modwhisper=modwhisper, reply_to_message_id=reply_to_message_id, reply_to_whisper_id=reply_to_whisper_id)
+    if update.effective_message:
+        store.add_whisper_delivery(whisper_obj.id, user.telegram_id, update.effective_message.message_id)
+    store.add_whisper_delivery(whisper_obj.id, target.telegram_id, sent.message_id)
+    for mod in repo.list_users():
+        if mod.is_mod_or_admin and mod.has_started and mod.telegram_id not in {user.telegram_id, target.telegram_id}:
             try:
-                stake = round_credit(float(context.args[amount_arg_idx]))
-            except ValueError:
-                await update.message.reply_text(Msg.FIGHT_INVALID_STAKE)
-                return
-            if stake < 0.01 or stake > max_stake:
-                await update.message.reply_text(Msg.FIGHT_INITIATE_FAILED)
-                return
-        else:
-            stake = round_credit(
-                min(max_stake, max(1.0, math.sqrt(max(0.0, sender.credits)))))
-        if sender.credits < stake:
-            await update.message.reply_text(Msg.FIGHT_INITIATE_FAILED)
-            return
+                mirror_reply_to = _whisper_mirror_reply_to(store, mod.telegram_id, reply_to_message_id, reply_to_whisper_id)
+                mirror = await context.bot.send_message(mod.telegram_id, body, parse_mode="HTML", reply_to_message_id=mirror_reply_to)
+                store.add_whisper_delivery(whisper_obj.id, mod.telegram_id, mirror.message_id)
+            except TelegramError as exc:
+                log_telegram_error(LOGGER, "whisper.send_mirror", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=mod.telegram_id)
+                pass
+    if cost:
+        _, user = apply_credit(repo, config, user.telegram_id, -cost, "whisper_cost", cap_positive=False)
+    repo.touch_activity(user.telegram_id)
+    await command_reply(update, context, f"Whisper sent. Cost: {cost:.2f}. Balance: {user.credits:.2f}")
 
-        # Initiation cooldown (sender-side only).
-        latest = await repo.latest_fight_by_initiator(sender.telegram_id)
-        if latest is not None:
+
+def _whisper_mirror_reply_to(store, recipient_id: int, reply_to_message_id: int | None, reply_to_whisper_id: int | None) -> int | None:
+    if reply_to_message_id:
+        prior_msg = store.get_message(reply_to_message_id)
+        if prior_msg and prior_msg.sender_id == recipient_id and prior_msg.source_chat_id == recipient_id:
+            return prior_msg.source_message_id
+        delivery = store.delivery_for_recipient(reply_to_message_id, recipient_id)
+        return delivery.telegram_message_id if delivery else None
+    if reply_to_whisper_id:
+        delivery = next((d for d in store.deliveries_for_whisper(reply_to_whisper_id) if d.recipient_id == recipient_id), None)
+        return delivery.telegram_message_id if delivery else None
+    return None
+
+
+async def wmods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    text = args_text(context)
+    if not user or not text:
+        await update.effective_message.reply_text("Use /wmods <text>")
+        return
+    repo = get_repo(context)
+    store = get_store(context)
+    body = f"<i><b>Modwhisper:</b></i> {html_escape(text)}\n\n~ mods"
+    for target in repo.list_users():
+        if target.is_mod_or_admin and target.has_started and target.telegram_id != user.telegram_id:
             try:
-                last_dt = as_utc(str(latest["created_at"]))
-            except ValueError:
-                last_dt = datetime.now(timezone.utc) - timedelta(days=1)
-            cooldown_seconds = int(cfg["fights"]["cooldown_seconds"])
-            if (datetime.now(timezone.utc) - last_dt).total_seconds() < cooldown_seconds:
-                await update.message.reply_text(Msg.FIGHT_INITIATE_FAILED)
-                return
-        fee_pct = float(cfg["fights"]["initiation_fee_percent"])
-        fee_min = float(cfg["fights"]["initiation_fee_min"])
-        fee_max = float(cfg["fights"]["initiation_fee_max"])
-        fee = round_credit(max(fee_min, min(fee_max, stake * fee_pct)))
-        if sender.credits < stake + fee:
-            await update.message.reply_text(Msg.FIGHT_INITIATE_FAILED)
+                msg = await context.bot.send_message(target.telegram_id, body, parse_mode="HTML")
+                whisper_obj = store.add_whisper(sender_id=user.telegram_id, target_id=target.telegram_id, text=body, is_modwhisper=True)
+                store.add_whisper_delivery(whisper_obj.id, target.telegram_id, msg.message_id)
+            except TelegramError as exc:
+                log_telegram_error(LOGGER, "wmods.send", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=target.telegram_id)
+                pass
+    repo.touch_activity(user.telegram_id)
+    await update.effective_message.reply_text("Message sent.")
+
+
+async def sauce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    config = get_config(context)
+    store = get_store(context)
+    if not config.get("saucenao.enabled", False) or not config.get("saucenao.api_key") or str(config.get("saucenao.api_key")).startswith("${"):
+        await command_reply(update, context, "SauceNAO is not configured.")
+        return
+    msg, delivery, error = await resolve_message_from_reply(update, context)
+    if not user or not msg:
+        await command_reply(update, context, error or "No message.")
+        return
+    if delivery and delivery.blurred:
+        await command_reply(update, context, "Cannot search blurred media.")
+        return
+    cached = store.get_sauce_cache(msg.id)
+    if cached:
+        await command_reply(update, context, cached + "\n(cached)\n" + _sauce_remaining_text(store, config, user.telegram_id))
+        return
+    user_used, global_used = store.get_sauce_usage(user.telegram_id)
+    per_user = int(config.get("saucenao.per_user_daily_limit", -1) or -1)
+    global_limit = int(config.get("saucenao.global_daily_limit", -1) or -1)
+    if per_user >= 0 and user_used >= per_user:
+        await command_reply(update, context, "Daily SauceNAO user limit reached.")
+        return
+    if global_limit >= 0 and global_used >= global_limit:
+        await command_reply(update, context, "Daily SauceNAO global limit reached.")
+        return
+    gate = float(config.get("saucenao.top_credit_percentile", 0) or 0)
+    if gate > 0:
+        cutoff = get_repo(context).credit_percentile_cutoff(gate)
+        if user.credits < cutoff:
+            await command_reply(update, context, "You need enough credits to use /sauce.")
             return
-        balance = await repo.adjust_credits(sender.telegram_id, -fee, "fight_initiation_fee")
-        await repo.touch_activity(sender.telegram_id)
-        expires = datetime.now(
-            timezone.utc) + timedelta(seconds=int(cfg["fights"]["request_timeout_seconds"]))
-        fight_id = await repo.create_fight_request(
-            sender.telegram_id,
-            target.telegram_id,
-            stake,
-            fee,
-            expires.isoformat(),
-            update.message.message_id,
-        )
+    file_id = msg.thumbnail_file_id if msg.content_type in {"video", "animation", "video_note", "sticker"} else msg.media_file_id
+    file_id = file_id or msg.media_file_id or msg.thumbnail_file_id
+    if not file_id:
+        await command_reply(update, context, "No searchable media.")
+        return
+    user_used, global_used = store.record_sauce_usage(user.telegram_id)
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        url = tg_file.file_path
+        import aiohttp
+        params = {"api_key": config.get("saucenao.api_key"), "url": url, "numres": int(config.get("saucenao.num_results", 6) or 6), "output_type": 2}
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://saucenao.com/search.php", params=params, timeout=20) as resp:
+                data = await resp.json()
+        result = _format_sauce(data)
+    except Exception:
+        await command_reply(update, context, "Lookup failed.")
+        return
+    store.add_sauce_cache(msg.id, result)
+    await command_reply(update, context, result + "\n" + _sauce_remaining_text(store, config, user.telegram_id, user_used=user_used, global_used=global_used))
 
-        # Relative descriptor only.
-        def tier(c: float) -> int:
-            return int(math.log2(max(1.0, c)))
 
-        diff = tier(sender.credits) - tier(target.credits)
-        rel = "even"
-        if diff >= 2:
-            rel = "advantage"
-        elif diff == 1:
-            rel = "slight advantage"
-        elif diff == -1:
-            rel = "slight disadvantage"
-        elif diff <= -2:
-            rel = "disadvantage"
+def _format_sauce(data) -> str:
+    results = data.get("results") or []
+    if not results:
+        return "No results."
+    top = results[0]
+    header = top.get("header", {})
+    item = top.get("data", {})
+    urls = item.get("ext_urls") or []
+    if isinstance(urls, str):
+        urls = [urls]
+    lines = [
+        f"Title: {item.get('title') or item.get('material') or 'unknown'}",
+        f"Similarity: {header.get('similarity', '?')}%",
+    ]
+    if item.get("author_name") or item.get("member_name"):
+        lines.append(f"Author: {item.get('author_name') or item.get('member_name')}")
+    lines.extend(urls[:3])
+    return "\n".join(lines)
+
+
+def _sauce_remaining_text(store, config, user_id: int, *, user_used: int | None = None, global_used: int | None = None) -> str:
+    if user_used is None or global_used is None:
+        user_used, global_used = store.get_sauce_usage(user_id)
+    per_user = int(config.get("saucenao.per_user_daily_limit", -1) or -1)
+    global_limit = int(config.get("saucenao.global_daily_limit", -1) or -1)
+    user_remaining = "unlimited" if per_user < 0 else str(max(0, per_user - user_used))
+    global_remaining = "unlimited" if global_limit < 0 else str(max(0, global_limit - global_used))
+    return f"Remaining today: user {user_remaining}, global {global_remaining}."
+
+
+async def fight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    config = get_config(context)
+    repo = get_repo(context)
+    store = get_store(context)
+    if not user or not config.get("fights.enabled", True):
+        await command_reply(update, context, "Fights are disabled.")
+        return
+    cooldown_left = store.latest_fight_request_seconds_left(user.telegram_id, int(config.get("fights.cooldown_seconds", 300) or 300))
+    if cooldown_left > 0:
+        await command_reply(update, context, f"Fight cooldown: {human_seconds(cooldown_left)}.")
+        return
+    target, _, rest = await resolve_target_user(update, context, user)
+    amount_arg = rest.split()[0] if rest else None
+    if not target or target.telegram_id == user.telegram_id:
+        await command_reply(update, context, "Use /fight in reply or /fight <user> [amount].")
+        return
+    if not target.fights_enabled:
+        await command_reply(update, context, "Target does not accept fights.")
+        return
+    max_cap = float(config.get("fights.max_stake_cap", 500) or 500)
+    if amount_arg:
         try:
-            await context.bot.send_message(
-                chat_id=target.telegram_id,
-                text=Msg.fight_request(stake, rel),
-                reply_markup=InlineKeyboardMarkup(
-                    [[
-                        InlineKeyboardButton(
-                            "Accept", callback_data=f"facc:{fight_id}"),
-                        InlineKeyboardButton(
-                            "Decline", callback_data=f"fdec:{fight_id}"),
-                    ]]
-                ),
-            )
-        except Exception:
-            await update.message.reply_text(Msg.FIGHT_UNAVAILABLE)
+            stake = round_credits(float(amount_arg))
+        except (TypeError, ValueError):
+            await command_reply(update, context, "Use /fight in reply or /fight <user> [amount]. Amount must be numeric.")
             return
-        await update.message.reply_text(Msg.fight_request_sent(fee, balance))
-
-    return handler
+    else:
+        stake = round_credits(min(max_cap, max(1.0, math.sqrt(max(0.0, user.credits)))))
+    if stake < 0.01 or stake > max_cap or user.credits < stake:
+        await command_reply(update, context, "Invalid stake.")
+        return
+    fee = round_credits(min(float(config.get("fights.initiation_fee_max", 20) or 20), max(float(config.get("fights.initiation_fee_min", 1) or 1), stake * float(config.get("fights.initiation_fee_percent", 0.05) or 0.05))))
+    if user.credits < stake + fee:
+        await command_reply(update, context, "Insufficient credits for stake plus fee.")
+        return
+    tier_diff = math.floor(math.log2(max(1.0, user.credits))) - math.floor(math.log2(max(1.0, target.credits)))
+    matchup = "even"
+    if tier_diff >= 2: matchup = "advantage"
+    elif tier_diff == 1: matchup = "slight advantage"
+    elif tier_diff == -1: matchup = "slight disadvantage"
+    elif tier_diff <= -2: matchup = "disadvantage"
+    timeout = int(config.get("fights.request_timeout_seconds", 300) or 300)
+    from datetime import timedelta
+    from forward_bot.utils import now_utc
+    fight_req = store.add_fight(sender_id=user.telegram_id, target_id=target.telegram_id, stake=stake, fee=fee, matchup=matchup, command_message_id=update.effective_message.message_id, expires_at=now_utc() + timedelta(seconds=timeout))
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Accept", callback_data=f"facc:{fight_req.id}"),
+        InlineKeyboardButton("Decline", callback_data=f"fdec:{fight_req.id}"),
+    ]])
+    reply_to = await reply_to_for_target(update, context, target.telegram_id)
+    if update.effective_message.reply_to_message and not reply_to:
+        store.fights.pop(fight_req.id, None)
+        await command_reply(update, context, "Reply target is not available for the recipient.")
+        return
+    try:
+        sent = await context.bot.send_message(target.telegram_id, f"Fight request: stake {stake:.2f}, matchup {matchup}.", reply_to_message_id=reply_to, reply_markup=markup)
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "fight.send_request", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=target.telegram_id)
+        store.fights.pop(fight_req.id, None)
+        await command_reply(update, context, "Recipient unavailable.")
+        return
+    fight_req.target_message_id = sent.message_id
+    _, updated = apply_credit(repo, config, user.telegram_id, -fee, "fight_fee", cap_positive=False)
+    repo.touch_activity(user.telegram_id)
+    balance = updated.credits if updated else user.credits - fee
+    await command_reply(update, context, f"Fight sent. Fee: {fee:.2f}. Balance: {balance:.2f}.")

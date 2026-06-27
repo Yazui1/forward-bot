@@ -1,67 +1,81 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Any
+from datetime import timedelta
 
-from forward_bot.features.interpolation import linear_interpolate
-
-
-@dataclass(frozen=True)
-class InflationStats:
-    daily_percent: float
-    weekly_percent: float
+from forward_bot.config import Config
+from forward_bot.db.repository import Repository, User
+from forward_bot.features.interpolation import interpolate
+from forward_bot.utils import now_utc, parse_dt, round_credits
 
 
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def daily_caps(config: Config) -> dict[str, float]:
+    raw = config.section("credits.daily_earning_limits")
+    return {str(k): float(v) for k, v in raw.items()}
 
 
-def round_credit(value: float) -> float:
-    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+def tax_rate(config: Config, credits: float) -> float:
+    return interpolate(config.get("credits.tax_ramp", []), "credits", "daily_tax_percent", credits, 0.0)
 
 
-def interpolate_tax_rate(tax_ramp: list[dict[str, Any]], credits: float) -> float:
-    points = [(float(x["credits"]), float(x["daily_tax_percent"])) for x in tax_ramp]
-    return linear_interpolate(points, credits)
+def loss_rate(config: Config, credits: float) -> float:
+    return interpolate(config.get("loss_rate.schedule", []), "credits", "loss_rate", credits, 0.0)
 
 
-def interpolate_loss_rate(loss_schedule: list[dict[str, Any]], credits: float) -> float:
-    points = [(float(x["credits"]), float(x["loss_rate"])) for x in loss_schedule]
-    return linear_interpolate(points, credits)
+def apply_credit(
+    repo: Repository,
+    config: Config,
+    user_id: int,
+    amount: float,
+    reason: str,
+    *,
+    cap_positive: bool = True,
+) -> tuple[float, User | None]:
+    caps = daily_caps(config) if cap_positive else None
+    applied, user = repo.apply_credit_change(user_id, round_credits(amount), reason, daily_caps=caps)
+    maybe_apply_negative_cooldown(repo, config, user)
+    return applied, user
 
 
-def interpolate_downvote_cost(schedule: list[dict[str, Any]], minute_value: float, start_cost: float) -> float:
-    points = [(float(x["minute"]), float(x["cost"])) for x in schedule]
-    if not points:
-        return round_credit(start_cost)
-    return round_credit(linear_interpolate(points, max(1.0, minute_value)))
-
-
-async def apply_negative_credit_cooldown(repo: Any, cfg: dict[str, Any], user_id: int, balance: float, applied_by: int = 0) -> None:
-    if balance >= 0:
+def maybe_apply_negative_cooldown(repo: Repository, config: Config, user: User | None) -> None:
+    if not user or user.credits >= 0 or user.is_mod_or_admin:
         return
-    seconds = int(cfg["credits"].get("negative_credit_cooldown_seconds", 3600))
-    until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-    await repo.set_cooldown(user_id, until.isoformat(), "negative-credit", applied_by)
+    seconds = int(config.get("credits.negative_credit_cooldown_seconds", 0) or 0)
+    if seconds > 0:
+        repo.set_cooldown(user.telegram_id, seconds, "negative credits", None, stack=False)
 
 
-async def adjust_credits_with_daily_limit(repo: Any, cfg: dict[str, Any], user_id: int, amount: float, reason: str) -> tuple[float, float]:
-    amount = round_credit(amount)
-    if amount <= 0:
-        balance = await repo.adjust_credits(user_id, amount, reason)
-        return balance, amount
+def downvote_cost(config: Config, streak: int, last_downvote_at: str | None) -> tuple[float, int, int]:
+    schedule = config.get("credits.downvote_cost_schedule", []) or []
+    decayed = _decayed_streak(streak, last_downvote_at)
+    next_streak = decayed + 1
+    if not schedule:
+        return float(config.get("credits.downvote_start_cost", 1.0)), next_streak, 0
+    points = sorted((int(item.get("minute", 0)), float(item.get("cost", 0))) for item in schedule)
+    idx = min(next_streak - 1, len(points) - 1)
+    next_drop = 0
+    last = parse_dt(last_downvote_at)
+    if last and idx < len(points):
+        next_drop = max(0, int(((last + timedelta(minutes=points[idx][0])) - now_utc()).total_seconds()))
+    return points[idx][1], next_streak, next_drop
 
-    limits = cfg.get("credits", {}).get("daily_earning_limits", {})
-    limit = float(limits.get(reason, -1))
-    if limit >= 0:
-        earned_today = await repo.positive_credits_today(user_id, reason)
-        amount = round_credit(max(0.0, min(amount, limit - earned_today)))
 
-    if amount <= 0:
-        user = await repo.get_user(user_id)
-        return (user.credits if user else 0.0), 0.0
+def downvote_drop_seconds(config: Config, streak: int, last_downvote_at: str | None) -> int:
+    if streak <= 0:
+        return 0
+    schedule = config.get("credits.downvote_cost_schedule", []) or []
+    if not schedule:
+        return 0
+    points = sorted((int(item.get("minute", 0)), float(item.get("cost", 0))) for item in schedule)
+    idx = min(streak - 1, len(points) - 1)
+    last = parse_dt(last_downvote_at)
+    if not last:
+        return 0
+    return max(0, int(((last + timedelta(minutes=points[idx][0])) - now_utc()).total_seconds()))
 
-    balance = await repo.adjust_credits(user_id, amount, reason)
-    return balance, amount
+
+def _decayed_streak(streak: int, last_downvote_at: str | None) -> int:
+    last = parse_dt(last_downvote_at)
+    if not last:
+        return 0
+    minutes = max(0, int((now_utc() - last).total_seconds() // 60))
+    return max(0, streak - minutes)
