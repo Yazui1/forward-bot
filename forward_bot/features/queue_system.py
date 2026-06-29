@@ -12,7 +12,7 @@ from io import BytesIO
 from typing import Any
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.error import BadRequest, ChatMigrated, Forbidden, RetryAfter, TelegramError
+from telegram.error import BadRequest, ChatMigrated, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from forward_bot.cache.transient import TransientMessage, TransientStore
 from forward_bot.config import Config
@@ -59,19 +59,27 @@ class DeliveryQueue:
         self.repo = repo
         self.store = store
         self.media = media
-        self.rate_per_second = float(config.get("delivery.telegram_rate_limit_per_second", 25) or 25)
-        self.active_window = timedelta(hours=float(config.get("delivery.active_window_hours", 72) or 72))
+        self.rate_per_second = float(config.get(
+            "delivery.telegram_rate_limit_per_second", 25) or 25)
+        self.per_recipient_rate_per_second = float(config.get(
+            "delivery.per_recipient_rate_limit_per_second", 1) or 1)
+        self.active_window = timedelta(hours=float(
+            config.get("delivery.active_window_hours", 72) or 72))
         self.worker_count = int(config.get("delivery.worker_count", 1) or 1)
         self._bot: Bot | None = None
         self._aggregate_logger = aggregate_logger
         self._queue: list[tuple[float, int, DeliveryItem]] = []
         self._event = asyncio.Event()
         self._seq = itertools.count()
-        self._recipient_pending: dict[int, deque[DeliveryItem]] = defaultdict(deque)
+        self._recipient_pending: dict[int,
+                                      deque[DeliveryItem]] = defaultdict(deque)
         self._recipient_queued: set[int] = set()
         self._recipient_heap_item: dict[int, DeliveryItem] = {}
-        self._recipient_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._recipient_locks: dict[int,
+                                    asyncio.Lock] = defaultdict(asyncio.Lock)
         self._rate_lock = asyncio.Lock()
+        self._recipient_last_send: dict[int, float] = defaultdict(float)
+        self._recipient_pause_until: dict[int, float] = defaultdict(float)
         self._workers: list[asyncio.Task] = []
         self._stopping = False
         self._last_send = 0.0
@@ -81,13 +89,18 @@ class DeliveryQueue:
 
     def update_config(self, config: Config) -> None:
         self.config = config
-        self.rate_per_second = float(config.get("delivery.telegram_rate_limit_per_second", 25) or 25)
-        self.active_window = timedelta(hours=float(config.get("delivery.active_window_hours", 72) or 72))
+        self.rate_per_second = float(config.get(
+            "delivery.telegram_rate_limit_per_second", 25) or 25)
+        self.per_recipient_rate_per_second = float(config.get(
+            "delivery.per_recipient_rate_limit_per_second", 1) or 1)
+        self.active_window = timedelta(hours=float(
+            config.get("delivery.active_window_hours", 72) or 72))
 
     async def start(self, bot: Bot) -> None:
         self._bot = bot
         self._stopping = False
-        self._workers = [asyncio.create_task(self._worker(), name=f"delivery-{i}") for i in range(self.worker_count)]
+        self._workers = [asyncio.create_task(
+            self._worker(), name=f"delivery-{i}") for i in range(self.worker_count)]
 
     async def stop(self) -> None:
         self._stopping = True
@@ -106,7 +119,8 @@ class DeliveryQueue:
                 message_id=message.id,
                 sender_id=message.sender_id,
                 recipient_id=recipient.telegram_id,
-                priority=self._priority(recipient, urgent=message.urgent or message.is_system),
+                priority=self._priority(
+                    recipient, urgent=message.urgent or message.is_system),
                 content_type=message.content_type,
                 text=message.text,
                 media_file_id=message.media_file_id,
@@ -120,8 +134,10 @@ class DeliveryQueue:
                 parse_mode=message.parse_mode,
                 remove_buttons=message.remove_buttons,
                 media_hash=message.media_hash,
-                forward_from_chat_id=message.metadata.get("forward_from_chat_id"),
-                forward_from_message_id=message.metadata.get("forward_from_message_id"),
+                forward_from_chat_id=message.metadata.get(
+                    "forward_from_chat_id"),
+                forward_from_message_id=message.metadata.get(
+                    "forward_from_message_id"),
                 system_html=bool(message.metadata.get("system_html")),
             )
             if item.urgent and self._bot:
@@ -140,7 +156,8 @@ class DeliveryQueue:
                 touched = True
         if touched:
             self._queue = [
-                (urgent_priority if item.message_id == message_id and not item.started and not item.cancelled else priority, seq, item)
+                (urgent_priority if item.message_id ==
+                 message_id and not item.started and not item.cancelled else priority, seq, item)
                 for priority, seq, item in self._queue
             ]
             heapq.heapify(self._queue)
@@ -219,29 +236,39 @@ class DeliveryQueue:
             self._completed_counts.pop(item.message_id, None)
 
     async def _send_with_backoff(self, item: DeliveryItem) -> str:
-        for _ in range(3):
+        for attempt in range(3):
             try:
                 return await self._send(item)
             except RetryAfter as exc:
-                log_telegram_error(LOGGER, "delivery.retry_after", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id, retry_after=getattr(exc, "retry_after", None))
-                await asyncio.sleep(float(getattr(exc, "retry_after", 1) or 1))
+                retry_after = float(getattr(exc, "retry_after", 1) or 1)
+                log_telegram_error(LOGGER, "delivery.retry_after", exc, aggregate=self._aggregate_logger,
+                                   message_id=item.message_id, recipient_id=item.recipient_id, retry_after=retry_after)
+                await self._pause_recipient_for_retry_after(item.recipient_id, retry_after)
+            except (TimedOut, NetworkError) as exc:
+                log_telegram_error(LOGGER, "delivery.network_retry", exc, aggregate=self._aggregate_logger,
+                                   message_id=item.message_id, recipient_id=item.recipient_id, attempt=attempt + 1)
+                await asyncio.sleep(min(10.0, 1.5 * (attempt + 1)))
             except Forbidden as exc:
-                log_telegram_error(LOGGER, "delivery.forbidden", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id)
+                log_telegram_error(LOGGER, "delivery.forbidden", exc, aggregate=self._aggregate_logger,
+                                   message_id=item.message_id, recipient_id=item.recipient_id)
                 self.repo.mark_left(item.recipient_id)
                 return "forbidden_left"
             except ChatMigrated as exc:
-                log_telegram_error(LOGGER, "delivery.chat_migrated", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id)
+                log_telegram_error(LOGGER, "delivery.chat_migrated", exc, aggregate=self._aggregate_logger,
+                                   message_id=item.message_id, recipient_id=item.recipient_id)
                 self.repo.mark_left(item.recipient_id)
                 return "chat_not_found_left"
             except BadRequest as exc:
-                log_telegram_error(LOGGER, "delivery.bad_request", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id)
+                log_telegram_error(LOGGER, "delivery.bad_request", exc, aggregate=self._aggregate_logger,
+                                   message_id=item.message_id, recipient_id=item.recipient_id)
                 msg = str(exc).lower()
                 if "chat not found" in msg or "bot was blocked" in msg:
                     self.repo.mark_left(item.recipient_id)
                     return "chat_not_found_left"
                 return "bad_request"
             except TelegramError as exc:
-                log_telegram_error(LOGGER, "delivery.telegram_error", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id)
+                log_telegram_error(LOGGER, "delivery.telegram_error", exc, aggregate=self._aggregate_logger,
+                                   message_id=item.message_id, recipient_id=item.recipient_id)
                 return "telegram_error"
             except Exception:
                 return "unexpected_error"
@@ -251,6 +278,7 @@ class DeliveryQueue:
         if not self._bot:
             return "telegram_error"
         async with self._recipient_locks[item.recipient_id]:
+            await self._respect_recipient_rate(item.recipient_id)
             await self._respect_global_rate()
             recipient = self.repo.get_user(item.recipient_id)
             if not recipient or recipient.is_banned or not recipient.has_started:
@@ -260,7 +288,8 @@ class DeliveryQueue:
                 return "ineligible"
             reply_to = None
             if item.reply_to_message_id:
-                reply_to = self._reply_to_for_recipient(item, recipient.telegram_id)
+                reply_to = self._reply_to_for_recipient(
+                    item, recipient.telegram_id)
                 if not reply_to:
                     return "reply_missing"
             if current_message.deleted:
@@ -268,7 +297,8 @@ class DeliveryQueue:
                     return await self._send_deleted_tombstone(item, reply_to)
                 except BadRequest as exc:
                     if reply_to and _is_reply_rejection(exc):
-                        log_telegram_error(LOGGER, "delivery.reply_rejected", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id, reply_to=reply_to)
+                        log_telegram_error(LOGGER, "delivery.reply_rejected", exc, aggregate=self._aggregate_logger,
+                                           message_id=item.message_id, recipient_id=item.recipient_id, reply_to=reply_to)
                         return "reply_rejected"
                     raise
 
@@ -287,12 +317,14 @@ class DeliveryQueue:
                 sent = await self._send_content(item, reply_to, markup, blurred)
             except BadRequest as exc:
                 if reply_to and _is_reply_rejection(exc):
-                    log_telegram_error(LOGGER, "delivery.reply_rejected", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id, reply_to=reply_to)
+                    log_telegram_error(LOGGER, "delivery.reply_rejected", exc, aggregate=self._aggregate_logger,
+                                       message_id=item.message_id, recipient_id=item.recipient_id, reply_to=reply_to)
                     return "reply_rejected"
                 raise
             if not sent:
                 return "bad_request"
-            delivery = self.store.add_delivery(item.message_id, recipient.telegram_id, sent.message_id, blurred=blurred)
+            delivery = self.store.add_delivery(
+                item.message_id, recipient.telegram_id, sent.message_id, blurred=blurred)
             if self._message_deleted(item.message_id):
                 await self._tombstone_existing_delivery(delivery, reply_to, item.content_type)
                 return "deleted_tombstone"
@@ -306,8 +338,10 @@ class DeliveryQueue:
             parse_mode="HTML",
             reply_to_message_id=reply_to,
         )
-        delivery = self.store.add_delivery(item.message_id, item.recipient_id, sent.message_id)
-        self.store.mark_delivery_deleted(delivery.id, tombstone_message_id=sent.message_id, kind="queued_tombstone")
+        delivery = self.store.add_delivery(
+            item.message_id, item.recipient_id, sent.message_id)
+        self.store.mark_delivery_deleted(
+            delivery.id, tombstone_message_id=sent.message_id, kind="queued_tombstone")
         return "deleted_tombstone"
 
     async def _tombstone_existing_delivery(self, delivery, reply_to: int | None, content_type: str) -> None:
@@ -327,11 +361,14 @@ class DeliveryQueue:
                     media=removed_photo_media("<i>Message removed.</i>"),
                 )
             else:
-                raise TelegramError("content type cannot be tombstoned in-place")
-            self.store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id, kind="media_edited" if content_type != "text" else "edited")
+                raise TelegramError(
+                    "content type cannot be tombstoned in-place")
+            self.store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id,
+                                             kind="media_edited" if content_type != "text" else "edited")
             return
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "delivery.tombstone_edit", exc, aggregate=self._aggregate_logger, recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
+            log_telegram_error(LOGGER, "delivery.tombstone_edit", exc, aggregate=self._aggregate_logger,
+                               recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
             pass
         if content_type in {"photo", "video", "animation", "document"}:
             try:
@@ -341,17 +378,21 @@ class DeliveryQueue:
                     caption="<i>Message removed.</i>",
                     parse_mode="HTML",
                 )
-                self.store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id, kind="caption_edited")
+                self.store.mark_delivery_deleted(
+                    delivery.id, tombstone_message_id=delivery.telegram_message_id, kind="caption_edited")
                 return
             except TelegramError as exc:
-                log_telegram_error(LOGGER, "delivery.tombstone_caption", exc, aggregate=self._aggregate_logger, recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
+                log_telegram_error(LOGGER, "delivery.tombstone_caption", exc, aggregate=self._aggregate_logger,
+                                   recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
                 pass
         try:
             await self._bot.delete_message(delivery.recipient_id, delivery.telegram_message_id)
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "delivery.tombstone_delete", exc, aggregate=self._aggregate_logger, recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
+            log_telegram_error(LOGGER, "delivery.tombstone_delete", exc, aggregate=self._aggregate_logger,
+                               recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
             pass
-        self.store.mark_delivery_deleted(delivery.id, tombstone_message_id=None, kind="deleted")
+        self.store.mark_delivery_deleted(
+            delivery.id, tombstone_message_id=None, kind="deleted")
 
     def _message_deleted(self, message_id: int) -> bool:
         message = self.store.get_message(message_id)
@@ -367,6 +408,24 @@ class DeliveryQueue:
                 await asyncio.sleep(wait)
             self._last_send = loop.time()
 
+    async def _respect_recipient_rate(self, recipient_id: int) -> None:
+        loop = asyncio.get_running_loop()
+        pause_wait = self._recipient_pause_until[recipient_id] - loop.time()
+        if pause_wait > 0:
+            await asyncio.sleep(pause_wait)
+        min_gap = 1.0 / max(0.1, self.per_recipient_rate_per_second)
+        now = loop.time()
+        wait = self._recipient_last_send[recipient_id] + min_gap - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._recipient_last_send[recipient_id] = loop.time()
+
+    async def _pause_recipient_for_retry_after(self, recipient_id: int, retry_after: float) -> None:
+        loop = asyncio.get_running_loop()
+        pause_until = loop.time() + max(1.0, retry_after)
+        self._recipient_pause_until[recipient_id] = max(self._recipient_pause_until[recipient_id], pause_until)
+        await asyncio.sleep(max(1.0, retry_after))
+
     def _inactive_drop(self, recipient: User, item: DeliveryItem) -> bool:
         if item.is_system or recipient.is_mod_or_admin:
             return False
@@ -377,10 +436,12 @@ class DeliveryQueue:
             return False
         if recipient.telegram_id not in self.store.inactive_notified and self._bot:
             self.store.inactive_notified.add(recipient.telegram_id)
-            asyncio.create_task(self._bot.send_message(recipient.telegram_id, "You are inactive. Text is paused and media is sampled until you use the bot again."))
+            asyncio.create_task(self._bot.send_message(
+                recipient.telegram_id, "You are inactive. Text is paused and media is sampled until you use the bot again."))
         if item.content_type == "text":
             return True
-        chance = float(self.config.get("inactivity.non_system_receive_chance", 0.05) or 0.05)
+        chance = float(self.config.get(
+            "inactivity.non_system_receive_chance", 0.05) or 0.05)
         return random.random() > chance
 
     async def _should_blur(self, recipient: User, item: DeliveryItem) -> bool:
@@ -395,7 +456,8 @@ class DeliveryQueue:
 
     async def _send_content(self, item: DeliveryItem, reply_to: int | None, markup: InlineKeyboardMarkup | None, blurred: bool):
         assert self._bot is not None
-        kwargs = {"chat_id": item.recipient_id, "reply_to_message_id": reply_to, "reply_markup": markup}
+        kwargs = {"chat_id": item.recipient_id,
+                  "reply_to_message_id": reply_to, "reply_markup": markup}
         if item.is_system:
             kwargs["parse_mode"] = "HTML"
         elif item.parse_mode:
@@ -408,14 +470,29 @@ class DeliveryQueue:
                     message_id=item.forward_from_message_id,
                 )
             except BadRequest as exc:
-                log_telegram_error(LOGGER, "delivery.forward_fallback", exc, aggregate=self._aggregate_logger, message_id=item.message_id, recipient_id=item.recipient_id)
+                log_telegram_error(LOGGER, "delivery.forward_fallback", exc, aggregate=self._aggregate_logger,
+                                   message_id=item.message_id, recipient_id=item.recipient_id)
                 pass
         if blurred:
-            preview = await self.media.blurred_preview(item.message_id)
-            notice = "Media blurred due to current credit loss rate."
-            if preview:
-                caption = f"{item.text}\n\n{notice}" if item.text else notice
-                return await self._bot.send_photo(photo=InputFile(BytesIO(preview), filename="blurred.jpg"), caption=caption, **kwargs)
+            notice = "Uh oh 😭 The message was blurred due to your loss rate, earn credits to reduce your loss rate, see /help, /info and /creditstats for more info."
+            caption = f"{item.text}\n\n{notice}" if item.text else notice
+            cached_file_id = self.media.blurred_file_id(item.message_id)
+            if cached_file_id:
+                return await self._bot.send_photo(photo=cached_file_id, caption=caption, **kwargs)
+            async with self.media.blur_upload_lock(item.message_id):
+                cached_file_id = self.media.blurred_file_id(item.message_id)
+                if cached_file_id:
+                    return await self._bot.send_photo(photo=cached_file_id, caption=caption, **kwargs)
+                preview = await self.media.blurred_preview(item.message_id)
+                if preview:
+                    sent = await self._bot.send_photo(
+                        photo=InputFile(BytesIO(preview), filename="blurred.jpg"),
+                        caption=caption,
+                        **kwargs,
+                    )
+                    if sent.photo:
+                        self.media.set_blurred_file_id(item.message_id, sent.photo[-1].file_id)
+                    return sent
             text = f"{item.text}\n\n{notice}" if item.text else notice
             return await self._bot.send_message(text=text, **kwargs)
         if item.content_type == "text":
@@ -437,7 +514,8 @@ class DeliveryQueue:
     def _reply_to_for_recipient(self, item: DeliveryItem, recipient_id: int) -> int | None:
         if not item.reply_to_message_id:
             return None
-        prior = self.store.delivery_for_recipient(item.reply_to_message_id, recipient_id)
+        prior = self.store.delivery_for_recipient(
+            item.reply_to_message_id, recipient_id)
         if prior:
             return prior.telegram_message_id
         original = self.store.get_message(item.reply_to_message_id)

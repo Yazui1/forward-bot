@@ -21,6 +21,8 @@ COMMON_TELEGRAM_ERROR_MARKERS = (
     "reply message not found",
     "message can't be deleted",
     "message can't be edited",
+    "flood control exceeded",
+    "timed out",
 )
 
 UNREACHABLE_TELEGRAM_ERROR_MARKERS = (

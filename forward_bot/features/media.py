@@ -27,6 +27,8 @@ class MediaService:
     def __init__(self) -> None:
         self._preview_cache: dict[int, bytes] = {}
         self._blur_cache: dict[int, bytes] = {}
+        self._blur_file_id_cache: dict[int, str] = {}
+        self._blur_upload_locks: dict[int, asyncio.Lock] = {}
 
     async def inspect(self, bot: Bot, message_id: int, payload: dict[str, Any]) -> MediaInspection:
         file_id = _preview_file_id(payload)
@@ -73,9 +75,24 @@ class MediaService:
         except Exception:
             return None
 
+    def blurred_file_id(self, message_id: int) -> str | None:
+        return self._blur_file_id_cache.get(message_id)
+
+    def set_blurred_file_id(self, message_id: int, file_id: str) -> None:
+        self._blur_file_id_cache[message_id] = file_id
+
+    def blur_upload_lock(self, message_id: int) -> asyncio.Lock:
+        lock = self._blur_upload_locks.get(message_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._blur_upload_locks[message_id] = lock
+        return lock
+
     def release(self, message_id: int) -> None:
         self._preview_cache.pop(message_id, None)
         self._blur_cache.pop(message_id, None)
+        self._blur_file_id_cache.pop(message_id, None)
+        self._blur_upload_locks.pop(message_id, None)
 
 
 class AIClassifier:
