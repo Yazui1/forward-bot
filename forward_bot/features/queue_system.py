@@ -80,6 +80,7 @@ class DeliveryQueue:
         self._rate_lock = asyncio.Lock()
         self._recipient_last_send: dict[int, float] = defaultdict(float)
         self._recipient_pause_until: dict[int, float] = defaultdict(float)
+        self._recipient_wake_tasks: dict[int, asyncio.Task] = {}
         self._workers: list[asyncio.Task] = []
         self._stopping = False
         self._last_send = 0.0
@@ -107,7 +108,11 @@ class DeliveryQueue:
         self._event.set()
         for task in self._workers:
             task.cancel()
+        for task in self._recipient_wake_tasks.values():
+            task.cancel()
         await asyncio.gather(*self._workers, return_exceptions=True)
+        await asyncio.gather(*self._recipient_wake_tasks.values(), return_exceptions=True)
+        self._recipient_wake_tasks.clear()
 
     def enqueue_message(self, message: TransientMessage, recipients: list[User]) -> int:
         if not recipients:
@@ -197,11 +202,30 @@ class DeliveryQueue:
         if not pending:
             self._recipient_queued.discard(recipient_id)
             return
+        pause_wait = self._recipient_pause_until[recipient_id] - asyncio.get_running_loop().time()
+        if pause_wait > 0:
+            self._recipient_queued.discard(recipient_id)
+            task = self._recipient_wake_tasks.get(recipient_id)
+            if task is None or task.done():
+                self._recipient_wake_tasks[recipient_id] = asyncio.create_task(
+                    self._wake_recipient_after(recipient_id, pause_wait),
+                    name=f"delivery-wake-{recipient_id}",
+                )
+            return
         item = pending.popleft()
         self._recipient_queued.add(recipient_id)
         self._recipient_heap_item[recipient_id] = item
         heapq.heappush(self._queue, (item.priority, next(self._seq), item))
         self._event.set()
+
+    async def _wake_recipient_after(self, recipient_id: int, delay: float) -> None:
+        try:
+            await asyncio.sleep(max(0.0, delay))
+            self._recipient_wake_tasks.pop(recipient_id, None)
+            if recipient_id not in self._recipient_queued and self._recipient_pending.get(recipient_id):
+                self._queue_one_for_recipient(recipient_id)
+        except asyncio.CancelledError:
+            raise
 
     async def _worker(self) -> None:
         while not self._stopping:
@@ -221,6 +245,15 @@ class DeliveryQueue:
         self._finish_item(item, status, ordered=False)
 
     def _finish_item(self, item: DeliveryItem, status: str, *, ordered: bool = True) -> None:
+        if status == "requeued":
+            if ordered:
+                self._recipient_queued.discard(item.recipient_id)
+                if self._recipient_heap_item.get(item.recipient_id) is item:
+                    self._recipient_heap_item.pop(item.recipient_id, None)
+                item.started = False
+                self._recipient_pending[item.recipient_id].appendleft(item)
+                self._queue_one_for_recipient(item.recipient_id)
+            return
         if self._aggregate_logger:
             self._aggregate_logger.increment(f"delivery.{status}")
         self.store.record_delivery_status(item.message_id, status)
@@ -243,7 +276,8 @@ class DeliveryQueue:
                 retry_after = float(getattr(exc, "retry_after", 1) or 1)
                 log_telegram_error(LOGGER, "delivery.retry_after", exc, aggregate=self._aggregate_logger,
                                    message_id=item.message_id, recipient_id=item.recipient_id, retry_after=retry_after)
-                await self._pause_recipient_for_retry_after(item.recipient_id, retry_after)
+                self._pause_recipient_for_retry_after(item.recipient_id, retry_after)
+                return "requeued"
             except (TimedOut, NetworkError) as exc:
                 log_telegram_error(LOGGER, "delivery.network_retry", exc, aggregate=self._aggregate_logger,
                                    message_id=item.message_id, recipient_id=item.recipient_id, attempt=attempt + 1)
@@ -420,11 +454,10 @@ class DeliveryQueue:
             await asyncio.sleep(wait)
         self._recipient_last_send[recipient_id] = loop.time()
 
-    async def _pause_recipient_for_retry_after(self, recipient_id: int, retry_after: float) -> None:
+    def _pause_recipient_for_retry_after(self, recipient_id: int, retry_after: float) -> None:
         loop = asyncio.get_running_loop()
         pause_until = loop.time() + max(1.0, retry_after)
         self._recipient_pause_until[recipient_id] = max(self._recipient_pause_until[recipient_id], pause_until)
-        await asyncio.sleep(max(1.0, retry_after))
 
     def _inactive_drop(self, recipient: User, item: DeliveryItem) -> bool:
         if item.is_system or recipient.is_mod_or_admin:
