@@ -6,7 +6,7 @@ import random
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
 
 from forward_bot.cache.transient import TransientMessage
@@ -412,9 +412,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         label = f"Retry in {remaining}s" if remaining else "You can send again"
         try:
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"retry:{user.telegram_id}")]]))
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                log_telegram_error(LOGGER, "callback.retry_markup", exc, aggregate=context.application.bot_data.get("aggregate_logger"), user_id=user.telegram_id)
         except TelegramError as exc:
             log_telegram_error(LOGGER, "callback.retry_markup", exc, aggregate=context.application.bot_data.get("aggregate_logger"), user_id=user.telegram_id)
-            pass
         await query.answer(label)
         return
     if data.startswith("confirm:"):
