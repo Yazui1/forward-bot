@@ -69,6 +69,8 @@ class Harness:
         self.accounts: dict[str, Account] = {}
         self.history: dict[str, list[Any]] = defaultdict(list)
         self.queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+        self.deleted_ids: dict[str, set[int]] = defaultdict(set)
+        self.deleted_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         self.handlers: list[tuple[TelegramClient, Any, Any]] = []
         self.message_timeout = float(
             _get(self.config, "timeouts.message_seconds", 30))
@@ -128,15 +130,23 @@ class Harness:
             new_builder = events.NewMessage(
                 chats=account.bot_entity, incoming=True)
             edit_builder = events.MessageEdited(chats=account.bot_entity)
+            delete_builder = events.MessageDeleted(chats=account.bot_entity)
 
             async def handler(event, account_name=account.name):
                 self.history[account_name].append(event.message)
                 await self.queues[account_name].put(event.message)
 
+            async def delete_handler(event, account_name=account.name):
+                for message_id in event.deleted_ids:
+                    self.deleted_ids[account_name].add(int(message_id))
+                    await self.deleted_queues[account_name].put(int(message_id))
+
             account.client.add_event_handler(handler, new_builder)
             self.handlers.append((account.client, handler, new_builder))
             account.client.add_event_handler(handler, edit_builder)
             self.handlers.append((account.client, handler, edit_builder))
+            account.client.add_event_handler(delete_handler, delete_builder)
+            self.handlers.append((account.client, delete_handler, delete_builder))
 
     def launch_bot(self) -> None:
         owner_id = self.accounts["owner"].user_id
@@ -287,7 +297,14 @@ class Harness:
 
     def clear_inboxes(self) -> None:
         self.history.clear()
+        self.deleted_ids.clear()
         for queue in self.queues.values():
+            while True:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+        for queue in self.deleted_queues.values():
             while True:
                 try:
                     queue.get_nowait()
@@ -297,8 +314,19 @@ class Harness:
     async def wait_text(self, account_name: str, needle: str, *, timeout: float | None = None):
         return await self.wait_for(
             account_name,
-            lambda msg: needle in (msg.raw_text or ""),
+            lambda msg: _message_id(msg) is not None and needle in (msg.raw_text or ""),
             label=f"{account_name} message containing {needle!r}",
+            timeout=timeout,
+        )
+
+    async def wait_reply_text(self, account_name: str, needle: str, reply_to: Any, *, timeout: float | None = None):
+        expected = _message_id(reply_to) if not isinstance(reply_to, int) else reply_to
+        if expected is None:
+            raise E2EFailure(f"Cannot wait for reply to id-less message: {reply_to!r}")
+        return await self.wait_for(
+            account_name,
+            lambda msg: _message_id(msg) is not None and needle in (msg.raw_text or "") and getattr(msg, "reply_to_msg_id", None) == expected,
+            label=f"{account_name} message containing {needle!r} replying to {expected}",
             timeout=timeout,
         )
 
@@ -327,6 +355,36 @@ class Harness:
             if predicate(msg):
                 return msg
 
+    async def wait_deleted(self, account_name: str, message: Any, *, timeout: float | None = None) -> None:
+        expected = _message_id(message) if not isinstance(message, int) else message
+        if expected is None:
+            raise E2EFailure(f"Cannot wait for deletion of id-less message: {message!r}")
+        if expected in self.deleted_ids[account_name]:
+            return
+        timeout = self.message_timeout if timeout is None else timeout
+        account = self.accounts[account_name]
+        try:
+            current = await account.client.get_messages(account.bot_entity, ids=expected)
+            if not current:
+                return
+        except RPCError:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                current = await account.client.get_messages(account.bot_entity, ids=expected)
+                if not current:
+                    return
+                raise E2EFailure(f"Timed out waiting for {account_name} message {expected} to be deleted")
+            try:
+                message_id = await asyncio.wait_for(self.deleted_queues[account_name].get(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise E2EFailure(f"Timed out waiting for {account_name} message {expected} to be deleted") from exc
+            if message_id == expected:
+                return
+
     async def assert_absent_text(self, account_name: str, needle: str, *, timeout: float | None = None) -> None:
         timeout = float(_get(self.config, "timeouts.absent_seconds", 3)
                         ) if timeout is None else timeout
@@ -346,7 +404,9 @@ class Harness:
         return path
 
     def assert_reply_to(self, message: Any, target: Any, label: str) -> None:
-        expected = int(getattr(target, "id", target))
+        expected = _message_id(target) if not isinstance(target, int) else target
+        if expected is None:
+            raise E2EFailure(f"{label} target has no usable message id: {target!r}")
         actual = getattr(message, "reply_to_msg_id", None)
         if actual != expected:
             raise E2EFailure(f"{label} did not reply to expected message: got {actual}, expected {expected}")
@@ -432,23 +492,18 @@ async def _delete_vote_flow(h: Harness, prefix: str):
     user_b_copy = await h.wait_text("user_b", marker)
 
     await h.send_text("user_b", "/deletevote", reply_to=user_b_copy)
-    first_vote = await h.wait_text("user_b", "Remove vote recorded (1/2)")
-    h.assert_reply_to(first_vote, user_b_copy, "Remove-vote pending reply")
+    first_vote = await h.wait_reply_text("user_b", "Remove vote recorded (1/2)", user_b_copy)
     await h.send_text("owner", "/deletevote", reply_to=owner_copy)
-    threshold_vote = await h.wait_text("owner", "Remove vote threshold reached. Message removed.")
-    h.assert_reply_to(threshold_vote, owner_copy, "Remove-vote threshold reply")
-    voter_threshold_notice = await h.wait_text("user_b", "Remove vote threshold reached. Message removed.")
-    h.assert_reply_to(voter_threshold_notice, user_b_copy, "Remove-vote voter threshold notice")
+    threshold_vote = await h.wait_reply_text("owner", "Remove vote threshold reached. Message removed.", owner_copy)
+    voter_threshold_notice = await h.wait_reply_text("user_b", "Remove vote threshold reached. Message removed.", user_b_copy)
     await h.wait_for(
         "user_b",
         lambda msg: msg.id == user_b_copy.id and "Message removed." in (
             msg.raw_text or ""),
         label="user_b tombstone after delete-vote threshold",
     )
-    sender_removed = await h.wait_text("user_a", "Your message was removed:")
-    h.assert_reply_to(sender_removed, source, "Sender removal notice")
-    note = await h.wait_text("owner", "Moderation removal")
-    h.assert_reply_to(note, owner_copy, "Moderation note")
+    sender_removed = await h.wait_reply_text("user_a", "Your message was removed:", source)
+    note = await h.wait_reply_text("owner", "Moderation removal", owner_copy)
     required = {"Punish", "Remove for mods", "Revert", "Ban"}
     labels = set(h.button_texts(note))
     if not required.issubset(labels):
@@ -514,8 +569,14 @@ async def scenario_mod_dialog_remove_for_mods(h: Harness) -> None:
             msg.raw_text or "").lower(),
         label="mod note removed-for-mods status",
     )
+    updated_note = await h.wait_for(
+        "owner",
+        lambda msg: msg.id == note.id and "Punish" in h.button_texts(msg),
+        label="mod note still has punish button after remove-for-mods",
+    )
+    await h.click_button("owner", updated_note, "Punish")
     penalty = await h.wait_text("user_a", "Moderation confirmed. Penalty:")
-    h.assert_reply_to(penalty, flow["source"], "Remove-for-mods punishment notice")
+    h.assert_reply_to(penalty, flow["source"], "Punishment after remove-for-mods notice")
     print("PASS mod-dialog-remove-for-mods")
 
 
@@ -555,18 +616,15 @@ async def scenario_media_tombstone(h: Harness) -> None:
     user_b_copy = await h.wait_text("user_b", marker)
 
     await h.send_text("user_b", "/deletevote", reply_to=user_b_copy)
-    first_vote = await h.wait_text("user_b", "Remove vote recorded (1/2)")
-    h.assert_reply_to(first_vote, user_b_copy, "Media remove-vote pending reply")
+    first_vote = await h.wait_reply_text("user_b", "Remove vote recorded (1/2)", user_b_copy)
     await h.send_text("owner", "/deletevote", reply_to=owner_copy)
-    threshold_vote = await h.wait_text("owner", "Remove vote threshold reached. Message removed.")
-    h.assert_reply_to(threshold_vote, owner_copy, "Media remove-vote threshold reply")
-    voter_threshold_notice = await h.wait_text("user_b", "Remove vote threshold reached. Message removed.")
-    h.assert_reply_to(voter_threshold_notice, user_b_copy, "Media remove-vote voter threshold notice")
+    threshold_vote = await h.wait_reply_text("owner", "Remove vote threshold reached. Message removed.", owner_copy)
+    voter_threshold_notice = await h.wait_reply_text("user_b", "Remove vote threshold reached. Message removed.", user_b_copy)
     tombstone = await h.wait_for(
         "user_b",
         lambda msg: msg.id == user_b_copy.id and "Message removed." in (
             msg.raw_text or ""),
-        label="media caption tombstone on same user_b message",
+        label="media replacement tombstone on same user_b message",
     )
     if tombstone.id != user_b_copy.id:
         raise E2EFailure("Media tombstone was not applied to the original Telegram message.")
@@ -576,20 +634,37 @@ async def scenario_media_tombstone(h: Harness) -> None:
 async def scenario_forward_preservation(h: Harness) -> None:
     await h.start_all()
     h.clear_inboxes()
-    account = h.accounts["user_a"]
-    source = None
-    for candidate in await account.client.get_messages("Telegram", limit=20):
-        if candidate.raw_text and len(candidate.raw_text.strip()) >= 20:
-            source = candidate
-            break
-    if not source:
-        raise E2EFailure("Could not find a text post in @Telegram to forward.")
+    source = await _telegram_text_post(h)
     marker = source.raw_text.strip()[:40]
     await h.forward_to_bot("user_a", source)
     forwarded = await h.wait_text("user_b", marker)
     if not getattr(forwarded, "fwd_from", None):
         raise E2EFailure("Recipient copy was not delivered as a Telegram forward.")
     print("PASS forward-preservation")
+
+
+async def scenario_forward_delete_removes_uneditable_forward(h: Harness) -> None:
+    await h.start_all()
+    h.clear_inboxes()
+    source = await _telegram_text_post(h)
+    marker = source.raw_text.strip()[:40]
+    await h.forward_to_bot("user_a", source)
+    owner_forwarded = await h.wait_text("owner", marker)
+    user_b_forwarded = await h.wait_text("user_b", marker)
+    if not getattr(user_b_forwarded, "fwd_from", None):
+        raise E2EFailure("Recipient copy was not delivered as a Telegram forward.")
+    await h.send_text("owner", "/delete", reply_to=owner_forwarded)
+    await h.wait_reply_text("owner", "Deleted (", owner_forwarded)
+    await h.wait_deleted("user_b", user_b_forwarded)
+    print("PASS forward-delete-removes-uneditable-forward")
+
+
+async def _telegram_text_post(h: Harness):
+    account = h.accounts["user_a"]
+    for candidate in await account.client.get_messages("Telegram", limit=20):
+        if candidate.raw_text and len(candidate.raw_text.strip()) >= 20:
+            return candidate
+    raise E2EFailure("Could not find a text post in @Telegram to forward.")
 
 
 SCENARIOS: dict[str, Callable[[Harness], Awaitable[None]]] = {
@@ -603,6 +678,7 @@ SCENARIOS: dict[str, Callable[[Harness], Awaitable[None]]] = {
     "mod-dialog-remove-for-mods": scenario_mod_dialog_remove_for_mods,
     "media-tombstone": scenario_media_tombstone,
     "forward-preservation": scenario_forward_preservation,
+    "forward-delete-removes-uneditable-forward": scenario_forward_delete_removes_uneditable_forward,
     "mod-dialog-ban-purge": scenario_mod_dialog_ban_purge,
 }
 
@@ -678,6 +754,15 @@ def _require(data: dict[str, Any], dotted: str) -> Any:
     if value in (None, ""):
         raise E2EFailure(f"Missing required config value: {dotted}")
     return value
+
+
+def _message_id(message: Any) -> int | None:
+    value = getattr(message, "id", None)
+    if value is not None:
+        return int(value)
+    nested = getattr(message, "message", None)
+    value = getattr(nested, "id", None)
+    return int(value) if value is not None else None
 
 
 def parse_args() -> argparse.Namespace:

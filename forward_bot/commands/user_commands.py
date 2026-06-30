@@ -81,6 +81,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user, created = await ensure_user(update, context)
     if not user:
         return
+    if user.is_banned:
+        await msg.reply_text("You are banned.")
+        return
     first_seen = created
     joining_now = not user.has_started
     repo.set_started(user.telegram_id, True)

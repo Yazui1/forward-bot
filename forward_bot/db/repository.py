@@ -183,6 +183,9 @@ class Repository:
         if banned is not None:
             updates.append("is_banned=?")
             values.append(int(banned))
+            if banned:
+                updates.append("has_started=?")
+                values.append(0)
         if not updates:
             return self.get_user(user_id)
         values.append(user_id)

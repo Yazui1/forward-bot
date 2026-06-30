@@ -22,7 +22,7 @@ _REMOVED_PNG = _build_removed_png()
 
 def removed_photo_media(caption: str = "Message removed.") -> InputMediaPhoto:
     return InputMediaPhoto(
-        media=InputFile(BytesIO(_REMOVED_PNG), filename="removed.png"),
+        media=InputFile(BytesIO(_REMOVED_PNG), filename="removed.png", attach=True),
         caption=caption,
         parse_mode="HTML",
     )

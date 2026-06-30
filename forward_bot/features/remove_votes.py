@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from telegram import Bot
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 
 from forward_bot.cache.transient import TransientStore
 from forward_bot.config import Config
@@ -67,7 +67,7 @@ async def vote_to_remove(
         reason="community remove vote threshold reached",
         voter_ids=voters,
     )
-    await _notify_voters(bot, voter_reply_targets, "Remove vote threshold reached. Message removed.")
+    await _notify_voters(bot, store, repo, voter_reply_targets, "Remove vote threshold reached. Message removed.")
     await _remove_collateral(bot, repo, store, config, message_id)
     return True, "Remove vote threshold reached. Message removed."
 
@@ -81,20 +81,39 @@ def _voter_reply_targets(store: TransientStore, message_id: int, voter_ids: list
     return targets
 
 
-async def _notify_voters(bot: Bot, reply_targets: dict[int, int | None], text: str) -> None:
+async def _notify_voters(bot: Bot, store: TransientStore, repo: Repository, reply_targets: dict[int, int | None], text: str) -> None:
     for voter_id, reply_to in reply_targets.items():
+        if not reply_to:
+            LOGGER.info(
+                "telegram remove_vote.notify_voter skipped missing reply target fields=%s",
+                {"user_id": voter_id},
+            )
+            continue
         try:
             await bot.send_message(
                 voter_id,
                 text,
                 reply_to_message_id=reply_to,
             )
+        except BadRequest as exc:
+            if reply_to and _is_reply_rejection(exc):
+                queue = getattr(store, "delivery_queue", None)
+                aggregate = getattr(queue, "_aggregate_logger", None)
+                log_telegram_error(LOGGER, "remove_vote.notify_voter_reply_rejected", exc, aggregate=aggregate, repo=repo, user_id=voter_id, reply_to=reply_to)
+                continue
+            queue = getattr(store, "delivery_queue", None)
+            aggregate = getattr(queue, "_aggregate_logger", None)
+            log_telegram_error(LOGGER, "remove_vote.notify_voter", exc, aggregate=aggregate, repo=repo, user_id=voter_id, reply_to=reply_to)
         except TelegramError as exc:
             queue = getattr(store, "delivery_queue", None)
             aggregate = getattr(queue, "_aggregate_logger", None)
-            repo = getattr(getattr(store, "delivery_queue", None), "repo", None)
             log_telegram_error(LOGGER, "remove_vote.notify_voter", exc, aggregate=aggregate, repo=repo, user_id=voter_id, reply_to=reply_to)
             pass
+
+
+def _is_reply_rejection(exc: BadRequest) -> bool:
+    text = str(exc).lower()
+    return "reply" in text and ("not found" in text or "message to be replied" in text or "invalid" in text)
 
 
 async def _remove_collateral(bot: Bot, repo: Repository, store: TransientStore, config: Config, pivot_id: int) -> None:

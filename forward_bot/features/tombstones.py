@@ -37,23 +37,26 @@ async def remove_message(
     voter_ids: list[int] | None = None,
 ) -> int:
     msg = store.get_message(message_id)
-    if not msg or msg.deleted and not remove_for_mods:
+    if not msg or (msg.deleted and not remove_for_mods) or (msg.removed_for_mods and remove_for_mods):
         return 0
-    msg.deleted = True
+    if remove_for_mods:
+        msg.removed_for_mods = True
+    else:
+        msg.deleted = True
     msg.deletion_reason = reason
     queue = getattr(store, "delivery_queue", None)
-    if queue is not None:
+    if queue is not None and not remove_for_mods:
         try:
             queue.promote_deleted_message(message_id)
         except Exception:
             pass
-    if remove_for_mods:
-        msg.removed_for_mods = True
     sender = repo.get_user(msg.sender_id) if msg.sender_id else None
     updated = 0
     for delivery in store.deliveries_for_message(message_id):
         user = repo.get_user(delivery.recipient_id)
         if not user or delivery.deleted:
+            continue
+        if remove_for_mods and not user.is_mod_or_admin:
             continue
         if user.is_mod_or_admin and not remove_for_mods:
             continue
@@ -122,21 +125,14 @@ async def _tombstone_delivery(
     except TelegramError as exc:
         log_telegram_error(LOGGER, "tombstone.edit", exc, aggregate=_aggregate(store), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
         pass
-    if content_type in {"photo", "video", "animation", "document"}:
-        try:
-            await bot.edit_message_caption(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, caption=text, parse_mode="HTML")
-            store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id, kind="caption_edited")
-            return True
-        except TelegramError as exc:
-            log_telegram_error(LOGGER, "tombstone.caption", exc, aggregate=_aggregate(store), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
-            pass
     try:
         await bot.delete_message(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id)
     except TelegramError as exc:
         log_telegram_error(LOGGER, "tombstone.delete", exc, aggregate=_aggregate(store), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
-        pass
+        store.mark_delivery_deleted(delivery.id, tombstone_message_id=None, kind="delete_failed")
+        return False
     store.mark_delivery_deleted(delivery.id, tombstone_message_id=None, kind="deleted")
-    return False
+    return True
 
 
 async def send_mod_notes(
@@ -310,8 +306,6 @@ def _tombstone_note_text(store: TransientStore, msg) -> str | None:
     kinds = {delivery.tombstone_kind for delivery in store.deliveries_for_message(msg.id)}
     if "deleted" in kinds:
         return "The referenced message had to be deleted because Telegram could not tombstone it in place."
-    if "caption_edited" in kinds:
-        return "Some copies could only be captioned because Telegram could not replace their media in place."
     return None
 
 
@@ -319,7 +313,7 @@ async def punish_sender(bot: Bot, repo: Repository, store: TransientStore, confi
     msg = store.get_message(message_id)
     if not msg or msg.sender_id is None:
         return "Message is not in cache anymore."
-    if msg.punishment_confirmed or msg.removed_for_mods or msg.reverted:
+    if msg.punishment_confirmed or msg.reverted:
         return "This moderation action is already resolved."
     sender = repo.get_user(msg.sender_id)
     if not sender:
@@ -353,10 +347,6 @@ async def remove_for_moderators(bot: Bot, repo: Repository, store: TransientStor
         return "Message is not in cache anymore."
     if msg.reverted or msg.removed_for_mods:
         return "This moderation action is already resolved."
-    if not msg.punishment_confirmed:
-        result = await punish_sender(bot, repo, store, config, message_id, moderator_id)
-        if result != "Punishment applied.":
-            return result
     count = await remove_message(bot, repo, store, config, message_id, reason=msg.deletion_reason or "removed for moderators", remove_for_mods=True, notify_sender=False)
     msg.removed_for_mods = True
     _append_mod_action(msg, f"Removed {count} moderator copies")
@@ -462,7 +452,12 @@ def _sender_source_reply(msg) -> int | None:
 
 def _delivery_reply_for_user(store: TransientStore, message_id: int, user_id: int) -> int | None:
     delivery = store.delivery_for_recipient(message_id, user_id)
-    return delivery.telegram_message_id if delivery else None
+    if delivery:
+        return delivery.telegram_message_id
+    for delivery in store.deliveries_for_message(message_id):
+        if delivery.recipient_id == user_id:
+            return delivery.tombstone_message_id or delivery.telegram_message_id
+    return None
 
 
 def _whisper_reply_for_user(store: TransientStore, whisper_id: int, user_id: int) -> int | None:

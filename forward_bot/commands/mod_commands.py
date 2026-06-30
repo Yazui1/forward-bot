@@ -214,7 +214,8 @@ async def _ban_set(update: Update, context: ContextTypes.DEFAULT_TYPE, value: bo
         await command_reply(update, context, "Use /ban <user> or /unban <user>, or reply to a message.")
         return
     target = get_repo(context).set_role(target.telegram_id, banned=value)
-    await command_reply(update, context, f"Banned for {display_identity_html(target, get_config(context), viewer=caller)}: {target.is_banned}", parse_mode="HTML")
+    action = "Banned" if value else "Unbanned"
+    await command_reply(update, context, f"{action} {display_identity_html(target, get_config(context), viewer=caller)}", parse_mode="HTML")
     try:
         await context.bot.send_message(target.telegram_id, "You are banned." if value else "You are unbanned.", reply_to_message_id=await reply_to_for_target(update, context, target.telegram_id))
     except TelegramError as exc:
@@ -307,7 +308,8 @@ async def purgebanned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for msg in list(store.messages.values()):
         sender = repo.get_user(msg.sender_id) if msg.sender_id else None
         if sender and sender.is_banned and not msg.deleted:
-            await remove_message(context.bot, repo, store, get_config(context), msg.id, reason="purged banned sender", remove_for_mods=True)
+            await remove_message(context.bot, repo, store, get_config(context), msg.id, reason="purged banned sender", remove_for_mods=False, notify_sender=False)
+            await remove_message(context.bot, repo, store, get_config(context), msg.id, reason="purged banned sender", remove_for_mods=True, notify_sender=False)
             count += 1
     await update.effective_message.reply_text(f"Purged {count} cached messages.")
 

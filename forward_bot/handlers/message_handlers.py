@@ -45,7 +45,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user.active_cooldown_seconds > 0 and not user.is_mod_or_admin:
         _aggregate(context, "pipeline.cooldown_attempt")
         await _reply_to_message(context, msg, f"Cooldown active: {human_seconds(user.active_cooldown_seconds)}. Reason: {user.cooldown_reason or 'cooldown'}")
-        await _broadcast_cooldown_attempt(update, context, user)
+        await _broadcast_cooldown_attempt(update, context, user, extract_payload(msg), source_message=msg)
         return
     if not user.has_started:
         await _reply_to_message(context, msg, MSG_USE_START)
@@ -87,7 +87,9 @@ async def submit_text(
     if user.active_cooldown_seconds > 0 and not user.is_mod_or_admin:
         _aggregate(context, "pipeline.cooldown_attempt")
         await _reply_to_message(context, msg, f"Cooldown active: {human_seconds(user.active_cooldown_seconds)}. Reason: {user.cooldown_reason or 'cooldown'}")
-        await _broadcast_cooldown_attempt(update, context, user)
+        payload = {"content_type": "text", "text": text, "media_file_id": None, "thumbnail_file_id": None, "media_kind": None, "mime_type": None,
+                   "sticker_set_name": None, "is_animated": False, "is_video": False, "parse_mode": None, "force_remove_buttons": force_remove_buttons}
+        await _broadcast_cooldown_attempt(update, context, user, payload, source_message=msg, identity_mode=identity_mode)
         return
     allowed, retry = context.application.bot_data["rate_limiter"].check(
         user.telegram_id)
@@ -101,32 +103,63 @@ async def submit_text(
     await _process_payload(update, context, user, payload, source_message=msg, identity_mode=identity_mode)
 
 
-async def _broadcast_cooldown_attempt(update: Update, context: ContextTypes.DEFAULT_TYPE, user: User) -> None:
-    msg = update.effective_message
-    if not msg:
-        return
+async def _broadcast_cooldown_attempt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: User,
+    payload: dict[str, Any],
+    *,
+    source_message: Message,
+    identity_mode: str | None = None,
+) -> None:
     repo = get_repo(context)
     config = get_config(context)
     store = get_store(context)
-    content = msg.text or msg.caption or "[media]"
     recipients = [u for u in repo.list_users(
     ) if u.has_started and u.is_mod_or_admin and not u.is_banned]
     for recipient in recipients:
+        body, identity_parse_mode = _apply_identity(payload.get("text") or "", user, identity_mode)
+        parse_mode = identity_parse_mode or payload.get("parse_mode")
+        text = _cooldown_attempt_text(user, recipient, config, body, parse_mode)
+        reply_target_id = _resolve_reply_target(source_message, user, context)
         tm = store.add_message(
             sender_id=user.telegram_id,
-            content_type="text",
-            text=(
-                f"Cooldown attempt from {display_identity_html(user, config, viewer=recipient)} "
-                f"({human_seconds(user.active_cooldown_seconds)}, {html_escape(user.cooldown_reason or 'cooldown')}):\n"
-                f"{html_escape(content)}"
-            ),
-            source_chat_id=msg.chat_id,
-            source_message_id=msg.message_id,
-            is_system=True,
+            content_type=payload.get("content_type", "text"),
+            text=text,
+            media_file_id=payload.get("media_file_id"),
+            thumbnail_file_id=payload.get("thumbnail_file_id"),
+            media_kind=payload.get("media_kind"),
+            mime_type=payload.get("mime_type"),
+            sticker_set_name=payload.get("sticker_set_name"),
+            is_animated=bool(payload.get("is_animated")),
+            is_video=bool(payload.get("is_video")),
+            source_chat_id=source_message.chat_id,
+            source_message_id=source_message.message_id,
+            reply_to_message_id=None if reply_target_id == -1 else reply_target_id,
+            parse_mode="HTML",
+            is_system=False,
             urgent=True,
-            metadata={"system_html": True},
+            metadata={
+                "cooldown_attempt": True,
+                "forward_from_chat_id": payload.get("forward_from_chat_id"),
+                "forward_from_message_id": payload.get("forward_from_message_id"),
+            },
         )
         context.application.bot_data["queue"].enqueue_message(tm, [recipient])
+
+
+def _cooldown_attempt_text(user: User, viewer: User, config, body: str, parse_mode: str | None) -> str:
+    header = (
+        f"<i>In cooldown (Left: {html_escape(human_seconds(user.active_cooldown_seconds))}):</i> "
+        f"{display_identity_html(user, config, viewer=viewer)}"
+    )
+    if not body:
+        return header
+    if parse_mode == "HTML":
+        rendered_body = body
+    else:
+        rendered_body = html_escape(body)
+    return f"{header}\n{rendered_body}"
 
 
 async def _try_auto_whisper_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user: User) -> bool:
@@ -235,7 +268,7 @@ async def _process_payload(
 def _apply_identity(text: str, user: User, identity_mode: str | None) -> tuple[str, str | None]:
     if identity_mode == "signed" or (identity_mode is None and user.sign_enabled):
         suffix = f"~ @{user.username}" if user.username else "~ signed"
-        return (f"{text}\n\n{suffix}" if text else suffix), None
+        return (f"{text} {suffix}" if text else suffix), None
     if (identity_mode == "tripcode" or (identity_mode is None and user.tripcode_enabled)) and user.tripcode_name and user.tripcode_hash:
         trip = f"<b>{html_escape(user.tripcode_name)}</b> !{html_escape(user.tripcode_hash)}"
         return (f"{trip}:\n{html_escape(text)}" if text else trip), "HTML"
@@ -461,13 +494,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         store = get_store(context)
         config = get_config(context)
         source = store.get_message(int(message_id_s))
-        repo.set_role(sender_id, banned=True)
+        banned_sender = repo.set_role(sender_id, banned=True)
         purged = 0
         for cached in list(store.messages.values()):
             if cached.sender_id == sender_id and not cached.deleted:
                 cached.metadata.setdefault("mod_actions", []).append(
                     "Banned and purged by admin")
-                await remove_message(context.bot, repo, store, config, cached.id, reason="banned by admin", remove_for_mods=True)
+                await remove_message(context.bot, repo, store, config, cached.id, reason="banned by admin", remove_for_mods=False, notify_sender=False)
+                await remove_message(context.bot, repo, store, config, cached.id, reason="banned by admin", remove_for_mods=True, notify_sender=False)
                 purged += 1
         if source:
             source.metadata.setdefault("mod_actions", []).append(
@@ -486,7 +520,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except TelegramError as exc:
             log_telegram_error(LOGGER, "callback.ban_notify", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=get_repo(context), user_id=sender_id)
             pass
-        await query.answer(f"Banned user. Purged {purged} cached messages.", show_alert=True)
+        await query.answer(f"Banned {display_identity(banned_sender, config, viewer=user)}. Purged {purged} cached messages.", show_alert=True)
         return
     if data.startswith("delconf:"):
         if not user or not user.is_mod_or_admin:
@@ -500,7 +534,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer(f"Whisper deleted ({count} copies).")
             return
         reason = "deleted by admin" if user.is_admin else "deleted by moderator"
-        count = await remove_message(context.bot, get_repo(context), get_store(context), get_config(context), message_id, reason=reason, remove_for_mods=True)
+        count = await remove_message(context.bot, get_repo(context), get_store(context), get_config(context), message_id, reason=reason, remove_for_mods=True, notify_sender=False)
         await query.edit_message_text(f"Deleted ({count} copies).")
         await query.answer(f"Deleted ({count} copies).")
         return

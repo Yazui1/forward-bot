@@ -202,7 +202,8 @@ class DeliveryQueue:
         if not pending:
             self._recipient_queued.discard(recipient_id)
             return
-        pause_wait = self._recipient_pause_until[recipient_id] - asyncio.get_running_loop().time()
+        pause_wait = self._recipient_pause_until[recipient_id] - \
+            asyncio.get_running_loop().time()
         if pause_wait > 0:
             self._recipient_queued.discard(recipient_id)
             task = self._recipient_wake_tasks.get(recipient_id)
@@ -276,8 +277,26 @@ class DeliveryQueue:
                 retry_after = float(getattr(exc, "retry_after", 1) or 1)
                 log_telegram_error(LOGGER, "delivery.retry_after", exc, aggregate=self._aggregate_logger,
                                    message_id=item.message_id, recipient_id=item.recipient_id, retry_after=retry_after)
-                self._pause_recipient_for_retry_after(item.recipient_id, retry_after)
+                self._pause_recipient_for_retry_after(
+                    item.recipient_id, retry_after)
                 return "requeued"
+            except BadRequest as exc:
+                if _is_reply_rejection(exc):
+                    LOGGER.info(
+                        "telegram delivery.reply_rejected failed: %s fields=%s",
+                        exc,
+                        {"message_id": item.message_id, "recipient_id": item.recipient_id},
+                    )
+                    if self._aggregate_logger:
+                        self._aggregate_logger.increment("telegram.delivery.reply_rejected.BadRequest")
+                    return "reply_rejected"
+                log_telegram_error(LOGGER, "delivery.bad_request", exc, aggregate=self._aggregate_logger,
+                                   message_id=item.message_id, recipient_id=item.recipient_id)
+                msg = str(exc).lower()
+                if "chat not found" in msg or "bot was blocked" in msg:
+                    self.repo.mark_left(item.recipient_id)
+                    return "chat_not_found_left"
+                return "bad_request"
             except (TimedOut, NetworkError) as exc:
                 log_telegram_error(LOGGER, "delivery.network_retry", exc, aggregate=self._aggregate_logger,
                                    message_id=item.message_id, recipient_id=item.recipient_id, attempt=attempt + 1)
@@ -292,14 +311,6 @@ class DeliveryQueue:
                                    message_id=item.message_id, recipient_id=item.recipient_id)
                 self.repo.mark_left(item.recipient_id)
                 return "chat_not_found_left"
-            except BadRequest as exc:
-                log_telegram_error(LOGGER, "delivery.bad_request", exc, aggregate=self._aggregate_logger,
-                                   message_id=item.message_id, recipient_id=item.recipient_id)
-                msg = str(exc).lower()
-                if "chat not found" in msg or "bot was blocked" in msg:
-                    self.repo.mark_left(item.recipient_id)
-                    return "chat_not_found_left"
-                return "bad_request"
             except TelegramError as exc:
                 log_telegram_error(LOGGER, "delivery.telegram_error", exc, aggregate=self._aggregate_logger,
                                    message_id=item.message_id, recipient_id=item.recipient_id)
@@ -326,6 +337,15 @@ class DeliveryQueue:
                     item, recipient.telegram_id)
                 if not reply_to:
                     return "reply_missing"
+            if current_message.removed_for_mods and recipient.is_mod_or_admin:
+                try:
+                    return await self._send_deleted_tombstone(item, reply_to)
+                except BadRequest as exc:
+                    if reply_to and _is_reply_rejection(exc):
+                        log_telegram_error(LOGGER, "delivery.reply_rejected", exc, aggregate=self._aggregate_logger,
+                                           message_id=item.message_id, recipient_id=item.recipient_id, reply_to=reply_to)
+                        return "reply_rejected"
+                    raise
             if current_message.deleted:
                 try:
                     return await self._send_deleted_tombstone(item, reply_to)
@@ -354,7 +374,8 @@ class DeliveryQueue:
                     log_telegram_error(LOGGER, "delivery.reply_rejected", exc, aggregate=self._aggregate_logger,
                                        message_id=item.message_id, recipient_id=item.recipient_id, reply_to=reply_to)
                     return "reply_rejected"
-                raise
+                else:
+                    raise
             if not sent:
                 return "bad_request"
             delivery = self.store.add_delivery(
@@ -404,21 +425,6 @@ class DeliveryQueue:
             log_telegram_error(LOGGER, "delivery.tombstone_edit", exc, aggregate=self._aggregate_logger,
                                recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
             pass
-        if content_type in {"photo", "video", "animation", "document"}:
-            try:
-                await self._bot.edit_message_caption(
-                    chat_id=delivery.recipient_id,
-                    message_id=delivery.telegram_message_id,
-                    caption="<i>Message removed.</i>",
-                    parse_mode="HTML",
-                )
-                self.store.mark_delivery_deleted(
-                    delivery.id, tombstone_message_id=delivery.telegram_message_id, kind="caption_edited")
-                return
-            except TelegramError as exc:
-                log_telegram_error(LOGGER, "delivery.tombstone_caption", exc, aggregate=self._aggregate_logger,
-                                   recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
-                pass
         try:
             await self._bot.delete_message(delivery.recipient_id, delivery.telegram_message_id)
         except TelegramError as exc:
@@ -457,7 +463,8 @@ class DeliveryQueue:
     def _pause_recipient_for_retry_after(self, recipient_id: int, retry_after: float) -> None:
         loop = asyncio.get_running_loop()
         pause_until = loop.time() + max(1.0, retry_after)
-        self._recipient_pause_until[recipient_id] = max(self._recipient_pause_until[recipient_id], pause_until)
+        self._recipient_pause_until[recipient_id] = max(
+            self._recipient_pause_until[recipient_id], pause_until)
 
     def _inactive_drop(self, recipient: User, item: DeliveryItem) -> bool:
         if item.is_system or recipient.is_mod_or_admin:
@@ -470,7 +477,7 @@ class DeliveryQueue:
         if recipient.telegram_id not in self.store.inactive_notified and self._bot:
             self.store.inactive_notified.add(recipient.telegram_id)
             asyncio.create_task(self._bot.send_message(
-                recipient.telegram_id, "You are inactive. Text is paused and media is sampled until you use the bot again."))
+                recipient.telegram_id, "You are currently inactive, so most non-system messages are not being delivered. Send meaningful messages or interact normally to become active again. Abuse such as dotposting or other low-effort activity padding is not allowed."))
         if item.content_type == "text":
             return True
         chance = float(self.config.get(
@@ -503,8 +510,17 @@ class DeliveryQueue:
                     message_id=item.forward_from_message_id,
                 )
             except BadRequest as exc:
-                log_telegram_error(LOGGER, "delivery.forward_fallback", exc, aggregate=self._aggregate_logger,
-                                   message_id=item.message_id, recipient_id=item.recipient_id)
+                if _is_forward_rejection(exc):
+                    LOGGER.info(
+                        "telegram delivery.forward_fallback skipped: %s fields=%s",
+                        exc,
+                        {"message_id": item.message_id, "recipient_id": item.recipient_id},
+                    )
+                    if self._aggregate_logger:
+                        self._aggregate_logger.increment("telegram.delivery.forward_fallback.BadRequest")
+                else:
+                    log_telegram_error(LOGGER, "delivery.forward_fallback", exc, aggregate=self._aggregate_logger,
+                                       message_id=item.message_id, recipient_id=item.recipient_id)
                 pass
         if blurred:
             notice = "Uh oh 😭 The message was blurred due to your loss rate, earn credits to reduce your loss rate, see /help, /info and /creditstats for more info."
@@ -519,12 +535,14 @@ class DeliveryQueue:
                 preview = await self.media.blurred_preview(item.message_id)
                 if preview:
                     sent = await self._bot.send_photo(
-                        photo=InputFile(BytesIO(preview), filename="blurred.jpg"),
+                        photo=InputFile(BytesIO(preview),
+                                        filename="blurred.jpg"),
                         caption=caption,
                         **kwargs,
                     )
                     if sent.photo:
-                        self.media.set_blurred_file_id(item.message_id, sent.photo[-1].file_id)
+                        self.media.set_blurred_file_id(
+                            item.message_id, sent.photo[-1].file_id)
                     return sent
             text = f"{item.text}\n\n{notice}" if item.text else notice
             return await self._bot.send_message(text=text, **kwargs)
@@ -560,6 +578,11 @@ class DeliveryQueue:
 def _is_reply_rejection(exc: BadRequest) -> bool:
     text = str(exc).lower()
     return "reply" in text and ("not found" in text or "message to be replied" in text or "invalid" in text)
+
+
+def _is_forward_rejection(exc: BadRequest) -> bool:
+    text = str(exc).lower()
+    return "forward" in text and "not found" in text
 
 
 def _render_text(text: str | None, is_system: bool, *, fallback: str | None = None, trusted_html: bool = False) -> str | None:
