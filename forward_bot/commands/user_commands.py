@@ -24,6 +24,7 @@ from forward_bot.commands.common import (
     resolve_replied_sender,
     resolve_target_user,
     resolve_user_reference,
+    touch_activity,
 )
 from forward_bot.commands.help_registry import HelpRegistry
 from forward_bot.crypto.tripcode import make_tripcode
@@ -87,7 +88,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     first_seen = created
     joining_now = not user.has_started
     repo.set_started(user.telegram_id, True)
-    repo.touch_activity(user.telegram_id)
+    touch_activity(context, user.telegram_id)
     if not user.about_seen:
         await msg.reply_text(repo.get_about())
         repo.set_about_seen(user.telegram_id)
@@ -190,7 +191,7 @@ async def _toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, column: st
     repo = get_repo(context)
     new = not bool(getattr(user, column))
     repo.set_preference(user.telegram_id, column, new)
-    repo.touch_activity(user.telegram_id)
+    touch_activity(context, user.telegram_id)
     await update.effective_message.reply_text(f"{label}: {'on' if new else 'off'}")
 
 
@@ -274,7 +275,7 @@ async def block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     repo = get_repo(context)
     repo.add_block(user.telegram_id, target.telegram_id)
-    repo.touch_activity(user.telegram_id)
+    touch_activity(context, user.telegram_id)
     suffix = "\nModeration visibility is preserved for mods/admins." if user.is_mod_or_admin else ""
     await command_reply(update, context, "Sender blocked." + suffix)
 
@@ -284,7 +285,7 @@ async def unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     repo = get_repo(context)
     removed = repo.remove_latest_block(user.telegram_id) if user else None
     if user:
-        repo.touch_activity(user.telegram_id)
+        touch_activity(context, user.telegram_id)
     await update.effective_message.reply_text("Most recent block removed." if removed else "You have no blocked users.")
 
 
@@ -321,7 +322,7 @@ async def credit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await command_reply(update, context, "Insufficient credits.")
             return
         sender, target = repo.transfer_credits(user.telegram_id, target.telegram_id, amount)
-        repo.touch_activity(user.telegram_id)
+        touch_activity(context, user.telegram_id)
         await command_reply(update, context, f"Sent {amount:.2f} credits to {display_identity_html(target, config, viewer=user)}. Balance: {sender.credits:.2f}", parse_mode="HTML")
         try:
             await context.bot.send_message(target.telegram_id, f"You received {amount:.2f} credits.", reply_to_message_id=await reply_to_for_target(update, context, target.telegram_id))
@@ -450,7 +451,7 @@ async def gamble(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         applied, updated = apply_credit(repo, config, user.telegram_id, -amount, "gamble_loss", cap_positive=False)
         result = f"Lost {abs(applied):.2f}"
-    repo.touch_activity(user.telegram_id)
+    touch_activity(context, user.telegram_id)
     await update.effective_message.reply_text(f"{result}. Balance: {updated.credits:.2f}")
 
 
@@ -468,7 +469,7 @@ async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not repo.get_invite(code):
                 break
         repo.create_invite(user.telegram_id, code)
-    repo.touch_activity(user.telegram_id)
+    touch_activity(context, user.telegram_id)
     try:
         me = await context.bot.get_me()
         text = f"https://t.me/{me.username}?start={code}" if me.username else code
@@ -599,8 +600,7 @@ async def _send_whisper(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         if prior_msg and prior_msg.sender_id == target.telegram_id and prior_msg.source_chat_id == target.telegram_id:
             reply_to = prior_msg.source_message_id
         else:
-            prior = store.delivery_for_recipient(reply_to_message_id, target.telegram_id)
-            reply_to = prior.telegram_message_id if prior else None
+            reply_to = store.delivery_reply_for_recipient(reply_to_message_id, target.telegram_id)
     elif reply_to_whisper_id:
         priorw = next((d for d in store.deliveries_for_whisper(reply_to_whisper_id) if d.recipient_id == target.telegram_id), None)
         reply_to = priorw.telegram_message_id if priorw else None
@@ -628,7 +628,7 @@ async def _send_whisper(update: Update, context: ContextTypes.DEFAULT_TYPE, user
                 pass
     if cost:
         _, user = apply_credit(repo, config, user.telegram_id, -cost, "whisper_cost", cap_positive=False)
-    repo.touch_activity(user.telegram_id)
+    touch_activity(context, user.telegram_id)
     await command_reply(update, context, f"Whisper sent. Cost: {cost:.2f}. Balance: {user.credits:.2f}")
 
 
@@ -637,8 +637,7 @@ def _whisper_mirror_reply_to(store, recipient_id: int, reply_to_message_id: int 
         prior_msg = store.get_message(reply_to_message_id)
         if prior_msg and prior_msg.sender_id == recipient_id and prior_msg.source_chat_id == recipient_id:
             return prior_msg.source_message_id
-        delivery = store.delivery_for_recipient(reply_to_message_id, recipient_id)
-        return delivery.telegram_message_id if delivery else None
+        return store.delivery_reply_for_recipient(reply_to_message_id, recipient_id)
     if reply_to_whisper_id:
         delivery = next((d for d in store.deliveries_for_whisper(reply_to_whisper_id) if d.recipient_id == recipient_id), None)
         return delivery.telegram_message_id if delivery else None
@@ -653,18 +652,22 @@ async def wmods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     repo = get_repo(context)
     store = get_store(context)
-    body = f"<i><b>Modwhisper:</b></i> {html_escape(text)}\n\n~ mods"
+    body = f"<i><b>Modwhisper:</b></i> {html_escape(text)}"
+    whisper_obj = store.add_whisper(sender_id=user.telegram_id, target_id=0, text=body, is_modwhisper=True)
+    if update.effective_message:
+        store.add_whisper_delivery(whisper_obj.id, user.telegram_id, update.effective_message.message_id)
+    sent_count = 0
     for target in repo.list_users():
         if target.is_mod_or_admin and target.has_started and target.telegram_id != user.telegram_id:
             try:
                 msg = await context.bot.send_message(target.telegram_id, body, parse_mode="HTML")
-                whisper_obj = store.add_whisper(sender_id=user.telegram_id, target_id=target.telegram_id, text=body, is_modwhisper=True)
                 store.add_whisper_delivery(whisper_obj.id, target.telegram_id, msg.message_id)
+                sent_count += 1
             except TelegramError as exc:
                 log_telegram_error(LOGGER, "wmods.send", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=target.telegram_id)
                 pass
-    repo.touch_activity(user.telegram_id)
-    await update.effective_message.reply_text("Message sent.")
+    touch_activity(context, user.telegram_id)
+    await update.effective_message.reply_text(f"Message sent ({sent_count} mod copies).")
 
 
 async def sauce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -816,6 +819,6 @@ async def fight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     fight_req.target_message_id = sent.message_id
     _, updated = apply_credit(repo, config, user.telegram_id, -fee, "fight_fee", cap_positive=False)
-    repo.touch_activity(user.telegram_id)
+    touch_activity(context, user.telegram_id)
     balance = updated.credits if updated else user.credits - fee
     await command_reply(update, context, f"Fight sent. Fee: {fee:.2f}. Balance: {balance:.2f}.")

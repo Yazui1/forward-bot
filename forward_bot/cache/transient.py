@@ -122,6 +122,7 @@ class TransientStore:
         self.remove_vote_times: dict[int, list[datetime]] = {}
         self.global_remove_events: list[datetime] = []
         self.mod_notes: dict[int, list[tuple[int, int]]] = {}
+        self.mod_note_index: dict[tuple[int, int], int] = {}
         self.sender_snapshots: dict[int, tuple[datetime, dict[str, Any]]] = {}
         self.confirmations: dict[int, datetime] = {}
         self.retries: dict[str, tuple[datetime, dict[str, Any]]] = {}
@@ -247,6 +248,25 @@ class TransientStore:
 
     def add_mod_note(self, message_id: int, recipient_id: int, telegram_message_id: int) -> None:
         self.mod_notes.setdefault(message_id, []).append((recipient_id, telegram_message_id))
+        self.mod_note_index[(recipient_id, telegram_message_id)] = message_id
+
+    def resolve_mod_note(self, recipient_id: int, telegram_message_id: int) -> TransientMessage | None:
+        return self.get_message(self.mod_note_index.get((recipient_id, telegram_message_id)))
+
+    def mod_note_for_recipient(self, message_id: int, recipient_id: int) -> int | None:
+        for note_recipient_id, note_message_id in self.mod_notes.get(message_id, []):
+            if note_recipient_id == recipient_id:
+                return note_message_id
+        return None
+
+    def delivery_reply_for_recipient(self, message_id: int, recipient_id: int) -> int | None:
+        delivery_id = self.message_recipient_index.get((message_id, recipient_id))
+        if delivery_id is None:
+            return None
+        delivery = self.deliveries.get(delivery_id)
+        if not delivery or self._expired(delivery.created_at):
+            return None
+        return delivery.tombstone_message_id or delivery.telegram_message_id
 
     def set_sender_snapshot(self, message_id: int, snapshot: dict[str, Any]) -> None:
         self.sender_snapshots[message_id] = (now_utc(), snapshot)
@@ -385,6 +405,11 @@ class TransientStore:
         self.sender_snapshots = {k: v for k, v in self.sender_snapshots.items() if not self._sender_snapshot_expired(v[0]) and k in live_message_ids}
         self.remove_votes = {k: v for k, v in self.remove_votes.items() if k in live_message_ids}
         self.mod_notes = {k: v for k, v in self.mod_notes.items() if k in live_message_ids}
+        self.mod_note_index = {
+            (recipient_id, telegram_message_id): message_id
+            for message_id, notes in self.mod_notes.items()
+            for recipient_id, telegram_message_id in notes
+        }
         self.delivery_stats = {k: v for k, v in self.delivery_stats.items() if k in live_message_ids}
         self.votes = {
             vote for vote in self.votes

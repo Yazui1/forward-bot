@@ -10,13 +10,13 @@ from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
 
 from forward_bot.cache.transient import TransientMessage
-from forward_bot.commands.common import ensure_user, get_config, get_repo, get_store
+from forward_bot.commands.common import ensure_user, get_config, get_repo, get_store, touch_activity
 from forward_bot.db.repository import User
 from forward_bot.features.credits import apply_credit, downvote_cost, downvote_drop_seconds, maybe_apply_negative_cooldown
 from forward_bot.features.media import MediaInspection, extract_payload
 from forward_bot.features.remove_votes import vote_to_remove
 from forward_bot.features.tagging import TAG_BLOCKED, TAG_DUPLICATE, TAG_OK, TAG_POTENTIALLY_UNWANTED, TAG_QUESTIONABLE
-from forward_bot.features.tombstones import mark_for_moderation_action, punish_sender, remove_for_moderators, remove_message, remove_whisper, revert_remove_vote, send_mod_notes
+from forward_bot.features.tombstones import mark_for_moderation_action, punish_sender, punish_whisper_sender, remove_for_moderators, remove_message, remove_whisper, revert_remove_vote, send_mod_notes, send_whisper_mod_notes
 from forward_bot.identity import display_identity, display_identity_html
 from forward_bot.logging_utils import log_telegram_error
 from forward_bot.messages import MSG_BANNED, MSG_CACHE_MISS, MSG_RATE_LIMITED, MSG_USE_START
@@ -40,7 +40,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user.is_banned:
         await _reply_to_message(context, msg, MSG_BANNED)
         return
-    repo.touch_activity(user.telegram_id)
+    touch_activity(context, user.telegram_id)
     user = repo.get_user(user.telegram_id) or user
     if user.active_cooldown_seconds > 0 and not user.is_mod_or_admin:
         _aggregate(context, "pipeline.cooldown_attempt")
@@ -97,7 +97,7 @@ async def submit_text(
         _aggregate(context, "pipeline.rate_limited")
         await _reply_to_message(context, msg, MSG_RATE_LIMITED, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"Retry in {retry}s", callback_data=f"retry:{user.telegram_id}")]]))
         return
-    repo.touch_activity(user.telegram_id)
+    touch_activity(context, user.telegram_id)
     payload = {"content_type": "text", "text": text, "media_file_id": None, "thumbnail_file_id": None, "media_kind": None, "mime_type": None,
                "sticker_set_name": None, "is_animated": False, "is_video": False, "parse_mode": None, "force_remove_buttons": force_remove_buttons}
     await _process_payload(update, context, user, payload, source_message=msg, identity_mode=identity_mode)
@@ -118,7 +118,7 @@ async def _broadcast_cooldown_attempt(
     recipients = [u for u in repo.list_users(
     ) if u.has_started and u.is_mod_or_admin and not u.is_banned]
     for recipient in recipients:
-        body, identity_parse_mode = _apply_identity(payload.get("text") or "", user, identity_mode)
+        body, identity_parse_mode = _apply_identity(payload.get("text") or "", user, identity_mode, payload.get("content_type", "text"))
         parse_mode = identity_parse_mode or payload.get("parse_mode")
         text = _cooldown_attempt_text(user, recipient, config, body, parse_mode)
         reply_target_id = _resolve_reply_target(source_message, user, context)
@@ -197,13 +197,14 @@ async def _process_payload(
     identity_mode: str | None = None,
 ) -> TransientMessage | None:
     text = payload.get("text") or ""
-    payload["text"], identity_parse_mode = _apply_identity(text, user, identity_mode)
+    payload["text"], identity_parse_mode = _apply_identity(text, user, identity_mode, payload.get("content_type", "text"))
     if identity_parse_mode:
         payload["parse_mode"] = identity_parse_mode
     reply_target_id = _resolve_reply_target(source_message, user, context)
     if reply_target_id == -1:
         await _reply_to_message(context, source_message, MSG_CACHE_MISS)
         return None
+    mod_note_reply = _resolve_mod_note_reply(source_message, user, context)
     store = get_store(context)
     tm = store.add_message(
         sender_id=user.telegram_id,
@@ -223,8 +224,12 @@ async def _process_payload(
         metadata={
             "forward_from_chat_id": payload.get("forward_from_chat_id"),
             "forward_from_message_id": payload.get("forward_from_message_id"),
+            "mod_only": bool(mod_note_reply),
+            "reply_to_mod_note": bool(mod_note_reply),
         },
     )
+    if mod_note_reply:
+        tm.reply_to_message_id = mod_note_reply
     media_service = context.application.bot_data["media"]
     inspection = await media_service.inspect(context.bot, tm.id, payload)
     tagger = context.application.bot_data["tagger"]
@@ -265,10 +270,11 @@ async def _process_payload(
     return tm
 
 
-def _apply_identity(text: str, user: User, identity_mode: str | None) -> tuple[str, str | None]:
+def _apply_identity(text: str, user: User, identity_mode: str | None, content_type: str = "text") -> tuple[str, str | None]:
     if identity_mode == "signed" or (identity_mode is None and user.sign_enabled):
-        suffix = f"~ @{user.username}" if user.username else "~ signed"
-        return (f"{text} {suffix}" if text else suffix), None
+        identity = f"@{user.username}" if user.username else "signed"
+        suffix = f"~ {identity}" if text else identity
+        return (f"{html_escape(text)} <i>{html_escape(suffix)}</i>" if text else f"<i>{html_escape(suffix)}</i>"), "HTML"
     if (identity_mode == "tripcode" or (identity_mode is None and user.tripcode_enabled)) and user.tripcode_name and user.tripcode_hash:
         trip = f"<b>{html_escape(user.tripcode_name)}</b> !{html_escape(user.tripcode_hash)}"
         return (f"{trip}:\n{html_escape(text)}" if text else trip), "HTML"
@@ -289,7 +295,17 @@ def _resolve_reply_target(source_message: Message, user: User, context: ContextT
         return own.id
     if store.resolve_whisper_delivery(user.telegram_id, source_message.reply_to_message.message_id):
         return None
+    mod_note_msg = store.resolve_mod_note(user.telegram_id, source_message.reply_to_message.message_id)
+    if mod_note_msg:
+        return mod_note_msg.id
     return -1
+
+
+def _resolve_mod_note_reply(source_message: Message, user: User, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    if not user.is_mod_or_admin or not source_message.reply_to_message:
+        return None
+    msg = get_store(context).resolve_mod_note(user.telegram_id, source_message.reply_to_message.message_id)
+    return msg.id if msg else None
 
 
 def _sender_snapshot(user: User, inspection, reason: str | None) -> dict[str, Any]:
@@ -309,7 +325,10 @@ async def distribute_message(context: ContextTypes.DEFAULT_TYPE, tm: TransientMe
     repo = context.application.bot_data["repo"]
     config = get_config(context)
     sender = repo.get_user(tm.sender_id) if tm.sender_id else None
-    recipients = repo.eligible_recipients(tm.sender_id)
+    if tm.metadata.get("mod_only"):
+        recipients = [u for u in repo.list_users() if u.has_started and u.is_mod_or_admin and not u.is_banned and u.telegram_id != tm.sender_id]
+    else:
+        recipients = repo.eligible_recipients(tm.sender_id)
     if tm.tag == TAG_POTENTIALLY_UNWANTED:
         recipients = [
             u for u in recipients if u.is_mod_or_admin or not u.hide_potentially_unwanted]
@@ -323,7 +342,7 @@ async def distribute_message(context: ContextTypes.DEFAULT_TYPE, tm: TransientMe
         reason = "text_message_reward" if tm.content_type == "text" else "media_message_reward"
         reward = float(config.get(f"credits.{reason}", 0) or 0)
         apply_credit(repo, config, sender.telegram_id, reward, reason)
-        repo.touch_activity(sender.telegram_id)
+        touch_activity(context, sender.telegram_id)
 
 
 async def _deliver_to_mods(context: ContextTypes.DEFAULT_TYPE, tm: TransientMessage, notice: str) -> None:
@@ -360,7 +379,7 @@ async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TY
     if payload.get("content_type") != tm.content_type:
         await _reply_to_message(context, msg, "Edited content type must match original.")
         return
-    payload["text"], identity_parse_mode = _apply_identity(payload.get("text") or "", user, None)
+    payload["text"], identity_parse_mode = _apply_identity(payload.get("text") or "", user, None, payload.get("content_type", "text"))
     if identity_parse_mode:
         payload["parse_mode"] = identity_parse_mode
     result = await context.application.bot_data["tagger"].classify(
@@ -388,7 +407,7 @@ async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TY
     if not user.is_admin:
         apply_credit(repo, config, user.telegram_id, -
                      cost, "edit_cost", cap_positive=False)
-    repo.touch_activity(user.telegram_id)
+    touch_activity(context, user.telegram_id)
     updated_user = repo.get_user(user.telegram_id)
     await _reply_to_message(context, msg, f"Edited {updated} copies. Cost: {cost:.2f}. Balance: {updated_user.credits:.2f}")
 
@@ -467,6 +486,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Not allowed.", show_alert=True)
             return
         message_id = int(data.split(":")[1])
+        if message_id < 0:
+            text = await punish_whisper_sender(context.bot, get_repo(context), get_store(context), get_config(context), abs(message_id), user.telegram_id)
+            await query.answer(text, show_alert=True)
+            return
         text = await punish_sender(context.bot, get_repo(context), get_store(context), get_config(context), message_id, user.telegram_id)
         await query.answer(text, show_alert=True)
         return
@@ -475,6 +498,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Not allowed.", show_alert=True)
             return
         message_id = int(data.split(":")[1])
+        if message_id < 0:
+            reason = "removed for moderators"
+            count = await remove_whisper(context.bot, get_repo(context), get_store(context), get_config(context), abs(message_id), reason, remove_for_mods=True, send_note=False, notify_sender=False)
+            await send_whisper_mod_notes(context.bot, get_repo(context), get_store(context), get_config(context), abs(message_id), reason=reason, removed_for_mods=True)
+            await query.answer(f"Removed {count} moderator copies.", show_alert=True)
+            return
         text = await remove_for_moderators(context.bot, get_repo(context), get_store(context), get_config(context), message_id, user.telegram_id)
         await query.answer(text, show_alert=True)
         return
@@ -491,58 +520,56 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Admin only.", show_alert=True)
             return
         _, message_id_s, sender_id_s = data.split(":", 2)
-        sender_id = int(sender_id_s)
+        message_id = int(message_id_s)
         repo = get_repo(context)
         store = get_store(context)
         config = get_config(context)
-        source = store.get_message(int(message_id_s))
+        source = store.get_message(message_id) if message_id > 0 else None
+        whisper = store.whispers.get(abs(message_id)) if message_id < 0 else None
+        sender_id = int(sender_id_s) or (whisper.sender_id if whisper else 0)
+        if not sender_id:
+            await query.answer("Sender not found.", show_alert=True)
+            return
         banned_sender = repo.set_role(sender_id, banned=True)
         purged = 0
         for cached in list(store.messages.values()):
-            if cached.sender_id == sender_id and not cached.deleted:
-                cached.metadata.setdefault("mod_actions", []).append(
-                    "Banned and purged by admin")
-                await remove_message(context.bot, repo, store, config, cached.id, reason="banned by admin", remove_for_mods=False, notify_sender=False)
-                await remove_message(context.bot, repo, store, config, cached.id, reason="banned by admin", remove_for_mods=True, notify_sender=False)
+            if cached.sender_id != sender_id:
+                continue
+            touched = False
+            if not cached.deleted:
+                await remove_message(context.bot, repo, store, config, cached.id, reason="banned", remove_for_mods=False, notify_sender=False, send_note=False)
+                touched = True
+            if not cached.removed_for_mods:
+                await remove_message(context.bot, repo, store, config, cached.id, reason="banned", remove_for_mods=True, notify_sender=False, send_note=False)
+                touched = True
+            if touched:
                 purged += 1
         if source:
-            source.metadata.setdefault("mod_actions", []).append(
-                f"Banned sender and purged {purged} cached message(s)")
+            source.metadata["ban_purged_count"] = purged
             await send_mod_notes(
                 context.bot,
                 repo,
                 store,
                 config,
                 source.id,
-                reason="banned by admin",
-                voter_ids=list(store.remove_votes.get(source.id, set())),
+                reason="banned",
+                voter_ids=[],
+            )
+        elif whisper:
+            await send_whisper_mod_notes(
+                context.bot,
+                repo,
+                store,
+                config,
+                whisper.id,
+                reason="banned",
             )
         try:
-            await context.bot.send_message(sender_id, "You are banned.", reply_to_message_id=source.source_message_id if source else None)
+            await context.bot.send_message(sender_id, "You are banned.", reply_to_message_id=source.source_message_id if source else store.deliveries_for_whisper(whisper.id)[0].telegram_message_id if whisper else None)
         except TelegramError as exc:
             log_telegram_error(LOGGER, "callback.ban_notify", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=get_repo(context), user_id=sender_id)
             pass
         await query.answer(f"Banned {display_identity(banned_sender, config, viewer=user)}. Purged {purged} cached messages.", show_alert=True)
-        return
-    if data.startswith("delconf:"):
-        if not user or not user.is_mod_or_admin:
-            await query.answer("Not allowed.", show_alert=True)
-            return
-        message_id = int(data.split(":")[1])
-        if message_id < 0:
-            reason = "deleted by admin" if user.is_admin else "deleted by moderator"
-            count = await remove_whisper(context.bot, get_repo(context), get_store(context), abs(message_id), reason)
-            await query.edit_message_text(f"Whisper deleted ({count} copies).")
-            await query.answer(f"Whisper deleted ({count} copies).")
-            return
-        reason = "deleted by admin" if user.is_admin else "deleted by moderator"
-        count = await remove_message(context.bot, get_repo(context), get_store(context), get_config(context), message_id, reason=reason, remove_for_mods=True, notify_sender=False)
-        await query.edit_message_text(f"Deleted ({count} copies).")
-        await query.answer(f"Deleted ({count} copies).")
-        return
-    if data.startswith("delcancel:"):
-        await query.edit_message_text("Delete cancelled.")
-        await query.answer("Delete cancelled.")
         return
     if data.startswith("facc:") or data.startswith("fdec:"):
         await _fight_callback(update, context, accept=data.startswith("facc:"))
@@ -569,7 +596,7 @@ async def _fight_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
         return
     if not accept:
         fight.status = "declined"
-        repo.touch_activity(user.telegram_id)
+        touch_activity(context, user.telegram_id)
         try:
             await context.bot.send_message(fight.sender_id, "Fight declined.", reply_to_message_id=fight.command_message_id)
         except TelegramError as exc:
@@ -603,8 +630,8 @@ async def _fight_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
     loser_delta, loser_after = apply_credit(
         repo, config, loser.telegram_id, -fight.stake, "fight_loss", cap_positive=False)
     maybe_apply_negative_cooldown(repo, config, loser_after)
-    repo.touch_activity(sender.telegram_id)
-    repo.touch_activity(target.telegram_id)
+    touch_activity(context, sender.telegram_id)
+    touch_activity(context, target.telegram_id)
     fight.status = "completed"
     for participant in (sender, target):
         refreshed = repo.get_user(participant.telegram_id)
@@ -647,7 +674,7 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         str(config.get("moderation.delete_reaction_emoji", "✍️")))
     if delete_emoji in emojis and user.is_mod_or_admin:
         if delivery:
-            reason = "deleted by admin reaction" if user.is_admin else "deleted by moderator reaction"
+            reason = "deleted by moderator"
             subject = store.get_message(delivery.message_id)
             if subject:
                 subject.metadata.setdefault("mod_actions", []).append(reason)
@@ -655,19 +682,18 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if user.is_admin:
                 await remove_message(context.bot, repo, store, config, delivery.message_id, reason=reason, remove_for_mods=False)
             else:
-                markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Confirm", callback_data=f"delconf:{delivery.message_id}:{subject.sender_id if subject and subject.sender_id else 0}"),
-                    InlineKeyboardButton("Cancel", callback_data=f"delcancel:{delivery.message_id}"),
-                ]])
+                await remove_message(context.bot, repo, store, config, delivery.message_id, reason=reason, remove_for_mods=False)
+        elif wdel:
+            whisper = store.whispers.get(wdel.whisper_id)
+            if not whisper or whisper.deleted:
                 try:
-                    await context.bot.send_message(
-                        user.telegram_id,
-                        "Confirm moderator delete?",
-                        reply_to_message_id=reaction.message_id,
-                        reply_markup=markup,
-                    )
+                    await context.bot.send_message(user.telegram_id, MSG_CACHE_MISS, reply_to_message_id=reaction.message_id)
                 except TelegramError as exc:
-                    log_telegram_error(LOGGER, "reaction.delete_confirm", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
+                    log_telegram_error(LOGGER, "reaction.cache_miss", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
+                    pass
+            else:
+                whisper_id = _merge_related_modwhispers(store, whisper)
+                await remove_whisper(context.bot, repo, store, config, whisper_id, "deleted by moderator")
         else:
             try:
                 await context.bot.send_message(user.telegram_id, MSG_CACHE_MISS, reply_to_message_id=reaction.message_id)
@@ -695,6 +721,30 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except TelegramError as exc:
             log_telegram_error(LOGGER, "reaction.cache_miss", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
             pass
+
+
+def _merge_related_modwhispers(store, whisper) -> int:
+    if not whisper.is_modwhisper:
+        return whisper.id
+    related = [
+        other for other in store.whispers.values()
+        if other.id != whisper.id
+        and other.is_modwhisper
+        and not other.deleted
+        and other.sender_id == whisper.sender_id
+        and other.text == whisper.text
+        and abs((other.created_at - whisper.created_at).total_seconds()) <= 30
+    ]
+    if not related:
+        return whisper.id
+    target_ids = store.whisper_delivery_by_whisper_index.setdefault(whisper.id, set())
+    for other in related:
+        for delivery in store.deliveries_for_whisper(other.id):
+            delivery.whisper_id = whisper.id
+            target_ids.add(delivery.id)
+        store.whisper_delivery_by_whisper_index.pop(other.id, None)
+        other.deleted = True
+    return whisper.id
 
 
 async def _apply_vote(context: ContextTypes.DEFAULT_TYPE, voter: User, sender_id: int, key: str, *, up: bool, voter_reply_to: int | None = None) -> None:

@@ -82,15 +82,30 @@ class Harness:
         if bool(_get(self.config, "bot.launch.enabled", True)):
             self.launch_bot()
             await asyncio.sleep(float(_get(self.config, "timeouts.bot_start_seconds", 8)))
+            self.assert_bot_running()
         self.install_inboxes()
         return self
 
     async def __aexit__(self, *_: object) -> None:
-        for client, handler, builder in self.handlers:
-            client.remove_event_handler(handler, builder)
-        for account in self.accounts.values():
-            await account.client.disconnect()
-        self.stop_bot()
+        try:
+            if self.bot_process:
+                self.assert_no_bot_conflict()
+        finally:
+            for client, handler, builder in self.handlers:
+                client.remove_event_handler(handler, builder)
+            for account in self.accounts.values():
+                await account.client.disconnect()
+            self.stop_bot()
+
+    def assert_no_bot_conflict(self) -> None:
+        log_file = _resolve_path(str(_get(self.config, "bot.launch.log_file", "e2e/.runtime/bot.log")))
+        if not log_file.exists():
+            return
+        log_text = log_file.read_text(encoding="utf-8", errors="replace")
+        if "telegram.error.Conflict" not in log_text:
+            return
+        tail = "\n".join(log_text.splitlines()[-80:])
+        raise E2EFailure(f"Launched bot hit Telegram polling conflict; e2e result is invalid.\n{tail}")
 
     async def connect_accounts(self) -> None:
         account_cfg = self.config.get("accounts") or {}
@@ -189,6 +204,17 @@ class Harness:
             text=True,
         )
         print(f"bot: launched pid={self.bot_process.pid}, log={log_file}")
+
+    def assert_bot_running(self) -> None:
+        if not self.bot_process or self.bot_process.poll() is None:
+            return
+        log_text = ""
+        if self.bot_log_handle:
+            self.bot_log_handle.flush()
+        log_file = _resolve_path(str(_get(self.config, "bot.launch.log_file", "e2e/.runtime/bot.log")))
+        if log_file.exists():
+            log_text = "\n".join(log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-40:])
+        raise E2EFailure(f"Launched bot exited during startup with rc={self.bot_process.returncode}.\n{log_text}")
 
     def _runtime_bot_config(self, runtime_db: Path, owner_id: int) -> dict[str, Any]:
         launch = _get(self.config, "bot.launch", {})
@@ -385,6 +411,31 @@ class Harness:
             if message_id == expected:
                 return
 
+    async def fetch_bot_message(self, account_name: str, message: Any):
+        expected = _message_id(message) if not isinstance(message, int) else message
+        if expected is None:
+            raise E2EFailure(f"Cannot fetch id-less message: {message!r}")
+        account = self.accounts[account_name]
+        return await account.client.get_messages(account.bot_entity, ids=expected)
+
+    async def wait_reaction(self, account_name: str, message: Any, emoji: str, *, timeout: float | None = None) -> None:
+        expected = _message_id(message) if not isinstance(message, int) else message
+        if expected is None:
+            raise E2EFailure(f"Cannot wait for reaction on id-less message: {message!r}")
+        timeout = self.message_timeout if timeout is None else timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        last_reactions = None
+        while True:
+            current = await self.fetch_bot_message(account_name, expected)
+            last_reactions = getattr(current, "reactions", None) if current else None
+            if current and _message_has_reaction(current, emoji):
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise E2EFailure(f"Timed out waiting for {emoji!r} reaction on {account_name} message {expected}; reactions={last_reactions!r}")
+            await asyncio.sleep(min(0.5, remaining))
+
     async def assert_absent_text(self, account_name: str, needle: str, *, timeout: float | None = None) -> None:
         timeout = float(_get(self.config, "timeouts.absent_seconds", 3)
                         ) if timeout is None else timeout
@@ -503,11 +554,13 @@ async def _delete_vote_flow(h: Harness, prefix: str):
         label="user_b tombstone after delete-vote threshold",
     )
     sender_removed = await h.wait_reply_text("user_a", "Your message was removed:", source)
-    note = await h.wait_reply_text("owner", "Moderation removal", owner_copy)
+    note = await h.wait_reply_text("owner", "Moderation", owner_copy)
     required = {"Punish", "Remove for mods", "Revert", "Ban"}
     labels = set(h.button_texts(note))
     if not required.issubset(labels):
         raise E2EFailure(f"Mod dialog buttons missing. Have {sorted(labels)}")
+    if any(len(row) != 1 for row in (note.buttons or [])):
+        raise E2EFailure("Mod dialog buttons are not stacked vertically.")
     return {
         "source": source,
         "owner_copy": owner_copy,
@@ -591,9 +644,18 @@ async def scenario_mod_dialog_ban_purge(h: Harness) -> None:
     await h.click_button("owner", note, "Ban")
     await h.wait_for(
         "owner",
-        lambda msg: msg.id == note.id and "Banned sender and purged" in (msg.raw_text or ""),
+        lambda msg: msg.id == note.id and "Banned" in (msg.raw_text or "") and "Purged cached messages:" in (msg.raw_text or ""),
         label="mod note ban-purge action",
     )
+    updated_note = await h.wait_for(
+        "owner",
+        lambda msg: msg.id == note.id and "Banned" in (msg.raw_text or ""),
+        label="updated ban note",
+    )
+    if h.button_texts(updated_note):
+        raise E2EFailure(f"Ban note still has action buttons: {h.button_texts(updated_note)}")
+    if any(bad in (updated_note.raw_text or "") for bad in ("Voters:", "Actions:", "Banned sender")):
+        raise E2EFailure(f"Ban note contains stale moderation noise: {updated_note.raw_text!r}")
     await h.wait_for(
         "user_b",
         lambda msg: msg.id == second_b.id and "Message removed." in (
@@ -603,6 +665,331 @@ async def scenario_mod_dialog_ban_purge(h: Harness) -> None:
     banned = await h.wait_text("user_a", "You are banned.")
     h.assert_reply_to(banned, flow["source"], "Ban notice")
     print("PASS mod-dialog-ban-purge")
+
+
+async def scenario_reply_info_contexts(h: Harness) -> None:
+    await h.start_all()
+    h.clear_inboxes()
+
+    normal_marker = h.marker("info-normal")
+    normal_source = await h.send_text("user_a", normal_marker)
+    normal_owner = await h.wait_text("owner", normal_marker)
+    await h.send_text("owner", "/info", reply_to=normal_owner)
+    normal_info = await h.wait_reply_text("owner", "Role: user", normal_owner)
+    if "Role: admin" in (normal_info.raw_text or ""):
+        raise E2EFailure("/info on normal message returned caller/admin info.")
+
+    forward_source = await _telegram_text_post(h)
+    forward_marker = forward_source.raw_text.strip()[:40]
+    await h.forward_to_bot("user_a", forward_source)
+    forward_owner = await h.wait_text("owner", forward_marker)
+    await h.send_text("owner", "/info", reply_to=forward_owner)
+    await h.wait_reply_text("owner", "Role: user", forward_owner)
+
+    owner_prompt = h.marker("info-whisper-target")
+    await h.send_text("owner", owner_prompt)
+    owner_prompt_for_a = await h.wait_text("user_a", owner_prompt)
+    whisper_marker = h.marker("info-whisper")
+    await h.send_text("user_a", f"/w {whisper_marker}", reply_to=owner_prompt_for_a)
+    whisper_owner = await h.wait_text("owner", whisper_marker)
+    await h.send_text("owner", "/info", reply_to=whisper_owner)
+    await h.wait_reply_text("owner", "Role: user", whisper_owner)
+
+    tomb_marker = h.marker("info-tombstone")
+    await h.send_text("user_a", tomb_marker)
+    tomb_owner = await h.wait_text("owner", tomb_marker)
+    tomb_b = await h.wait_text("user_b", tomb_marker)
+    await h.send_text("owner", "/delete", reply_to=tomb_owner)
+    await h.wait_reply_text("owner", "Deleted (", tomb_owner)
+    await h.wait_for(
+        "user_b",
+        lambda msg: msg.id == tomb_b.id and "Message removed." in (msg.raw_text or ""),
+        label="user_b tombstone for /info",
+    )
+    await h.send_text("user_b", "/info", reply_to=tomb_b)
+    await h.wait_reply_text("user_b", "Normal users cannot inspect others.", tomb_b)
+
+    await h.send_text("owner", f"/mod {h.accounts['user_b'].user_id}")
+    await h.wait_text("owner", "promoted to moderator")
+    modwhisper_marker = h.marker("info-modwhisper")
+    await h.send_text("owner", f"/wmods {modwhisper_marker}")
+    modwhisper_b = await h.wait_text("user_b", modwhisper_marker)
+    if "~ mods" in (modwhisper_b.raw_text or ""):
+        raise E2EFailure("/wmods included the /modsay suffix.")
+    await h.send_text("user_b", "/info", reply_to=modwhisper_b)
+    await h.wait_reply_text("user_b", "Role: admin", modwhisper_b)
+    print("PASS reply-info-contexts")
+
+
+async def scenario_signed_media_identity(h: Harness) -> None:
+    await h.start_all()
+    h.clear_inboxes()
+    await h.send_text("user_a", "/togglesign")
+    await h.wait_text("user_a", "Persistent signing: on")
+    image_path = h.runtime_path("signed-media.png")
+    _make_test_image(image_path, variant="signed-media")
+    await h.send_file("user_a", image_path)
+    signed_media = await h.wait_for(
+        "user_b",
+        lambda msg: bool(getattr(msg, "photo", None)) and "@" in (msg.raw_text or ""),
+        label="signed media identity caption",
+    )
+    if "~" in (signed_media.raw_text or ""):
+        raise E2EFailure(f"Signed media identity should not include '~': {signed_media.raw_text!r}")
+    print("PASS signed-media-identity")
+
+
+async def scenario_mod_note_reply_context(h: Harness) -> None:
+    await h.start_all()
+    await h.send_text("owner", f"/mod {h.accounts['user_b'].user_id}")
+    await h.wait_text("owner", "promoted to moderator")
+    h.clear_inboxes()
+
+    marker = h.marker("mod-note-reply")
+    await h.send_text("user_a", marker)
+    owner_copy = await h.wait_text("owner", marker)
+    user_b_copy = await h.wait_text("user_b", marker)
+    await h.send_text("user_b", "/deletevote", reply_to=user_b_copy)
+    await h.wait_reply_text("user_b", "Remove vote recorded (1/2)", user_b_copy)
+    await h.send_text("owner", "/deletevote", reply_to=owner_copy)
+    await h.wait_reply_text("owner", "Remove vote threshold reached. Message removed.", owner_copy)
+    owner_note = await h.wait_reply_text("owner", "Moderation", owner_copy)
+    user_b_note = await h.wait_reply_text("user_b", "Moderation", user_b_copy)
+
+    reply_marker = h.marker("mod-note-thread")
+    await h.send_text("owner", reply_marker, reply_to=owner_note)
+    mod_reply = await h.wait_reply_text("user_b", reply_marker, user_b_note)
+    if not mod_reply:
+        raise E2EFailure("Mod note reply was not delivered to mod thread.")
+    await h.assert_absent_text("user_a", reply_marker)
+    print("PASS mod-note-reply-context")
+
+
+async def scenario_delete_flow_parity(h: Harness) -> None:
+    await h.start_all()
+    await h.send_text("owner", f"/mod {h.accounts['user_b'].user_id}")
+    await h.wait_text("owner", "promoted to moderator")
+    h.clear_inboxes()
+
+    regular_marker = h.marker("delete-parity-regular")
+    regular_source = await h.send_text("user_a", regular_marker)
+    regular_mod_copy = await h.wait_text("user_b", regular_marker)
+    regular_owner_copy = await h.wait_text("owner", regular_marker)
+    await _assert_direct_delete_flow(
+        h,
+        actor="user_b",
+        target=regular_mod_copy,
+        sender="user_a",
+        sender_source=regular_source,
+        marker=regular_marker,
+        label="regular message",
+        marked_targets=[("user_b", regular_mod_copy), ("owner", regular_owner_copy)],
+        mod_note_targets=[("user_b", regular_mod_copy), ("owner", regular_owner_copy)],
+        no_moderation_accounts=["user_a"],
+    )
+
+    whisper_target = h.marker("delete-parity-whisper-target")
+    await h.send_text("user_b", whisper_target)
+    prompt_for_a = await h.wait_text("user_a", whisper_target)
+    whisper_marker = h.marker("delete-parity-whisper")
+    whisper_source = await h.send_text("user_a", f"/w {whisper_marker}", reply_to=prompt_for_a)
+    whisper_mod_copy = await h.wait_text("user_b", whisper_marker)
+    whisper_owner_copy = await h.wait_text("owner", whisper_marker)
+    await _assert_direct_delete_flow(
+        h,
+        actor="user_b",
+        target=whisper_mod_copy,
+        sender="user_a",
+        sender_source=whisper_source,
+        marker=whisper_marker,
+        label="whisper",
+        marked_targets=[("user_b", whisper_mod_copy), ("owner", whisper_owner_copy)],
+        mod_note_targets=[("user_b", whisper_mod_copy), ("owner", whisper_owner_copy)],
+        no_moderation_accounts=["user_a"],
+    )
+
+    modwhisper_marker = h.marker("delete-parity-modwhisper")
+    modwhisper_source = await h.send_text("owner", f"/wmods {modwhisper_marker}")
+    modwhisper_mod_copy = await h.wait_text("user_b", modwhisper_marker)
+    await _assert_direct_delete_flow(
+        h,
+        actor="user_b",
+        target=modwhisper_mod_copy,
+        sender="owner",
+        sender_source=modwhisper_source,
+        marker=modwhisper_marker,
+        label="modwhisper",
+        marked_targets=[("user_b", modwhisper_mod_copy)],
+        mod_note_targets=[("user_b", modwhisper_mod_copy)],
+        no_moderation_accounts=["owner", "user_a"],
+    )
+
+    user_modwhisper_marker = h.marker("delete-parity-user-modwhisper")
+    user_modwhisper_source = await h.send_text("user_a", f"/wmods {user_modwhisper_marker}")
+    user_modwhisper_mod_copy = await h.wait_text("user_b", user_modwhisper_marker)
+    user_modwhisper_owner_copy = await h.wait_text("owner", user_modwhisper_marker)
+    await _assert_direct_delete_flow(
+        h,
+        actor="user_b",
+        target=user_modwhisper_mod_copy,
+        sender="user_a",
+        sender_source=user_modwhisper_source,
+        marker=user_modwhisper_marker,
+        label="regular-user modwhisper",
+        marked_targets=[("user_b", user_modwhisper_mod_copy), ("owner", user_modwhisper_owner_copy)],
+        mod_note_targets=[("user_b", user_modwhisper_mod_copy), ("owner", user_modwhisper_owner_copy)],
+        no_moderation_accounts=["user_a"],
+    )
+
+    reaction_modwhisper_marker = h.marker("delete-parity-reaction-user-modwhisper")
+    reaction_modwhisper_source = await h.send_text("user_a", f"/wmods {reaction_modwhisper_marker}")
+    reaction_modwhisper_mod_copy = await h.wait_text("user_b", reaction_modwhisper_marker)
+    reaction_modwhisper_owner_copy = await h.wait_text("owner", reaction_modwhisper_marker)
+    await _assert_reaction_delete_flow(
+        h,
+        actor="user_b",
+        target=reaction_modwhisper_mod_copy,
+        sender="user_a",
+        sender_source=reaction_modwhisper_source,
+        marker=reaction_modwhisper_marker,
+        label="regular-user modwhisper reaction",
+        marked_targets=[("user_b", reaction_modwhisper_mod_copy), ("owner", reaction_modwhisper_owner_copy)],
+        mod_note_targets=[("user_b", reaction_modwhisper_mod_copy), ("owner", reaction_modwhisper_owner_copy)],
+        no_moderation_accounts=["user_a"],
+    )
+    print("PASS delete-flow-parity")
+
+
+async def _assert_direct_delete_flow(
+    h: Harness,
+    *,
+    actor: str,
+    target: Any,
+    sender: str,
+    sender_source: Any,
+    marker: str,
+    label: str,
+    marked_targets: list[tuple[str, Any]],
+    mod_note_targets: list[tuple[str, Any]],
+    no_moderation_accounts: list[str],
+) -> None:
+    h.clear_inboxes()
+    await h.send_text(actor, "/delete", reply_to=target)
+    deleted = await h.wait_reply_text(actor, "Deleted (", target)
+    h.assert_reply_to(deleted, target, f"{label} delete acknowledgement")
+    notes: dict[str, Any] = {}
+    for account_name, note_target in mod_note_targets:
+        note = await h.wait_reply_text(account_name, "Moderation", note_target)
+        h.assert_reply_to(note, note_target, f"{label} {account_name} moderation note")
+        _assert_delete_mod_note_shape(h, note, account_name=account_name, label=f"{label} {account_name}")
+        notes[account_name] = note
+    for account_name in no_moderation_accounts:
+        await h.assert_absent_text(account_name, "Moderation", timeout=2)
+        _assert_no_moderation_buttons(h, account_name, label=label)
+    await h.assert_absent_text(actor, "Confirm moderator delete", timeout=2)
+    current_target = await h.fetch_bot_message(actor, target)
+    if not current_target or marker not in (current_target.raw_text or ""):
+        raise E2EFailure(f"{label} mod-visible copy disappeared or changed: {getattr(current_target, 'raw_text', None)!r}")
+    if "Message removed." in (current_target.raw_text or ""):
+        raise E2EFailure(f"{label} mod-visible copy was tombstoned instead of left available.")
+    sender_notice = await h.wait_reply_text(sender, "Your message was removed:", sender_source)
+    h.assert_reply_to(sender_notice, sender_source, f"{label} sender removal notice")
+    for account_name, marked_target in marked_targets:
+        await h.wait_reaction(account_name, marked_target, "✍️", timeout=20)
+    actor_note = notes.get(actor)
+    if actor_note:
+        before_ids = {
+            msg.id
+            for msg in h.history[actor]
+            if _message_id(msg) is not None and "Moderation" in (msg.raw_text or "")
+        }
+        await h.click_button(actor, actor_note, "Remove for mods")
+        updated_note = await h.wait_for(
+            actor,
+            lambda msg: msg.id == actor_note.id and "removed for mods" in (msg.raw_text or "").lower(),
+            label=f"{label} existing note updated after remove-for-mods",
+        )
+        labels = h.button_texts(updated_note)
+        if labels != ["Punish"]:
+            raise E2EFailure(f"{label} remove-for-mods note buttons differ: {labels!r}")
+        after_ids = {
+            msg.id
+            for msg in h.history[actor]
+            if _message_id(msg) is not None and "Moderation" in (msg.raw_text or "")
+        }
+        if after_ids - before_ids:
+            raise E2EFailure(f"{label} remove-for-mods created a new moderation note: before={before_ids}, after={after_ids}")
+        for account_name in no_moderation_accounts:
+            await h.assert_absent_text(account_name, "Moderation", timeout=2)
+            _assert_no_moderation_buttons(h, account_name, label=f"{label} after remove-for-mods")
+
+
+def _assert_delete_mod_note_shape(h: Harness, note: Any, *, account_name: str, label: str) -> None:
+    raw_note = note.raw_text or ""
+    for required in ("Moderation", "Sender:", "Reason: deleted by moderator"):
+        if required not in raw_note:
+            raise E2EFailure(f"{label} moderation note missing {required!r}: {raw_note!r}")
+    if "Status:" in raw_note:
+        raise E2EFailure(f"{label} direct delete note should not include status noise: {raw_note!r}")
+    if "Whisper" in raw_note:
+        raise E2EFailure(f"{label} moderation note should not use whisper-specific wording: {raw_note!r}")
+    labels = h.button_texts(note)
+    expected = ["Punish", "Remove for mods", "Ban"] if account_name == "owner" else ["Punish", "Remove for mods"]
+    if labels != expected:
+        raise E2EFailure(f"{label} moderation note buttons differ from regular delete flow: {labels!r}")
+
+
+async def _assert_reaction_delete_flow(
+    h: Harness,
+    *,
+    actor: str,
+    target: Any,
+    sender: str,
+    sender_source: Any,
+    marker: str,
+    label: str,
+    marked_targets: list[tuple[str, Any]],
+    mod_note_targets: list[tuple[str, Any]],
+    no_moderation_accounts: list[str],
+) -> None:
+    h.clear_inboxes()
+    await h.send_reaction(actor, target, "✍️")
+    notes: dict[str, Any] = {}
+    for account_name, note_target in mod_note_targets:
+        note = await h.wait_reply_text(account_name, "Moderation", note_target)
+        h.assert_reply_to(note, note_target, f"{label} {account_name} moderation note")
+        _assert_delete_mod_note_shape(h, note, account_name=account_name, label=f"{label} {account_name}")
+        notes[account_name] = note
+    for account_name in no_moderation_accounts:
+        await h.assert_absent_text(account_name, "Moderation", timeout=2)
+        _assert_no_moderation_buttons(h, account_name, label=label)
+    current_target = await h.fetch_bot_message(actor, target)
+    if not current_target or marker not in (current_target.raw_text or ""):
+        raise E2EFailure(f"{label} mod-visible copy disappeared or changed: {getattr(current_target, 'raw_text', None)!r}")
+    sender_notice = await h.wait_reply_text(sender, "Your message was removed:", sender_source)
+    h.assert_reply_to(sender_notice, sender_source, f"{label} sender removal notice")
+    for account_name, marked_target in marked_targets:
+        await h.wait_reaction(account_name, marked_target, "✍️", timeout=20)
+    actor_note = notes.get(actor)
+    if actor_note:
+        await h.click_button(actor, actor_note, "Remove for mods")
+        await h.wait_for(
+            actor,
+            lambda msg: msg.id == actor_note.id and "removed for mods" in (msg.raw_text or "").lower(),
+            label=f"{label} existing note updated after remove-for-mods",
+        )
+        for account_name in no_moderation_accounts:
+            await h.assert_absent_text(account_name, "Moderation", timeout=2)
+            _assert_no_moderation_buttons(h, account_name, label=f"{label} after remove-for-mods")
+
+
+def _assert_no_moderation_buttons(h: Harness, account_name: str, *, label: str) -> None:
+    forbidden = {"Punish", "Remove for mods", "Ban", "Revert"}
+    for msg in h.history[account_name]:
+        labels = set(h.button_texts(msg))
+        leaked = labels & forbidden
+        if leaked:
+            raise E2EFailure(f"{label} leaked moderation buttons to {account_name}: {sorted(leaked)} on {msg.raw_text!r}")
 
 
 async def scenario_media_tombstone(h: Harness) -> None:
@@ -680,6 +1067,10 @@ SCENARIOS: dict[str, Callable[[Harness], Awaitable[None]]] = {
     "forward-preservation": scenario_forward_preservation,
     "forward-delete-removes-uneditable-forward": scenario_forward_delete_removes_uneditable_forward,
     "mod-dialog-ban-purge": scenario_mod_dialog_ban_purge,
+    "reply-info-contexts": scenario_reply_info_contexts,
+    "signed-media-identity": scenario_signed_media_identity,
+    "mod-note-reply-context": scenario_mod_note_reply_context,
+    "delete-flow-parity": scenario_delete_flow_parity,
 }
 
 
@@ -763,6 +1154,31 @@ def _message_id(message: Any) -> int | None:
     nested = getattr(message, "message", None)
     value = getattr(nested, "id", None)
     return int(value) if value is not None else None
+
+
+def _message_has_reaction(message: Any, emoji: str) -> bool:
+    expected = _normalize_emoji(emoji)
+    reactions = getattr(message, "reactions", None)
+    if not reactions:
+        return False
+    for result in getattr(reactions, "results", []) or []:
+        if _normalize_emoji(_reaction_emoji(getattr(result, "reaction", None))) == expected:
+            return True
+    for recent in getattr(reactions, "recent_reactions", []) or []:
+        if _normalize_emoji(_reaction_emoji(getattr(recent, "reaction", None))) == expected:
+            return True
+    return False
+
+
+def _reaction_emoji(reaction: Any) -> str | None:
+    if reaction is None:
+        return None
+    value = getattr(reaction, "emoticon", None) or getattr(reaction, "emoji", None)
+    return str(value) if value else None
+
+
+def _normalize_emoji(value: str | None) -> str | None:
+    return value.replace("\ufe0f", "") if value else value
 
 
 def parse_args() -> argparse.Namespace:

@@ -35,6 +35,7 @@ async def remove_message(
     remove_for_mods: bool = False,
     notify_sender: bool = True,
     voter_ids: list[int] | None = None,
+    send_note: bool = True,
 ) -> int:
     msg = store.get_message(message_id)
     if not msg or (msg.deleted and not remove_for_mods) or (msg.removed_for_mods and remove_for_mods):
@@ -73,7 +74,8 @@ async def remove_message(
         except TelegramError as exc:
             log_telegram_error(LOGGER, "tombstone.notify_sender", exc, aggregate=_aggregate(store), repo=repo, user_id=sender.telegram_id, message_id=message_id)
             pass
-    await send_mod_notes(bot, repo, store, config, message_id, reason=reason, voter_ids=voter_ids or [])
+    if send_note:
+        await send_mod_notes(bot, repo, store, config, message_id, reason=reason, voter_ids=voter_ids or [])
     return updated
 
 
@@ -84,11 +86,13 @@ async def mark_for_moderation_action(bot: Bot, repo: Repository, store: Transien
     if not msg:
         return
     emoji = str(config.get("moderation.delete_reaction_emoji", "✍️") or "✍️")
-    for user in repo.list_users():
-        if not user.has_started or not user.is_mod_or_admin:
+    for delivery in store.deliveries_for_message(message_id):
+        if delivery.deleted:
             continue
-        delivery = store.delivery_for_recipient(message_id, user.telegram_id)
-        if not delivery or delivery.deleted:
+        if delivery.recipient_id == msg.sender_id:
+            continue
+        user = repo.get_user(delivery.recipient_id)
+        if not user or not user.has_started:
             continue
         try:
             await bot.set_message_reaction(
@@ -98,6 +102,30 @@ async def mark_for_moderation_action(bot: Bot, repo: Repository, store: Transien
             )
         except TelegramError as exc:
             log_telegram_error(LOGGER, "moderation.mark_reaction", exc, aggregate=_aggregate(store), repo=repo, user_id=user.telegram_id, message_id=message_id)
+            pass
+
+
+async def mark_whisper_for_moderation_action(bot: Bot, repo: Repository, store: TransientStore, config: Config, whisper_id: int) -> None:
+    if ReactionTypeEmoji is None:
+        return
+    whisper = store.whispers.get(whisper_id)
+    if not whisper:
+        return
+    emoji = str(config.get("moderation.delete_reaction_emoji", "✍️") or "✍️")
+    for delivery in store.deliveries_for_whisper(whisper_id):
+        if delivery.deleted or delivery.recipient_id == whisper.sender_id:
+            continue
+        user = repo.get_user(delivery.recipient_id)
+        if not user or not user.has_started:
+            continue
+        try:
+            await bot.set_message_reaction(
+                chat_id=user.telegram_id,
+                message_id=delivery.telegram_message_id,
+                reaction=[ReactionTypeEmoji(emoji)],
+            )
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "moderation.whisper_mark_reaction", exc, aggregate=_aggregate(store), repo=repo, user_id=user.telegram_id, whisper_id=whisper_id)
             pass
 
 
@@ -166,15 +194,15 @@ async def send_mod_notes(
                 msg.removed_for_mods,
                 msg.reverted,
                 viewer=user,
-                actions=list(msg.metadata.get("mod_actions", [])),
                 tombstone_note=tombstone_note,
+                purged_count=msg.metadata.get("ban_purged_count"),
             )
-            await _edit_mod_note(bot, config, user.telegram_id, note_message_id, text, _mod_note_markup(user, msg, bool(voter_users)))
+            await _edit_mod_note(bot, config, user.telegram_id, note_message_id, text, _mod_note_markup(user, msg, bool(voter_users), sender_banned=bool(sender and sender.is_banned)))
         return
     for user in repo.list_users():
         if not user.has_started or not user.is_mod_or_admin:
             continue
-        markup = _mod_note_markup(user, msg, bool(voter_users))
+        markup = _mod_note_markup(user, msg, bool(voter_users), sender_banned=bool(sender and sender.is_banned))
         text = _mod_note_text(
             config,
             sender,
@@ -184,44 +212,39 @@ async def send_mod_notes(
             msg.removed_for_mods,
             msg.reverted,
             viewer=user,
-            actions=list(msg.metadata.get("mod_actions", [])),
             tombstone_note=tombstone_note,
+            purged_count=msg.metadata.get("ban_purged_count"),
         )
-        reply_to = None
-        delivery = store.delivery_for_recipient(message_id, user.telegram_id)
-        if delivery:
-            reply_to = delivery.telegram_message_id
+        reply_to = _delivery_reply_for_user(store, message_id, user.telegram_id)
+        if not reply_to:
+            queue = getattr(store, "delivery_queue", None)
+            if queue and hasattr(queue, "ensure_delivery"):
+                reply_to = await queue.ensure_delivery(message_id, user.telegram_id)
+        if not reply_to:
+            LOGGER.info(
+                "telegram moderation.note_send skipped missing reply target fields=%s",
+                {"message_id": message_id, "user_id": user.telegram_id},
+            )
+            continue
         try:
             sent = await bot.send_message(user.telegram_id, text, parse_mode="HTML", reply_to_message_id=reply_to, reply_markup=markup)
             store.add_mod_note(message_id, user.telegram_id, sent.message_id)
         except TelegramError as exc:
             log_telegram_error(LOGGER, "moderation.note_send", exc, aggregate=_aggregate(store), repo=repo, user_id=user.telegram_id, message_id=message_id, reply_to=reply_to)
-            if not reply_to:
-                continue
-            try:
-                sent = await bot.send_message(
-                    user.telegram_id,
-                    text + "\nNote: The referenced message had to be deleted or is unavailable, so this moderation note could not reply to it.",
-                    parse_mode="HTML",
-                    reply_markup=markup,
-                )
-                store.add_mod_note(message_id, user.telegram_id, sent.message_id)
-            except TelegramError as fallback_exc:
-                log_telegram_error(LOGGER, "moderation.note_send_fallback", fallback_exc, aggregate=_aggregate(store), repo=repo, user_id=user.telegram_id, message_id=message_id)
-                pass
+            pass
 
 
-def _mod_note_markup(user: User, msg, has_voters: bool) -> InlineKeyboardMarkup | None:
+def _mod_note_markup(user: User, msg, has_voters: bool, *, sender_banned: bool = False) -> InlineKeyboardMarkup | None:
     buttons = []
-    if not msg.punishment_confirmed and not msg.reverted:
+    if not sender_banned and not msg.punishment_confirmed and not msg.reverted:
         buttons.append(InlineKeyboardButton("Punish", callback_data=f"mconf:{msg.id}:{msg.sender_id or 0}"))
-    if not msg.removed_for_mods and not msg.reverted:
+    if not sender_banned and not msg.removed_for_mods and not msg.reverted:
         buttons.append(InlineKeyboardButton("Remove for mods", callback_data=f"mrm:{msg.id}:{msg.sender_id or 0}"))
-    if has_voters and not msg.punishment_confirmed and not msg.reverted:
+    if not sender_banned and has_voters and not msg.punishment_confirmed and not msg.reverted:
         buttons.append(InlineKeyboardButton("Revert", callback_data=f"mrev:{msg.id}:{msg.sender_id or 0}"))
-    if user.is_admin and msg.sender_id:
+    if user.is_admin and msg.sender_id and not sender_banned:
         buttons.append(InlineKeyboardButton("Ban", callback_data=f"mban:{msg.id}:{msg.sender_id}"))
-    return InlineKeyboardMarkup([buttons]) if buttons else None
+    return InlineKeyboardMarkup([[button] for button in buttons]) if buttons else None
 
 
 async def _edit_mod_note(bot: Bot, config: Config, chat_id: int, message_id: int, text: str, markup: InlineKeyboardMarkup | None) -> None:
@@ -273,30 +296,33 @@ def _mod_note_text(
     reverted: bool,
     *,
     viewer: User,
-    actions: list[str] | None = None,
     tombstone_note: str | None = None,
+    purged_count: int | None = None,
 ) -> str:
     sender_id = display_identity_html(sender, config, viewer=viewer)
-    voter_text = ", ".join(display_identity_html(v, config, viewer=viewer) for v in voters) if voters else "none"
-    flags = []
-    if punished:
-        flags.append("punished")
-    if removed_for_mods:
-        flags.append("removed for mods")
-    if reverted:
-        flags.append("reverted")
-    flag_text = ", ".join(flags) if flags else "pending"
-    text = (
-        "<b>Moderation removal</b>\n"
-        f"Status: {html_escape(flag_text)}\n"
-        f"Reason: {html_escape(reason)}\n"
-        f"Sender: {sender_id}\n"
-        f"Voters: {voter_text}"
-    )
+    if sender and sender.is_banned:
+        text = f"<b>Banned</b> {sender_id}"
+        if purged_count is not None:
+            text += f"\nPurged cached messages: {int(purged_count)}"
+    else:
+        lines = ["<b>Moderation</b>", f"Sender: {sender_id}"]
+        if reason:
+            lines.append(f"Reason: {html_escape(reason)}")
+        state = []
+        if punished:
+            state.append("punished")
+        if removed_for_mods:
+            state.append("removed for mods")
+        if reverted:
+            state.append("reverted")
+        if state:
+            lines.append("Status: " + html_escape(", ".join(state)))
+        if voters:
+            voter_text = ", ".join(display_identity_html(v, config, viewer=viewer) for v in voters)
+            lines.append(f"Remove votes: {voter_text}")
+        text = "\n".join(lines)
     if tombstone_note:
         text += f"\nNote: {html_escape(tombstone_note)}"
-    if actions:
-        text += "\nActions:\n" + "\n".join(f"- {html_escape(action)}" for action in actions[-5:])
     return text
 
 
@@ -318,6 +344,8 @@ async def punish_sender(bot: Bot, repo: Repository, store: TransientStore, confi
     sender = repo.get_user(msg.sender_id)
     if not sender:
         return "Sender not found."
+    if sender.is_banned:
+        return "Sender is banned."
     percent = float(config.get("vote_to_remove.punishment_credit_tax_percent", 0.8) or 0.8)
     minimum = float(config.get("vote_to_remove.punishment_credit_minimum", 10.0) or 10.0)
     penalty = -round_credits(max(sender.credits * percent, minimum))
@@ -347,6 +375,9 @@ async def remove_for_moderators(bot: Bot, repo: Repository, store: TransientStor
         return "Message is not in cache anymore."
     if msg.reverted or msg.removed_for_mods:
         return "This moderation action is already resolved."
+    sender = repo.get_user(msg.sender_id)
+    if sender and sender.is_banned:
+        return "Sender is banned."
     count = await remove_message(bot, repo, store, config, message_id, reason=msg.deletion_reason or "removed for moderators", remove_for_mods=True, notify_sender=False)
     msg.removed_for_mods = True
     _append_mod_action(msg, f"Removed {count} moderator copies")
@@ -360,6 +391,9 @@ async def revert_remove_vote(bot: Bot, repo: Repository, store: TransientStore, 
         return "Message is not in cache anymore."
     if msg.reverted or msg.punishment_confirmed:
         return "This moderation action is already resolved."
+    sender = repo.get_user(msg.sender_id)
+    if sender and sender.is_banned:
+        return "Sender is banned."
     voters = list(store.remove_votes.get(message_id, set()))
     if not voters:
         return "No voters to reverse."
@@ -398,52 +432,206 @@ async def revert_remove_vote(bot: Bot, repo: Repository, store: TransientStore, 
     return "Remove vote reverted."
 
 
-async def remove_whisper(bot: Bot, repo: Repository, store: TransientStore, whisper_id: int, reason: str) -> int:
+async def remove_whisper(
+    bot: Bot,
+    repo: Repository,
+    store: TransientStore,
+    config: Config,
+    whisper_id: int,
+    reason: str,
+    *,
+    remove_for_mods: bool = False,
+    send_note: bool = True,
+    notify_sender: bool = True,
+) -> int:
     whisper = store.whispers.get(whisper_id)
     if not whisper:
         return 0
+    await mark_whisper_for_moderation_action(bot, repo, store, config, whisper_id)
     count = 0
     for delivery in store.deliveries_for_whisper(whisper_id):
         if delivery.deleted:
             continue
+        if delivery.recipient_id == whisper.sender_id:
+            continue
         user = repo.get_user(delivery.recipient_id)
-        if user and user.is_mod_or_admin:
-            text = f"<b>Removed whisper</b>\nReason: {html_escape(reason)}\n\n{whisper.text}"
-            try:
-                await bot.edit_message_text(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, text=text, parse_mode="HTML")
-            except TelegramError as exc:
-                log_telegram_error(LOGGER, "whisper.remove_mod_edit_html", exc, aggregate=_aggregate(store), repo=repo, user_id=delivery.recipient_id, whisper_id=whisper_id)
-                try:
-                    await bot.edit_message_text(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, text=_plain_text(text))
-                except TelegramError as fallback_exc:
-                    log_telegram_error(LOGGER, "whisper.remove_mod_edit_plain", fallback_exc, aggregate=_aggregate(store), repo=repo, user_id=delivery.recipient_id, whisper_id=whisper_id)
-                    pass
-            delivery.deleted = True
-            count += 1
+        if remove_for_mods and not (user and user.is_mod_or_admin):
+            continue
+        if not remove_for_mods and user and user.is_mod_or_admin:
             continue
         try:
-            await bot.edit_message_text(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, text="Whisper removed.")
+            await bot.edit_message_text(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, text="<i>Message removed.</i>", parse_mode="HTML")
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "whisper.remove_recipient_edit", exc, aggregate=_aggregate(store), repo=repo, user_id=delivery.recipient_id, whisper_id=whisper_id)
+            log_telegram_error(LOGGER, "whisper.remove_edit", exc, aggregate=_aggregate(store), repo=repo, user_id=delivery.recipient_id, whisper_id=whisper_id)
             try:
                 await bot.delete_message(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id)
             except TelegramError as fallback_exc:
-                log_telegram_error(LOGGER, "whisper.remove_recipient_delete", fallback_exc, aggregate=_aggregate(store), repo=repo, user_id=delivery.recipient_id, whisper_id=whisper_id)
+                log_telegram_error(LOGGER, "whisper.remove_delete", fallback_exc, aggregate=_aggregate(store), repo=repo, user_id=delivery.recipient_id, whisper_id=whisper_id)
                 pass
         delivery.deleted = True
         count += 1
     whisper.deleted = True
+    if send_note:
+        await send_whisper_mod_notes(bot, repo, store, config, whisper_id, reason=reason)
+    if notify_sender:
+        try:
+            await bot.send_message(
+                whisper.sender_id,
+                f"Your message was removed: {html_escape(reason)}",
+                parse_mode="HTML",
+                reply_to_message_id=_whisper_reply_for_user(store, whisper_id, whisper.sender_id),
+            )
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "whisper.remove_sender_notify", exc, aggregate=_aggregate(store), repo=repo, user_id=whisper.sender_id, whisper_id=whisper_id)
+            pass
+    return count
+
+
+async def send_whisper_mod_notes(
+    bot: Bot,
+    repo: Repository,
+    store: TransientStore,
+    config: Config,
+    whisper_id: int,
+    *,
+    reason: str,
+    punished: bool = False,
+    removed_for_mods: bool = False,
+    reverted: bool = False,
+) -> None:
+    whisper = store.whispers.get(whisper_id)
+    if not whisper:
+        return
+    sender = repo.get_user(whisper.sender_id)
+    note_key = -whisper.id
+    subject = _WhisperModerationSubject(
+        id=note_key,
+        sender_id=whisper.sender_id,
+        punishment_confirmed=punished,
+        removed_for_mods=removed_for_mods,
+        reverted=reverted,
+    )
+    existing_notes = list(store.mod_notes.get(note_key, []))
+    if existing_notes:
+        retained_notes: list[tuple[int, int]] = []
+        for recipient_id, note_message_id in existing_notes:
+            user = repo.get_user(recipient_id)
+            if not _can_receive_whisper_mod_note(user, whisper.sender_id):
+                await _delete_stale_whisper_mod_note(bot, repo, store, recipient_id, note_message_id, whisper_id)
+                store.mod_note_index.pop((recipient_id, note_message_id), None)
+                continue
+            retained_notes.append((recipient_id, note_message_id))
+            text = _mod_note_text(
+                config,
+                sender,
+                reason,
+                [],
+                punished,
+                removed_for_mods,
+                reverted,
+                viewer=user,
+            )
+            markup = _mod_note_markup(user, subject, False, sender_banned=bool(sender and sender.is_banned))
+            await _edit_mod_note(bot, config, user.telegram_id, note_message_id, text, markup)
+        store.mod_notes[note_key] = retained_notes
+        return
+    for delivery in store.deliveries_for_whisper(whisper_id):
+        if delivery.deleted:
+            continue
+        if delivery.recipient_id == whisper.sender_id:
+            continue
+        user = repo.get_user(delivery.recipient_id)
+        if not _can_receive_whisper_mod_note(user, whisper.sender_id):
+            continue
+        text = _mod_note_text(
+            config,
+            sender,
+            reason,
+            [],
+            punished,
+            removed_for_mods,
+            reverted,
+            viewer=user,
+        )
+        markup = _mod_note_markup(user, subject, False, sender_banned=bool(sender and sender.is_banned))
+        try:
+            sent = await bot.send_message(
+                user.telegram_id,
+                text,
+                parse_mode="HTML",
+                reply_to_message_id=delivery.telegram_message_id,
+                reply_markup=markup,
+            )
+            store.add_mod_note(note_key, user.telegram_id, sent.message_id)
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "moderation.whisper_note_send", exc, aggregate=_aggregate(store), repo=repo, user_id=user.telegram_id, whisper_id=whisper_id, reply_to=delivery.telegram_message_id)
+            pass
+
+
+def _can_receive_whisper_mod_note(user: User | None, sender_id: int) -> bool:
+    return bool(user and user.has_started and user.is_mod_or_admin and user.telegram_id != sender_id)
+
+
+async def _delete_stale_whisper_mod_note(
+    bot: Bot,
+    repo: Repository,
+    store: TransientStore,
+    recipient_id: int,
+    note_message_id: int,
+    whisper_id: int,
+) -> None:
+    try:
+        await bot.delete_message(chat_id=recipient_id, message_id=note_message_id)
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "moderation.whisper_note_stale_delete", exc, aggregate=_aggregate(store), repo=repo, user_id=recipient_id, whisper_id=whisper_id)
+        pass
+
+
+class _WhisperModerationSubject:
+    def __init__(
+        self,
+        *,
+        id: int,
+        sender_id: int,
+        punishment_confirmed: bool = False,
+        removed_for_mods: bool = False,
+        reverted: bool = False,
+    ):
+        self.id = id
+        self.sender_id = sender_id
+        self.punishment_confirmed = punishment_confirmed
+        self.removed_for_mods = removed_for_mods
+        self.reverted = reverted
+
+
+async def punish_whisper_sender(bot: Bot, repo: Repository, store: TransientStore, config: Config, whisper_id: int, moderator_id: int | None = None) -> str:
+    whisper = store.whispers.get(whisper_id)
+    if not whisper:
+        return "Message is not in cache anymore."
+    sender = repo.get_user(whisper.sender_id)
+    if not sender:
+        return "Sender not found."
+    if sender.is_banned:
+        return "Sender is banned."
+    percent = float(config.get("vote_to_remove.punishment_credit_tax_percent", 0.8) or 0.8)
+    minimum = float(config.get("vote_to_remove.punishment_credit_minimum", 10.0) or 10.0)
+    penalty = -round_credits(max(sender.credits * percent, minimum))
+    _, updated = repo.apply_credit_change(sender.telegram_id, penalty, "remove_punishment", daily_caps=None)
+    maybe_apply_negative_cooldown(repo, config, updated)
+    cooldown = int(config.get("vote_to_remove.punishment_cooldown_seconds", 3600) or 3600)
+    if cooldown > 0:
+        repo.set_cooldown(sender.telegram_id, cooldown, "moderation punishment", moderator_id, stack=False)
     try:
         await bot.send_message(
-            whisper.sender_id,
-            f"Your whisper was removed: {html_escape(reason)}",
-            parse_mode="HTML",
-            reply_to_message_id=_whisper_reply_for_user(store, whisper_id, whisper.sender_id),
+            sender.telegram_id,
+            f"Moderation confirmed. Penalty: {abs(penalty):.2f} credits. Balance: {updated.credits:.2f}.",
+            reply_to_message_id=_whisper_reply_for_user(store, whisper_id, sender.telegram_id),
         )
     except TelegramError as exc:
-        log_telegram_error(LOGGER, "whisper.remove_sender_notify", exc, aggregate=_aggregate(store), repo=repo, user_id=whisper.sender_id, whisper_id=whisper_id)
+        log_telegram_error(LOGGER, "moderation.whisper_punish_notify", exc, aggregate=_aggregate(store), repo=repo, user_id=sender.telegram_id, whisper_id=whisper_id)
         pass
-    return count
+    await send_whisper_mod_notes(bot, repo, store, config, whisper_id, reason="moderation confirmed", punished=True)
+    return "Punishment applied."
 
 
 def _sender_source_reply(msg) -> int | None:

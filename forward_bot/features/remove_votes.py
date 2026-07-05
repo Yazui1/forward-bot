@@ -51,6 +51,9 @@ async def vote_to_remove(
     if not ok:
         return False, f"You already voted. Current votes: {count}."
     repo.touch_activity(voter.telegram_id)
+    queue = getattr(store, "delivery_queue", None)
+    if queue and hasattr(queue, "on_user_activity"):
+        queue.on_user_activity(voter.telegram_id)
     await mark_for_moderation_action(bot, repo, store, config, message_id)
     threshold = int(config.get("vote_to_remove.threshold", 3) or 3)
     if count < threshold:

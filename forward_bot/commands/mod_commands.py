@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
@@ -25,7 +26,7 @@ from forward_bot.config import Config
 from forward_bot.features.credits import loss_rate, tax_rate
 from forward_bot.features.tombstones import mark_for_moderation_action, remove_message, remove_whisper
 from forward_bot.logging_utils import log_telegram_error
-from forward_bot.utils import html_escape, human_seconds, parse_duration_seconds
+from forward_bot.utils import html_escape, human_seconds, now_utc, parse_dt, parse_duration_seconds
 
 
 LOGGER = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ def register_mod_commands(registry: HelpRegistry) -> None:
     add("purgebanned", "Admin", "Remove cached messages from banned users.", purgebanned, admin=True)
     add("adminsay", "Admin", "Urgently broadcast as admin.", adminsay, admin=True)
     add("reload", "Admin", "Reload config without restarting workers.", reload_config, admin=True)
+    add("status", "Admin", "Show delivery queue and cache status.", status, admin=True)
     add("warn", "Moderation", "Warn a user by reply or reference.", warn, mod=True)
     add("cooldown", "Moderation", "Apply a user cooldown.", cooldown, mod=True)
     add("uncooldown", "Moderation", "Clear a user cooldown.", uncooldown, mod=True)
@@ -74,6 +76,141 @@ def args_text_from(context: ContextTypes.DEFAULT_TYPE, start: int) -> str:
     return " ".join((context.args or [])[start:]).strip()
 
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update, context):
+        return
+    queue = context.application.bot_data.get("queue")
+    if not queue or not hasattr(queue, "snapshot"):
+        await command_reply(update, context, "Delivery queue is not available.", prefer_target=False)
+        return
+    text = _status_report(queue.snapshot(), get_repo(context), get_store(context))
+    await command_reply(update, context, text, prefer_target=False)
+
+
+def _status_report(snapshot: dict, repo, store) -> str:
+    users = repo.list_users()
+    active_window = int(snapshot.get("active_window_seconds", 0) or 0)
+    now = now_utc()
+    started = [user for user in users if user.has_started and not user.is_banned]
+    active = 0
+    inactive = 0
+    never_active = 0
+    for user in started:
+        last = parse_dt(user.last_activity)
+        if not last:
+            never_active += 1
+        elif active_window and (now - last).total_seconds() <= active_window:
+            active += 1
+        else:
+            inactive += 1
+
+    message_types = Counter(message.content_type for message in store.messages.values())
+    delivery_deleted = sum(1 for delivery in store.deliveries.values() if delivery.deleted)
+    whisper_delivery_deleted = sum(1 for delivery in store.whisper_deliveries.values() if delivery.deleted)
+    message_deleted = sum(1 for message in store.messages.values() if message.deleted)
+    removed_for_mods = sum(1 for message in store.messages.values() if message.removed_for_mods)
+    system_messages = sum(1 for message in store.messages.values() if message.is_system)
+    urgent_messages = sum(1 for message in store.messages.values() if message.urgent)
+    mod_whispers = sum(1 for whisper in store.whispers.values() if whisper.is_modwhisper)
+    mod_note_copies = sum(len(notes) for notes in store.mod_notes.values())
+
+    workers = snapshot.get("workers", []) or []
+    alive_workers = sum(1 for worker in workers if not worker.get("done") and not worker.get("cancelled"))
+    inflight = [
+        f"{worker.get('name')} msg={worker.get('inflight_message_id')} to={worker.get('inflight_recipient_id')}"
+        for worker in workers
+        if worker.get("inflight_message_id") is not None
+    ]
+
+    lines = [
+        "Bot status",
+        f"Queue: {'running' if snapshot.get('running') else 'stopped'}; stopping={snapshot.get('stopping')}",
+        f"Workers: {alive_workers}/{snapshot.get('worker_count_config', len(workers))} alive; inflight={snapshot.get('inflight', 0)}",
+        f"Open items: {snapshot.get('open_items', 0)} total; heap={snapshot.get('heap_live', 0)} live/{snapshot.get('heap_cancelled', 0)} cancelled; per-recipient={snapshot.get('recipient_pending_items', 0)} across {snapshot.get('recipient_pending_recipients', 0)} recipients; bypass tasks={snapshot.get('bypass_tasks', 0)} pending={snapshot.get('bypass_pending_items', 0)} deferred={snapshot.get('bypass_deferred_items', 0)}",
+        f"Scheduler: heap size={snapshot.get('heap_size', 0)}; queued recipients={snapshot.get('recipient_queued', 0)}; heap recipient handles={snapshot.get('recipient_heap_items', 0)}",
+        f"Fanout: pending={snapshot.get('pending_fanout_total', 0)}; completed={snapshot.get('completed_fanout_total', 0)}; pending messages={snapshot.get('pending_messages', 0)}",
+        f"Backlog: max recipient={snapshot.get('max_recipient_backlog', 0)}; oldest open message={_status_seconds(snapshot.get('oldest_open_message_age_seconds'))}",
+        f"Delays: global wait={_status_seconds(snapshot.get('global_wait_seconds'))}; paused recipients={snapshot.get('paused_recipients', 0)}; max pause={_status_seconds(snapshot.get('max_pause_seconds'))}; wake tasks={snapshot.get('wake_tasks', 0)}",
+        f"Rates: global={snapshot.get('rate_per_second')}/s; per recipient={snapshot.get('per_recipient_rate_per_second')}/s; active window={_status_seconds(active_window)}",
+        f"Users: total={len(users)}; started active={active}; started inactive={inactive}; started no activity={never_active}; banned={sum(1 for user in users if user.is_banned)}; not started={sum(1 for user in users if not user.has_started and not user.is_banned)}; mods/admins={sum(1 for user in users if user.is_mod_or_admin)}",
+        f"Cache: messages={len(store.messages)}; deliveries={len(store.deliveries)} ({delivery_deleted} deleted); whispers={len(store.whispers)} ({len(store.whisper_deliveries)} copies, {whisper_delivery_deleted} deleted); mod notes={len(store.mod_notes)} messages/{mod_note_copies} copies",
+        f"Cache flags: deleted={message_deleted}; removed for mods={removed_for_mods}; system={system_messages}; urgent={urgent_messages}; mod whispers={mod_whispers}; confirmations={len(store.confirmations)}; retries={len(store.retries)}",
+        f"Message types: {_status_counts(message_types)}",
+        f"Delivery statuses: {_status_counts(snapshot.get('delivery_statuses', {}))}",
+        f"Open content types: {_status_counts(snapshot.get('content_types', {}))}",
+    ]
+    if inflight:
+        lines.append("Inflight: " + "; ".join(inflight[:5]))
+    top_messages = snapshot.get("top_messages", [])[:8]
+    if top_messages:
+        lines.append("")
+        lines.append("Top messages")
+        lines.extend(_status_message_line(message) for message in top_messages)
+    top_recipients = snapshot.get("top_recipients", [])[:8]
+    if top_recipients:
+        lines.append("")
+        lines.append("Top recipients")
+        lines.extend(_status_recipient_line(recipient) for recipient in top_recipients)
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        return text[:3850].rstrip() + "\n...truncated"
+    return text
+
+
+def _status_seconds(value) -> str:
+    if value is None:
+        return "n/a"
+    return human_seconds(int(value))
+
+
+def _status_counts(counts, *, limit: int = 8) -> str:
+    items = [(str(key), int(value)) for key, value in dict(counts).items() if value]
+    if not items:
+        return "none"
+    items.sort(key=lambda item: item[1], reverse=True)
+    rendered = ", ".join(f"{key}={value}" for key, value in items[:limit])
+    if len(items) > limit:
+        rendered += f", +{len(items) - limit} more"
+    return rendered
+
+
+def _status_message_line(message: dict) -> str:
+    flags = []
+    if message.get("system"):
+        flags.append("system")
+    if message.get("urgent"):
+        flags.append("urgent")
+    if message.get("deleted"):
+        flags.append("deleted")
+    suffix = f" [{' '.join(flags)}]" if flags else ""
+    return (
+        f"- msg {message.get('message_id')} from {message.get('sender_id')} "
+        f"{message.get('content_type')}: open={message.get('open')} "
+        f"pending={message.get('pending')} done={message.get('completed')} "
+        f"recipients={message.get('recipient_count')} age={_status_seconds(message.get('age_seconds'))}{suffix}"
+    )
+
+
+def _status_recipient_line(recipient: dict) -> str:
+    flags = []
+    if recipient.get("queued"):
+        flags.append("queued")
+    if recipient.get("heap_item"):
+        flags.append("heap")
+    if recipient.get("wake_task"):
+        flags.append("wake")
+    if recipient.get("mod"):
+        flags.append("mod")
+    if recipient.get("banned"):
+        flags.append("banned")
+    suffix = f" [{' '.join(flags)}]" if flags else ""
+    return (
+        f"- user {recipient.get('recipient_id')}: pending={recipient.get('pending')} "
+        f"pause={_status_seconds(recipient.get('paused_seconds'))} "
+        f"last={_status_seconds(recipient.get('last_activity_age_seconds'))}{suffix}"
+    )
+
+
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     caller, _ = await ensure_user(update, context)
     repo = get_repo(context)
@@ -83,7 +220,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     inspected_message_id = None
     reply = update.effective_message.reply_to_message if update.effective_message else None
     if caller and caller.is_mod_or_admin and reply:
-        msg, delivery, _ = await resolve_message_from_reply(update, context)
+        msg, delivery, error = await resolve_message_from_reply(update, context)
         if msg and msg.sender_id:
             target = repo.get_user(msg.sender_id)
             inspected_message_id = msg.id
@@ -92,6 +229,9 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if wdel and store.whispers.get(wdel.whisper_id):
                 whisper = store.whispers[wdel.whisper_id]
                 target = repo.get_user(whisper.sender_id)
+        if not target:
+            await command_reply(update, context, error or "Message sender is not available.")
+            return
     elif caller and caller.is_mod_or_admin and context.args:
         from forward_bot.identity import resolve_user_reference
         target = resolve_user_reference(repo, config, context.args[0], caller)
@@ -112,7 +252,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if caller.telegram_id not in {whisper.sender_id, whisper.target_id}:
                 await command_reply(update, context, "Normal users cannot inspect others.")
                 return
-            target = caller
+            target = repo.get_user(whisper.sender_id)
     elif context.args:
         await command_reply(update, context, "Normal users cannot inspect others.")
         return
@@ -233,7 +373,7 @@ async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = rest or "Warned by moderator"
     count = get_repo(context).increment_warning(target.telegram_id)
-    suffix = "~ admin" if caller.is_admin else "~ mods"
+    suffix = "~ mods"
     try:
         await context.bot.send_message(target.telegram_id, f"{text}\n\n{suffix}", reply_to_message_id=await reply_to_for_target(update, context, target.telegram_id))
     except TelegramError as exc:
@@ -307,9 +447,11 @@ async def purgebanned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     count = 0
     for msg in list(store.messages.values()):
         sender = repo.get_user(msg.sender_id) if msg.sender_id else None
-        if sender and sender.is_banned and not msg.deleted:
-            await remove_message(context.bot, repo, store, get_config(context), msg.id, reason="purged banned sender", remove_for_mods=False, notify_sender=False)
-            await remove_message(context.bot, repo, store, get_config(context), msg.id, reason="purged banned sender", remove_for_mods=True, notify_sender=False)
+        if sender and sender.is_banned and (not msg.deleted or not msg.removed_for_mods):
+            if not msg.deleted:
+                await remove_message(context.bot, repo, store, get_config(context), msg.id, reason="purged banned sender", remove_for_mods=False, notify_sender=False, send_note=False)
+            if not msg.removed_for_mods:
+                await remove_message(context.bot, repo, store, get_config(context), msg.id, reason="purged banned sender", remove_for_mods=True, notify_sender=False, send_note=False)
             count += 1
     await update.effective_message.reply_text(f"Purged {count} cached messages.")
 
@@ -324,29 +466,19 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_message.reply_to_message:
             wdel = get_store(context).resolve_whisper_delivery(caller.telegram_id, update.effective_message.reply_to_message.message_id)
         if wdel:
-            if caller.is_admin:
-                count = await remove_whisper(context.bot, get_repo(context), get_store(context), wdel.whisper_id, "deleted by admin")
-                await command_reply(update, context, f"Whisper removed ({count} copies).")
-            else:
-                markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Confirm", callback_data=f"delconf:-{wdel.whisper_id}:0"),
-                    InlineKeyboardButton("Cancel", callback_data=f"delcancel:-{wdel.whisper_id}"),
-                ]])
-                await command_reply(update, context, "Confirm moderator whisper delete?", reply_markup=markup)
+            count = await remove_whisper(context.bot, get_repo(context), get_store(context), get_config(context), wdel.whisper_id, "deleted by moderator")
+            await command_reply(update, context, f"Deleted ({count} copies).")
             return
         await command_reply(update, context, error or "Message is not in cache anymore.")
         return
     if caller.is_admin:
         await mark_for_moderation_action(context.bot, get_repo(context), get_store(context), get_config(context), msg.id)
-        count = await remove_message(context.bot, get_repo(context), get_store(context), get_config(context), msg.id, reason="deleted by admin", remove_for_mods=False)
+        count = await remove_message(context.bot, get_repo(context), get_store(context), get_config(context), msg.id, reason="deleted by moderator", remove_for_mods=False)
         await command_reply(update, context, f"Deleted ({count} copies).")
     else:
         await mark_for_moderation_action(context.bot, get_repo(context), get_store(context), get_config(context), msg.id)
-        markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("Confirm", callback_data=f"delconf:{msg.id}:{msg.sender_id or 0}"),
-            InlineKeyboardButton("Cancel", callback_data=f"delcancel:{msg.id}"),
-        ]])
-        await command_reply(update, context, "Confirm moderator delete?", reply_markup=markup)
+        count = await remove_message(context.bot, get_repo(context), get_store(context), get_config(context), msg.id, reason="deleted by moderator", remove_for_mods=False)
+        await command_reply(update, context, f"Deleted ({count} copies).")
 
 
 async def blocksticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
