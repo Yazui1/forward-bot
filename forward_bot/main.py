@@ -5,6 +5,7 @@ import asyncio
 import signal
 import logging
 from pathlib import Path
+import socket
 
 from telegram import Update
 from telegram.error import TelegramError
@@ -35,6 +36,58 @@ from forward_bot.logging_utils import log_telegram_error
 LOGGER = logging.getLogger(__name__)
 
 
+_real_getaddrinfo = socket.getaddrinfo
+
+TELEGRAM_HOSTS = {
+    "api.telegram.org",
+}
+
+_telegram_local_address = "127.0.0.1"
+_telegram_hosts = set(TELEGRAM_HOSTS)
+
+
+def telegram_local_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    host_str = host.decode() if isinstance(host, bytes) else host
+    host_clean = host_str.rstrip(".")
+
+    if host_clean in _telegram_hosts:
+        return _real_getaddrinfo(
+            _telegram_local_address,
+            port,
+            socket.AF_INET,
+            type,
+            proto,
+            flags,
+        )
+
+    return _real_getaddrinfo(host, port, family, type, proto, flags)
+
+
+def configure_telegram_local_getaddrinfo(config: Config) -> None:
+    global _telegram_local_address, _telegram_hosts
+
+    enabled = bool(config.get("network.telegram_local_api.enabled", False))
+    if not enabled:
+        socket.getaddrinfo = _real_getaddrinfo
+        return
+
+    _telegram_local_address = str(config.get("network.telegram_local_api.address", "127.0.0.1") or "127.0.0.1")
+    hosts = config.get("network.telegram_local_api.hosts", list(TELEGRAM_HOSTS)) or list(TELEGRAM_HOSTS)
+    _telegram_hosts = {str(host).rstrip(".") for host in hosts}
+    socket.getaddrinfo = telegram_local_getaddrinfo
+
+
+def configure_telegram_api_builder(builder: ApplicationBuilder, config: Config) -> ApplicationBuilder:
+    if not config.get("network.telegram_local_api.enabled", False):
+        return builder
+
+    hosts = config.get("network.telegram_local_api.hosts", list(TELEGRAM_HOSTS)) or list(TELEGRAM_HOSTS)
+    public_host = str(hosts[0]).rstrip(".")
+    port = int(config.get("network.telegram_local_api.port", 8443) or 8443)
+    api_base = f"https://{public_host}:{port}"
+    return builder.base_url(f"{api_base}/bot").base_file_url(f"{api_base}/file/bot")
+
+
 async def log_update_error(update: object, context) -> None:
     aggregate = context.application.bot_data.get("aggregate_logger") if context and context.application else None
     error = getattr(context, "error", None)
@@ -52,10 +105,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="config.yml")
     return parser.parse_args()
 
-
 async def run(config_path: str = "config.yml") -> None:
     config = Config.load(config_path)
     configure_logging(config.get("logging.level", "INFO"))
+    configure_telegram_local_getaddrinfo(config)
     db_path = _resolve_config_path(config, config.get("database.path", "./data/bot.db"))
     migration_source = config.get("database.migrate_from")
     migrated_about_text = None
@@ -90,7 +143,7 @@ async def run(config_path: str = "config.yml") -> None:
     setattr(store, "delivery_queue", queue)
     config_ref = {"config": config}
 
-    builder = ApplicationBuilder().token(token)
+    builder = configure_telegram_api_builder(ApplicationBuilder().token(token), config)
     builder = builder.connection_pool_size(int(config.get("delivery.connection_pool_size", 64) or 64))
     builder = builder.pool_timeout(float(config.get("delivery.pool_timeout_seconds", 30) or 30))
     app = builder.build()

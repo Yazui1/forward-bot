@@ -7,12 +7,20 @@ logging:
   level: "INFO"
   aggregate_interval_seconds: 60
 
+network:
+  telegram_local_api:
+    enabled: false
+    address: "127.0.0.1"
+    port: 8443
+    hosts:
+      - "api.telegram.org"
+
 database:
   path: "./data/bot.db"
-  migrate_from: "./main.db"
+  migrate_from: "./legacy_main.db"
 
 about:
-  text: "Anonymous relay bot. Messages are forwarded without exposing Telegram identity. Moderation, credits, voting, whispers, fights, duplicate filtering, and inactivity/loss rules are active."
+  text: "Anonymous forward bot."
 
 cache:
   sender_metadata_ttl_seconds: 86400
@@ -22,24 +30,21 @@ cache:
 
 delivery:
   telegram_rate_limit_per_second: 25
-  per_recipient_rate_limit_per_second: 1
   active_window_hours: 72
-  worker_count: 2
-  connection_pool_size: 64
-  pool_timeout_seconds: 30
+  worker_count: 1
 
 identity:
   allow_sign_toggle: true
   allow_tripcode_toggle: true
 
 rate_limits:
-  message_send_limit: 8
+  message_send_limit: 10
   window_seconds: 30
   cooldown_seconds: 30
 
 credits:
   starting_balance: 20.0
-  text_message_reward: 0.1
+  text_message_reward: 0.15
   media_message_reward: 0.35
   upvote_cost: 0.5
   upvote_reward: 1.0
@@ -49,7 +54,7 @@ credits:
   edit_cost: 5.0
   invite_reward: 5.0
   whisper_cost: 1.0
-  whisper_unlock_credits: 30.0
+  whisper_unlock_credits: 25.0
   downvote_start_cost: 1.0
   negative_credit_cooldown_seconds: 3600
   daily_tax_enabled: true
@@ -89,14 +94,26 @@ tips:
   enabled: true
   interval_hours: 24
   messages:
-    - "Use /help to see commands."
-    - "Earn credits by sending messages, receiving upvotes, inviting users, gambling, and winning fights."
-    - "Use /unsend in reply to your own message to remove it."
-    - "Use /deletevote in reply to community-remove bad messages."
-    - "Use /info to see credits, loss rate, tax rate, and cooldown state."
+    - "Did you know, you can earn credits by sending messages and media? Check /info for your own credits /help and /creditstats for more details!"
+    - "Did you know, you can use /help to see all available commands."
+    - "Did you know, you can unsend your own messages with /unsend."
+    - "Did you know, you can vote messages with 👍, ❤️ or 👎 to send or deduct credits."
+    - "Did you know, you can reduce your message receiving loss rate, by earning credits? Check your current credits and loss rate with /info."
+    - "Did you know, you can use /s and /t to sign your messages with a custom name and tripcode? Check /help for details."
+    - "Did you know, you can see the top users by credits with /creditstats? Climb the leaderboard by earning credits through messaging and voting!"
+    - "Did you know, you can collectively moderate messages by voting to delete them with /deletevote?"
+    - "Did you know, the bot has multiple channels and a backup website in case it gets banned. Check the bots bio for details!"
+    - "Did you know, you can filter potentially unwanted messages with /togglepotentiallyunwanted? (Right now it fiters anon bot links sent by others)"
+    - "Did you know there are various /toggle commands to customize your experience? Check /help for details!"
+    - "Feeling lucky today? Try your luck with /gamble <X credits> to win or lose credits! (50% chance to double your bet)"
+    - "Want to share some credits with a friend? Use /credit <X credits> in reply to their message to send them some of your credits!"
+    - "Make sure to check the rules in /about to avoid getting banned!"
+    - "Sometimes the bot might be slow to respond due to Telegram API limits or server load. Your message will still be processed, so please be patient if you don't get a quick response."
+    - "Stay active to avoid losing media messages! The bot will not send you media messages if you are inactive for a while to avoid ratelimiting. Check /info for your current loss rate."
+    - "Feeling competitive? Challenge other users to a fight and bet your credits with /fight <X credits>! Strength is determined by your credits, but there's always a chance to win big or lose it all! Check /help for details."
 
 gamble:
-  max_amount: 1000.0
+  max_amount: 100.0
 
 vote_to_remove:
   threshold: 3
@@ -116,17 +133,12 @@ vote_to_remove:
 moderation:
   default_cooldown_seconds: 1800
   delete_reaction_emoji: "✍️"
-  status_reactions:
-    pending: "🤔"
-    confirmed: "👍"
-    removed: "👌"
-    reverted: "👎"
 
 fights:
   enabled: true
-  max_stake_cap: 500.0
+  max_stake_cap: 200.0
   initiation_fee_percent: 0.05
-  initiation_fee_min: 1.0
+  initiation_fee_min: 1
   initiation_fee_max: 20.0
   cooldown_seconds: 300
   request_timeout_seconds: 300
@@ -151,7 +163,7 @@ saucenao:
   num_results: 6
 
 ai:
-  enabled: false
+  enabled: true
   model_path: "model.keras"
   question_threshold: 0.93
   block_threshold: null
