@@ -64,7 +64,7 @@ def register_user_commands(registry: HelpRegistry) -> None:
     add("invite", "Invites", "Create or show your invite link.", invite)
     add("sendinvite", "Invites", "Forward a described Telegram invite link.", sendinvite)
     add("unsend", "Moderation", "Remove your own replied message for a cost.", unsend)
-    add("deletevote", "Moderation", "Vote to remove a replied message.", deletevote)
+    add("deletevote", "Moderation", "Vote to remove a replied message. You can also react with ✍️ on a message.", deletevote)
     add("reactions", "Preferences", "Toggle vote reaction notifications.", reactions)
     add("w", "Whispers", "Whisper to a user by reply or reference.", whisper)
     add("wmods", "Whispers", "Whisper to moderators/admins.", wmods)

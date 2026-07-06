@@ -101,7 +101,7 @@ tips:
     - "Did you know, you can reduce your message receiving loss rate, by earning credits? Check your current credits and loss rate with /info."
     - "Did you know, you can use /s and /t to sign your messages with a custom name and tripcode? Check /help for details."
     - "Did you know, you can see the top users by credits with /creditstats? Climb the leaderboard by earning credits through messaging and voting!"
-    - "Did you know, you can collectively moderate messages by voting to delete them with /deletevote?"
+    - "Did you know, you can collectively moderate messages by voting to delete them with /deletevote or by reacting to a message with ✍️?"
     - "Did you know, the bot has multiple channels and a backup website in case it gets banned. Check the bots bio for details!"
     - "Did you know, you can filter potentially unwanted messages with /togglepotentiallyunwanted? (Right now it fiters anon bot links sent by others)"
     - "Did you know there are various /toggle commands to customize your experience? Check /help for details!"

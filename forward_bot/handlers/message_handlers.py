@@ -688,37 +688,44 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user.telegram_id, reaction.message_id)
     delete_emoji = normalize_emoji(
         str(config.get("moderation.delete_reaction_emoji", "✍️")))
-    if delete_emoji in emojis and user.is_mod_or_admin:
-        if delivery:
-            reason = "deleted by moderator"
-            subject = store.get_message(delivery.message_id)
-            if subject:
-                subject.metadata.setdefault("mod_actions", []).append(reason)
-            await mark_for_moderation_action(context.bot, repo, store, config, delivery.message_id)
-            if user.is_admin:
+    if delete_emoji in emojis:
+        if user.is_mod_or_admin:
+            if delivery:
+                reason = "deleted by moderator"
+                subject = store.get_message(delivery.message_id)
+                if subject:
+                    subject.metadata.setdefault(
+                        "mod_actions", []).append(reason)
+                await mark_for_moderation_action(context.bot, repo, store, config, delivery.message_id)
                 await remove_message(context.bot, repo, store, config, delivery.message_id, reason=reason, remove_for_mods=False)
+            elif wdel:
+                whisper = store.whispers.get(wdel.whisper_id)
+                if not whisper or whisper.deleted:
+                    try:
+                        await context.bot.send_message(user.telegram_id, MSG_CACHE_MISS, reply_to_message_id=reaction.message_id)
+                    except TelegramError as exc:
+                        log_telegram_error(LOGGER, "reaction.cache_miss", exc, aggregate=context.application.bot_data.get(
+                            "aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
+                        pass
+                else:
+                    whisper_id = _merge_related_modwhispers(store, whisper)
+                    await remove_whisper(context.bot, repo, store, config, whisper_id, "deleted by moderator")
             else:
-                await remove_message(context.bot, repo, store, config, delivery.message_id, reason=reason, remove_for_mods=False)
-        elif wdel:
-            whisper = store.whispers.get(wdel.whisper_id)
-            if not whisper or whisper.deleted:
                 try:
                     await context.bot.send_message(user.telegram_id, MSG_CACHE_MISS, reply_to_message_id=reaction.message_id)
                 except TelegramError as exc:
                     log_telegram_error(LOGGER, "reaction.cache_miss", exc, aggregate=context.application.bot_data.get(
                         "aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
                     pass
-            else:
-                whisper_id = _merge_related_modwhispers(store, whisper)
-                await remove_whisper(context.bot, repo, store, config, whisper_id, "deleted by moderator")
-        else:
+            return
+        if delivery:
+            _, text = await vote_to_remove(context.bot, repo, store, config, delivery.message_id, user)
             try:
-                await context.bot.send_message(user.telegram_id, MSG_CACHE_MISS, reply_to_message_id=reaction.message_id)
+                await context.bot.send_message(user.telegram_id, text, reply_to_message_id=reaction.message_id)
             except TelegramError as exc:
-                log_telegram_error(LOGGER, "reaction.cache_miss", exc, aggregate=context.application.bot_data.get(
+                log_telegram_error(LOGGER, "reaction.deletevote_notify", exc, aggregate=context.application.bot_data.get(
                     "aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
-                pass
-        return
+            return
     up = bool(emojis & UPVOTES)
     down = bool(emojis & DOWNVOTES)
     if not up and not down:

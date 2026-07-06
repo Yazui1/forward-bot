@@ -56,7 +56,7 @@ class Repository:
     def __init__(self, path: str | Path, about_text: str = ""):
         self.path = Path(path)
         init_schema(self.path)
-        self.about_text = about_text
+        self.about_text = self._load_about_text(about_text)
         self._users: dict[int, User] = {}
         self._blocks: set[tuple[int, int]] = set()
         self._load_cache()
@@ -80,7 +80,8 @@ class Repository:
     ) -> tuple[User, bool]:
         admin = int(telegram_id in set(int(x) for x in admin_ids))
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
             created = row is None
             if created:
                 conn.execute(
@@ -89,7 +90,8 @@ class Repository:
                         telegram_id, username, created_at, credits, is_admin
                     ) VALUES (?, ?, ?, ?, ?)
                     """,
-                    (telegram_id, username, iso(), round_credits(starting_balance), admin),
+                    (telegram_id, username, iso(),
+                     round_credits(starting_balance), admin),
                 )
             else:
                 conn.execute(
@@ -98,7 +100,8 @@ class Repository:
                 )
             conn.commit()
         self._refresh_user(telegram_id)
-        return self.get_user(telegram_id), created  # type: ignore[return-value]
+        # type: ignore[return-value]
+        return self.get_user(telegram_id), created
 
     def get_user(self, telegram_id: int | None) -> User | None:
         if telegram_id is None:
@@ -113,9 +116,11 @@ class Repository:
         with self.connect() as conn:
             conn.execute("UPDATE users SET is_admin=0")
             for user_id in ids:
-                row = conn.execute("SELECT telegram_id FROM users WHERE telegram_id=?", (user_id,)).fetchone()
+                row = conn.execute(
+                    "SELECT telegram_id FROM users WHERE telegram_id=?", (user_id,)).fetchone()
                 if row:
-                    conn.execute("UPDATE users SET is_admin=1 WHERE telegram_id=?", (user_id,))
+                    conn.execute(
+                        "UPDATE users SET is_admin=1 WHERE telegram_id=?", (user_id,))
                 else:
                     conn.execute(
                         "INSERT INTO users (telegram_id, created_at, is_admin, credits) VALUES (?, ?, 1, 0)",
@@ -126,7 +131,8 @@ class Repository:
 
     def set_started(self, user_id: int, started: bool) -> None:
         with self.connect() as conn:
-            conn.execute("UPDATE users SET has_started=? WHERE telegram_id=?", (int(started), user_id))
+            conn.execute(
+                "UPDATE users SET has_started=? WHERE telegram_id=?", (int(started), user_id))
             conn.commit()
         self._refresh_user(user_id)
 
@@ -135,13 +141,15 @@ class Repository:
 
     def touch_activity(self, user_id: int) -> None:
         with self.connect() as conn:
-            conn.execute("UPDATE users SET last_activity=? WHERE telegram_id=?", (iso(), user_id))
+            conn.execute(
+                "UPDATE users SET last_activity=? WHERE telegram_id=?", (iso(), user_id))
             conn.commit()
         self._refresh_user(user_id)
 
     def set_about_seen(self, user_id: int) -> None:
         with self.connect() as conn:
-            conn.execute("UPDATE users SET about_seen=1 WHERE telegram_id=?", (user_id,))
+            conn.execute(
+                "UPDATE users SET about_seen=1 WHERE telegram_id=?", (user_id,))
             conn.commit()
         self._refresh_user(user_id)
 
@@ -159,7 +167,8 @@ class Repository:
         if column not in allowed:
             raise ValueError(column)
         with self.connect() as conn:
-            conn.execute(f"UPDATE users SET {column}=? WHERE telegram_id=?", (int(value), user_id))
+            conn.execute(
+                f"UPDATE users SET {column}=? WHERE telegram_id=?", (int(value), user_id))
             conn.commit()
         self._refresh_user(user_id)
         return self.get_user(user_id)  # type: ignore[return-value]
@@ -190,22 +199,26 @@ class Repository:
             return self.get_user(user_id)
         values.append(user_id)
         with self.connect() as conn:
-            conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE telegram_id=?", values)
+            conn.execute(
+                f"UPDATE users SET {', '.join(updates)} WHERE telegram_id=?", values)
             conn.commit()
         self._refresh_user(user_id)
         return self.get_user(user_id)
 
     def increment_warning(self, user_id: int) -> int:
         with self.connect() as conn:
-            conn.execute("UPDATE users SET warning_count=warning_count+1 WHERE telegram_id=?", (user_id,))
-            row = conn.execute("SELECT warning_count FROM users WHERE telegram_id=?", (user_id,)).fetchone()
+            conn.execute(
+                "UPDATE users SET warning_count=warning_count+1 WHERE telegram_id=?", (user_id,))
+            row = conn.execute(
+                "SELECT warning_count FROM users WHERE telegram_id=?", (user_id,)).fetchone()
             conn.commit()
         self._refresh_user(user_id)
         return int(row["warning_count"]) if row else 0
 
     def find_by_username(self, username: str) -> User | None:
         username = username.lstrip("@").lower()
-        matches = [user for user in self._users.values() if (user.username or "").lower() == username]
+        matches = [user for user in self._users.values() if (
+            user.username or "").lower() == username]
         return max(matches, key=lambda user: user.last_activity or "") if matches else None
 
     def find_by_tripcode(self, name: str, code: str) -> User | None:
@@ -216,7 +229,8 @@ class Repository:
 
     def eligible_recipients(self, sender_id: int | None, *, include_sender: bool = False) -> list[User]:
         users = sorted(
-            (user for user in self._users.values() if user.has_started and not user.is_banned),
+            (user for user in self._users.values()
+             if user.has_started and not user.is_banned),
             key=lambda user: user.last_activity or "",
             reverse=True,
         )
@@ -335,8 +349,10 @@ class Repository:
     def transfer_credits(self, sender_id: int, target_id: int, amount: float, reason: str = "transfer") -> tuple[User | None, User | None]:
         amount = round_credits(amount)
         with self.connect() as conn:
-            conn.execute("UPDATE users SET credits=ROUND(credits - ?, 2) WHERE telegram_id=?", (amount, sender_id))
-            conn.execute("UPDATE users SET credits=ROUND(credits + ?, 2) WHERE telegram_id=?", (amount, target_id))
+            conn.execute(
+                "UPDATE users SET credits=ROUND(credits - ?, 2) WHERE telegram_id=?", (amount, sender_id))
+            conn.execute(
+                "UPDATE users SET credits=ROUND(credits + ?, 2) WHERE telegram_id=?", (amount, target_id))
             self._record_credit_delta(conn, sender_id, -amount, reason)
             self._record_credit_delta(conn, target_id, amount, reason)
             conn.commit()
@@ -347,7 +363,8 @@ class Repository:
     def increment_vote_stat(self, user_id: int, up: bool) -> None:
         column = "upvotes_received" if up else "downvotes_received"
         with self.connect() as conn:
-            conn.execute(f"UPDATE users SET {column}={column}+1 WHERE telegram_id=?", (user_id,))
+            conn.execute(
+                f"UPDATE users SET {column}={column}+1 WHERE telegram_id=?", (user_id,))
             conn.commit()
         self._refresh_user(user_id)
 
@@ -412,7 +429,8 @@ class Repository:
         return [(_row_to_user(r), float(r["earned"])) for r in rows]
 
     def net_issuance_since_days(self, days: int) -> float:
-        cutoff = (now_utc().date() - timedelta(days=max(0, days - 1))).isoformat()
+        cutoff = (now_utc().date() -
+                  timedelta(days=max(0, days - 1))).isoformat()
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT SUM(net_amount) AS net FROM credit_global_daily WHERE day>=?",
@@ -465,14 +483,16 @@ class Repository:
                 (day, amount, user.telegram_id),
             )
             if amount:
-                self._record_credit_delta(conn, user.telegram_id, amount, reason)
+                self._record_credit_delta(
+                    conn, user.telegram_id, amount, reason)
             conn.commit()
         self._refresh_user(user.telegram_id)
         return amount, self.get_user(user.telegram_id)
 
     def get_media_hash(self, digest: str) -> dict[str, Any] | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM media_hashes WHERE hash=?", (digest,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM media_hashes WHERE hash=?", (digest,)).fetchone()
         return dict(row) if row else None
 
     def upsert_media_hash(self, digest: str, *, first_seen_at: str | None = None) -> dict[str, Any]:
@@ -486,7 +506,8 @@ class Repository:
                 """,
                 (digest, first, now),
             )
-            row = conn.execute("SELECT * FROM media_hashes WHERE hash=?", (digest,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM media_hashes WHERE hash=?", (digest,)).fetchone()
             conn.commit()
         return dict(row)
 
@@ -494,7 +515,8 @@ class Repository:
         if not set_name:
             return None
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM blocked_sticker_sets WHERE set_name=?", (set_name,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM blocked_sticker_sets WHERE set_name=?", (set_name,)).fetchone()
         return dict(row) if row else None
 
     def block_sticker_set(self, set_name: str, blocked_by: int, reason: str) -> None:
@@ -511,7 +533,8 @@ class Repository:
 
     def get_invite_for_user(self, user_id: int) -> str | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT invite_code FROM invites WHERE inviter_id=? ORDER BY created_at LIMIT 1", (user_id,)).fetchone()
+            row = conn.execute(
+                "SELECT invite_code FROM invites WHERE inviter_id=? ORDER BY created_at LIMIT 1", (user_id,)).fetchone()
         return str(row["invite_code"]) if row else None
 
     def create_invite(self, user_id: int, code: str) -> str:
@@ -525,12 +548,14 @@ class Repository:
 
     def get_invite(self, code: str) -> dict[str, Any] | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM invites WHERE invite_code=?", (code,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM invites WHERE invite_code=?", (code,)).fetchone()
         return dict(row) if row else None
 
     def redeem_invite(self, code: str, invitee_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:
-            invite = conn.execute("SELECT * FROM invites WHERE invite_code=?", (code,)).fetchone()
+            invite = conn.execute(
+                "SELECT * FROM invites WHERE invite_code=?", (code,)).fetchone()
             if not invite or int(invite["inviter_id"]) == invitee_id:
                 return None
             existing = conn.execute(
@@ -543,7 +568,8 @@ class Repository:
                 "INSERT INTO invite_redemptions (invite_code, invitee_id, created_at) VALUES (?, ?, ?)",
                 (code, invitee_id, iso()),
             )
-            conn.execute("UPDATE invites SET uses=uses+1 WHERE invite_code=?", (code,))
+            conn.execute(
+                "UPDATE invites SET uses=uses+1 WHERE invite_code=?", (code,))
             conn.commit()
             return dict(invite)
 
@@ -551,6 +577,16 @@ class Repository:
         return self.about_text
 
     def set_about(self, text: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO bot_state (state_key, state_value)
+                VALUES ('about', ?)
+                ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value
+                """,
+                (text,),
+            )
+            conn.commit()
         self.about_text = text
 
     def _load_cache(self) -> None:
@@ -564,9 +600,24 @@ class Repository:
                 for row in conn.execute("SELECT blocker_id, blocked_id FROM user_blocks").fetchall()
             }
 
+    def _load_about_text(self, default: str) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT state_value FROM bot_state WHERE state_key='about'",
+            ).fetchone()
+            if row is not None:
+                return str(row["state_value"])
+            conn.execute(
+                "INSERT INTO bot_state (state_key, state_value) VALUES ('about', ?)",
+                (default,),
+            )
+            conn.commit()
+        return default
+
     def _refresh_user(self, user_id: int) -> None:
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (user_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM users WHERE telegram_id=?", (user_id,)).fetchone()
         if row:
             self._users[int(user_id)] = _row_to_user(row)
         else:

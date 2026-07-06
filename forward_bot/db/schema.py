@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS users (
     last_daily_tax_date TEXT
 );
 
+CREATE TABLE IF NOT EXISTS bot_state (
+    state_key TEXT PRIMARY KEY,
+    state_value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_users_started ON users(has_started, is_banned);
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 
