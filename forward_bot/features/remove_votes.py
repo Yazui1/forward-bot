@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, TelegramError
 
 from forward_bot.cache.transient import TransientStore
@@ -54,6 +54,7 @@ async def vote_to_remove(
     queue = getattr(store, "delivery_queue", None)
     if queue and hasattr(queue, "on_user_activity"):
         queue.on_user_activity(voter.telegram_id)
+    await _show_remove_vote_buttons(bot, repo, store, message_id)
     await mark_for_moderation_action(bot, repo, store, config, message_id)
     threshold = int(config.get("vote_to_remove.threshold", 3) or 3)
     if count < threshold:
@@ -73,6 +74,28 @@ async def vote_to_remove(
     await _notify_voters(bot, store, repo, voter_reply_targets, "Remove vote threshold reached. Message removed.")
     await _remove_collateral(bot, repo, store, config, message_id)
     return True, "Remove vote threshold reached. Message removed."
+
+
+async def _show_remove_vote_buttons(bot: Bot, repo: Repository, store: TransientStore, message_id: int) -> None:
+    msg = store.get_message(message_id)
+    if not msg or msg.deleted or msg.is_system or msg.remove_buttons:
+        return
+    msg.remove_buttons = True
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("Vote remove", callback_data=f"rm:{message_id}")]])
+    for delivery in store.deliveries_for_message(message_id):
+        if delivery.deleted:
+            continue
+        recipient = repo.get_user(delivery.recipient_id)
+        if not recipient or not recipient.vote_buttons_enabled:
+            continue
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=delivery.recipient_id,
+                message_id=delivery.telegram_message_id,
+                reply_markup=markup,
+            )
+        except TelegramError:
+            continue
 
 
 def _voter_reply_targets(store: TransientStore, message_id: int, voter_ids: list[int]) -> dict[int, int | None]:

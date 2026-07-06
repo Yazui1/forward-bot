@@ -120,9 +120,9 @@ class AIClassifier:
         block_threshold = self.config.get("block_threshold")
         question_threshold = self.config.get("question_threshold")
         if block_threshold is not None and score >= float(block_threshold):
-            return "BLOCKED", f"ai-score:{score:.4f}"
+            return "BLOCKED", f"AI score:{score:.4f}"
         if question_threshold is not None and score >= float(question_threshold):
-            return "QUESTIONABLE", f"ai-score:{score:.4f}"
+            return "QUESTIONABLE", f"AI score:{score:.4f}"
         return "OK", None
 
     async def _predict_score(self, preview_bytes: bytes) -> float:

@@ -118,9 +118,11 @@ async def _broadcast_cooldown_attempt(
     recipients = [u for u in repo.list_users(
     ) if u.has_started and u.is_mod_or_admin and not u.is_banned]
     for recipient in recipients:
-        body, identity_parse_mode = _apply_identity(payload.get("text") or "", user, identity_mode, payload.get("content_type", "text"))
+        body, identity_parse_mode = _apply_identity(payload.get(
+            "text") or "", user, identity_mode, payload.get("content_type", "text"))
         parse_mode = identity_parse_mode or payload.get("parse_mode")
-        text = _cooldown_attempt_text(user, recipient, config, body, parse_mode)
+        text = _cooldown_attempt_text(
+            user, recipient, config, body, parse_mode)
         reply_target_id = _resolve_reply_target(source_message, user, context)
         tm = store.add_message(
             sender_id=user.telegram_id,
@@ -197,7 +199,8 @@ async def _process_payload(
     identity_mode: str | None = None,
 ) -> TransientMessage | None:
     text = payload.get("text") or ""
-    payload["text"], identity_parse_mode = _apply_identity(text, user, identity_mode, payload.get("content_type", "text"))
+    payload["text"], identity_parse_mode = _apply_identity(
+        text, user, identity_mode, payload.get("content_type", "text"))
     if identity_parse_mode:
         payload["parse_mode"] = identity_parse_mode
     reply_target_id = _resolve_reply_target(source_message, user, context)
@@ -252,7 +255,7 @@ async def _process_payload(
         return None
     if result.tag == TAG_DUPLICATE:
         _aggregate(context, "pipeline.duplicate")
-        await _reply_to_message(context, source_message, "Duplicate media was rejected.")
+        await _reply_to_message(context, source_message, "This was sent recently. Please wait before sending again or send something new.")
         media_service.release(tm.id)
         return None
     if result.tag == TAG_QUESTIONABLE and user.confirmation_enabled:
@@ -295,7 +298,8 @@ def _resolve_reply_target(source_message: Message, user: User, context: ContextT
         return own.id
     if store.resolve_whisper_delivery(user.telegram_id, source_message.reply_to_message.message_id):
         return None
-    mod_note_msg = store.resolve_mod_note(user.telegram_id, source_message.reply_to_message.message_id)
+    mod_note_msg = store.resolve_mod_note(
+        user.telegram_id, source_message.reply_to_message.message_id)
     if mod_note_msg:
         return mod_note_msg.id
     return -1
@@ -304,7 +308,8 @@ def _resolve_reply_target(source_message: Message, user: User, context: ContextT
 def _resolve_mod_note_reply(source_message: Message, user: User, context: ContextTypes.DEFAULT_TYPE) -> int | None:
     if not user.is_mod_or_admin or not source_message.reply_to_message:
         return None
-    msg = get_store(context).resolve_mod_note(user.telegram_id, source_message.reply_to_message.message_id)
+    msg = get_store(context).resolve_mod_note(user.telegram_id,
+                                              source_message.reply_to_message.message_id)
     return msg.id if msg else None
 
 
@@ -326,7 +331,8 @@ async def distribute_message(context: ContextTypes.DEFAULT_TYPE, tm: TransientMe
     config = get_config(context)
     sender = repo.get_user(tm.sender_id) if tm.sender_id else None
     if tm.metadata.get("mod_only"):
-        recipients = [u for u in repo.list_users() if u.has_started and u.is_mod_or_admin and not u.is_banned and u.telegram_id != tm.sender_id]
+        recipients = [u for u in repo.list_users(
+        ) if u.has_started and u.is_mod_or_admin and not u.is_banned and u.telegram_id != tm.sender_id]
     else:
         recipients = repo.eligible_recipients(tm.sender_id)
     if tm.tag == TAG_POTENTIALLY_UNWANTED:
@@ -379,7 +385,8 @@ async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TY
     if payload.get("content_type") != tm.content_type:
         await _reply_to_message(context, msg, "Edited content type must match original.")
         return
-    payload["text"], identity_parse_mode = _apply_identity(payload.get("text") or "", user, None, payload.get("content_type", "text"))
+    payload["text"], identity_parse_mode = _apply_identity(payload.get(
+        "text") or "", user, None, payload.get("content_type", "text"))
     if identity_parse_mode:
         payload["parse_mode"] = identity_parse_mode
     result = await context.application.bot_data["tagger"].classify(
@@ -402,7 +409,8 @@ async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TY
                 await context.bot.edit_message_caption(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, caption=tm.text or None, parse_mode=tm.parse_mode)
                 updated += 1
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "handler.edit_delivered_copy", exc, aggregate=context.application.bot_data.get("aggregate_logger"), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
+            log_telegram_error(LOGGER, "handler.edit_delivered_copy", exc, aggregate=context.application.bot_data.get(
+                "aggregate_logger"), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
             pass
     if not user.is_admin:
         apply_credit(repo, config, user.telegram_id, -
@@ -433,9 +441,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"retry:{user.telegram_id}")]]))
         except BadRequest as exc:
             if "message is not modified" not in str(exc).lower():
-                log_telegram_error(LOGGER, "callback.retry_markup", exc, aggregate=context.application.bot_data.get("aggregate_logger"), user_id=user.telegram_id)
+                log_telegram_error(LOGGER, "callback.retry_markup", exc, aggregate=context.application.bot_data.get(
+                    "aggregate_logger"), user_id=user.telegram_id)
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "callback.retry_markup", exc, aggregate=context.application.bot_data.get("aggregate_logger"), user_id=user.telegram_id)
+            log_telegram_error(LOGGER, "callback.retry_markup", exc, aggregate=context.application.bot_data.get(
+                "aggregate_logger"), user_id=user.telegram_id)
         await query.answer(label)
         return
     if data.startswith("confirm:"):
@@ -468,7 +478,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except TelegramError as exc:
-                log_telegram_error(LOGGER, "callback.remove_button_clear", exc, aggregate=context.application.bot_data.get("aggregate_logger"), message_id=message_id)
+                log_telegram_error(LOGGER, "callback.remove_button_clear", exc, aggregate=context.application.bot_data.get(
+                    "aggregate_logger"), message_id=message_id)
                 pass
         elif "cooldown:" in text.lower():
             try:
@@ -525,7 +536,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         store = get_store(context)
         config = get_config(context)
         source = store.get_message(message_id) if message_id > 0 else None
-        whisper = store.whispers.get(abs(message_id)) if message_id < 0 else None
+        whisper = store.whispers.get(
+            abs(message_id)) if message_id < 0 else None
         sender_id = int(sender_id_s) or (whisper.sender_id if whisper else 0)
         if not sender_id:
             await query.answer("Sender not found.", show_alert=True)
@@ -567,7 +579,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             await context.bot.send_message(sender_id, "You are banned.", reply_to_message_id=source.source_message_id if source else store.deliveries_for_whisper(whisper.id)[0].telegram_message_id if whisper else None)
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "callback.ban_notify", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=get_repo(context), user_id=sender_id)
+            log_telegram_error(LOGGER, "callback.ban_notify", exc, aggregate=context.application.bot_data.get(
+                "aggregate_logger"), repo=get_repo(context), user_id=sender_id)
             pass
         await query.answer(f"Banned {display_identity(banned_sender, config, viewer=user)}. Purged {purged} cached messages.", show_alert=True)
         return
@@ -600,7 +613,8 @@ async def _fight_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
         try:
             await context.bot.send_message(fight.sender_id, "Fight declined.", reply_to_message_id=fight.command_message_id)
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "fight.decline_notify", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=fight.sender_id)
+            log_telegram_error(LOGGER, "fight.decline_notify", exc, aggregate=context.application.bot_data.get(
+                "aggregate_logger"), repo=repo, user_id=fight.sender_id)
             pass
         await query.edit_message_text("Fight declined.")
         await query.answer("Fight declined.")
@@ -612,7 +626,8 @@ async def _fight_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
         try:
             await context.bot.send_message(fight.sender_id, "Fight expired: insufficient credits.", reply_to_message_id=fight.command_message_id)
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "fight.expired_notify", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=fight.sender_id)
+            log_telegram_error(LOGGER, "fight.expired_notify", exc, aggregate=context.application.bot_data.get(
+                "aggregate_logger"), repo=repo, user_id=fight.sender_id)
             pass
         await query.edit_message_text("Fight expired: insufficient credits.")
         await query.answer("Fight expired: insufficient credits.", show_alert=True)
@@ -647,7 +662,8 @@ async def _fight_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
                 reply_to_message_id=reply_to,
             )
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "fight.result_notify", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=participant.telegram_id, reply_to=reply_to)
+            log_telegram_error(LOGGER, "fight.result_notify", exc, aggregate=context.application.bot_data.get(
+                "aggregate_logger"), repo=repo, user_id=participant.telegram_id, reply_to=reply_to)
             pass
     await query.edit_message_text("Fight resolved.")
     await query.answer("Fight resolved.")
@@ -689,7 +705,8 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 try:
                     await context.bot.send_message(user.telegram_id, MSG_CACHE_MISS, reply_to_message_id=reaction.message_id)
                 except TelegramError as exc:
-                    log_telegram_error(LOGGER, "reaction.cache_miss", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
+                    log_telegram_error(LOGGER, "reaction.cache_miss", exc, aggregate=context.application.bot_data.get(
+                        "aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
                     pass
             else:
                 whisper_id = _merge_related_modwhispers(store, whisper)
@@ -698,7 +715,8 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             try:
                 await context.bot.send_message(user.telegram_id, MSG_CACHE_MISS, reply_to_message_id=reaction.message_id)
             except TelegramError as exc:
-                log_telegram_error(LOGGER, "reaction.cache_miss", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
+                log_telegram_error(LOGGER, "reaction.cache_miss", exc, aggregate=context.application.bot_data.get(
+                    "aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
                 pass
         return
     up = bool(emojis & UPVOTES)
@@ -719,7 +737,8 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             await context.bot.send_message(user.telegram_id, MSG_CACHE_MISS, reply_to_message_id=reaction.message_id)
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "reaction.cache_miss", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
+            log_telegram_error(LOGGER, "reaction.cache_miss", exc, aggregate=context.application.bot_data.get(
+                "aggregate_logger"), repo=repo, user_id=user.telegram_id, reply_to=reaction.message_id)
             pass
 
 
@@ -737,7 +756,8 @@ def _merge_related_modwhispers(store, whisper) -> int:
     ]
     if not related:
         return whisper.id
-    target_ids = store.whisper_delivery_by_whisper_index.setdefault(whisper.id, set())
+    target_ids = store.whisper_delivery_by_whisper_index.setdefault(
+        whisper.id, set())
     for other in related:
         for delivery in store.deliveries_for_whisper(other.id):
             delivery.whisper_id = whisper.id
@@ -828,7 +848,8 @@ async def _dm(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, *, re
     try:
         await context.bot.send_message(user_id, text, reply_to_message_id=reply_to_message_id)
     except TelegramError as exc:
-        log_telegram_error(LOGGER, "handler.dm", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=get_repo(context), user_id=user_id, reply_to=reply_to_message_id)
+        log_telegram_error(LOGGER, "handler.dm", exc, aggregate=context.application.bot_data.get(
+            "aggregate_logger"), repo=get_repo(context), user_id=user_id, reply_to=reply_to_message_id)
         pass
 
 
@@ -841,7 +862,8 @@ async def _reply_to_message(context: ContextTypes.DEFAULT_TYPE, msg: Message, te
             **kwargs,
         )
     except TelegramError as exc:
-        log_telegram_error(LOGGER, "handler.reply_to_message", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=get_repo(context), user_id=msg.chat_id, chat_id=msg.chat_id, message_id=msg.message_id)
+        log_telegram_error(LOGGER, "handler.reply_to_message", exc, aggregate=context.application.bot_data.get(
+            "aggregate_logger"), repo=get_repo(context), user_id=msg.chat_id, chat_id=msg.chat_id, message_id=msg.message_id)
         pass
 
 
