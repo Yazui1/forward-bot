@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -36,6 +37,8 @@ class User:
     downvotes_received: int
     credits: float
     about_seen: bool
+    onboarding_acknowledged: bool
+    onboarding_question_index: int
     cooldown_until: str | None
     cooldown_reason: str | None
     cooldown_applied_by: int | None
@@ -77,6 +80,7 @@ class Repository:
         username: str | None,
         starting_balance: float,
         admin_ids: Iterable[int] = (),
+        onboarding_acknowledged: bool = False,
     ) -> tuple[User, bool]:
         admin = int(telegram_id in set(int(x) for x in admin_ids))
         with self.connect() as conn:
@@ -87,11 +91,11 @@ class Repository:
                 conn.execute(
                     """
                     INSERT INTO users (
-                        telegram_id, username, created_at, credits, is_admin
-                    ) VALUES (?, ?, ?, ?, ?)
+                        telegram_id, username, created_at, credits, is_admin, onboarding_acknowledged
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (telegram_id, username, iso(),
-                     round_credits(starting_balance), admin),
+                     round_credits(starting_balance), admin, int(onboarding_acknowledged or bool(admin))),
                 )
             else:
                 conn.execute(
@@ -123,7 +127,7 @@ class Repository:
                         "UPDATE users SET is_admin=1 WHERE telegram_id=?", (user_id,))
                 else:
                     conn.execute(
-                        "INSERT INTO users (telegram_id, created_at, is_admin, credits) VALUES (?, ?, 1, 0)",
+                        "INSERT INTO users (telegram_id, created_at, is_admin, credits, onboarding_acknowledged) VALUES (?, ?, 1, 0, 1)",
                         (user_id, iso()),
                     )
             conn.commit()
@@ -152,6 +156,22 @@ class Repository:
                 "UPDATE users SET about_seen=1 WHERE telegram_id=?", (user_id,))
             conn.commit()
         self._refresh_user(user_id)
+
+    def set_onboarding_progress(self, user_id: int, *, acknowledged: bool, question_index: int | None = None) -> User | None:
+        updates = ["onboarding_acknowledged=?"]
+        values: list[Any] = [int(acknowledged)]
+        if question_index is not None:
+            updates.append("onboarding_question_index=?")
+            values.append(max(0, int(question_index)))
+        values.append(user_id)
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE users SET {', '.join(updates)} WHERE telegram_id=?",
+                values,
+            )
+            conn.commit()
+        self._refresh_user(user_id)
+        return self.get_user(user_id)
 
     def set_preference(self, user_id: int, column: str, value: bool) -> User:
         allowed = {
@@ -589,6 +609,55 @@ class Repository:
             conn.commit()
         self.about_text = text
 
+    def list_ack_rules(self) -> list[dict[str, str]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT state_value FROM bot_state WHERE state_key='ack_rules'",
+            ).fetchone()
+        if row is None:
+            return []
+        try:
+            raw = json.loads(str(row["state_value"]))
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        rules: list[dict[str, str]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            question = item.get("question")
+            answer = item.get("answer")
+            if isinstance(question, str) and isinstance(answer, str) and question and answer:
+                rules.append({"question": question, "answer": answer})
+        return rules
+
+    def add_ack_rule(self, question: str, answer: str) -> list[dict[str, str]]:
+        rules = self.list_ack_rules()
+        rules.append({"question": question, "answer": answer})
+        self._save_ack_rules(rules)
+        return rules
+
+    def drop_last_ack_rule(self) -> dict[str, str] | None:
+        rules = self.list_ack_rules()
+        if not rules:
+            return None
+        dropped = rules.pop()
+        self._save_ack_rules(rules)
+        return dropped
+
+    def _save_ack_rules(self, rules: list[dict[str, str]]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO bot_state (state_key, state_value)
+                VALUES ('ack_rules', ?)
+                ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value
+                """,
+                (json.dumps(rules, ensure_ascii=False),),
+            )
+            conn.commit()
+
     def _load_cache(self) -> None:
         with self.connect() as conn:
             self._users = {
@@ -649,6 +718,8 @@ def _row_to_user(row: sqlite3.Row) -> User:
         downvotes_received=int(row["downvotes_received"]),
         credits=float(row["credits"]),
         about_seen=bool(row["about_seen"]),
+        onboarding_acknowledged=bool(row["onboarding_acknowledged"]),
+        onboarding_question_index=int(row["onboarding_question_index"]),
         cooldown_until=row["cooldown_until"],
         cooldown_reason=row["cooldown_reason"],
         cooldown_applied_by=row["cooldown_applied_by"],

@@ -14,6 +14,7 @@ from forward_bot.commands.common import ensure_user, get_config, get_repo, get_s
 from forward_bot.db.repository import User
 from forward_bot.features.credits import apply_credit, downvote_cost, downvote_drop_seconds, maybe_apply_negative_cooldown
 from forward_bot.features.media import MediaInspection, extract_payload
+from forward_bot.features.onboarding import current_onboarding_question, onboarding_complete_message, onboarding_prompt, onboarding_questions, requires_onboarding_answers
 from forward_bot.features.remove_votes import vote_to_remove
 from forward_bot.features.tagging import TAG_BLOCKED, TAG_DUPLICATE, TAG_OK, TAG_POTENTIALLY_UNWANTED, TAG_QUESTIONABLE
 from forward_bot.features.tombstones import mark_for_moderation_action, punish_sender, punish_whisper_sender, remove_for_moderators, remove_message, remove_whisper, revert_remove_vote, send_mod_notes, send_whisper_mod_notes
@@ -42,13 +43,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     touch_activity(context, user.telegram_id)
     user = repo.get_user(user.telegram_id) or user
+    if not user.has_started:
+        await _reply_to_message(context, msg, MSG_USE_START)
+        return
+    if requires_onboarding_answers(user, repo):
+        await _handle_onboarding_message(context, msg, user)
+        return
     if user.active_cooldown_seconds > 0 and not user.is_mod_or_admin:
         _aggregate(context, "pipeline.cooldown_attempt")
         await _reply_to_message(context, msg, f"Cooldown active: {human_seconds(user.active_cooldown_seconds)}. Reason: {user.cooldown_reason or 'cooldown'}")
         await _broadcast_cooldown_attempt(update, context, user, extract_payload(msg), source_message=msg)
-        return
-    if not user.has_started:
-        await _reply_to_message(context, msg, MSG_USE_START)
         return
     if msg.reply_to_message:
         if await _try_auto_whisper_reply(update, context, user):
@@ -84,6 +88,9 @@ async def submit_text(
     if not user.has_started:
         await _reply_to_message(context, msg, MSG_USE_START)
         return
+    if requires_onboarding_answers(user, repo):
+        await _reply_to_message(context, msg, onboarding_prompt(user, repo))
+        return
     if user.active_cooldown_seconds > 0 and not user.is_mod_or_admin:
         _aggregate(context, "pipeline.cooldown_attempt")
         await _reply_to_message(context, msg, f"Cooldown active: {human_seconds(user.active_cooldown_seconds)}. Reason: {user.cooldown_reason or 'cooldown'}")
@@ -101,6 +108,29 @@ async def submit_text(
     payload = {"content_type": "text", "text": text, "media_file_id": None, "thumbnail_file_id": None, "media_kind": None, "mime_type": None,
                "sticker_set_name": None, "is_animated": False, "is_video": False, "parse_mode": None, "force_remove_buttons": force_remove_buttons}
     await _process_payload(update, context, user, payload, source_message=msg, identity_mode=identity_mode)
+
+
+async def _handle_onboarding_message(context: ContextTypes.DEFAULT_TYPE, msg: Message, user: User) -> None:
+    repo = get_repo(context)
+    question = current_onboarding_question(user, repo)
+    if question is None:
+        repo.set_onboarding_progress(user.telegram_id, acknowledged=True)
+        return
+    if msg.text != question.answer:
+        await _reply_to_message(context, msg, onboarding_prompt(user, repo))
+        return
+    current_questions = onboarding_questions(repo)
+    next_index = user.onboarding_question_index + 1
+    complete = next_index >= len(current_questions)
+    updated = repo.set_onboarding_progress(
+        user.telegram_id,
+        acknowledged=complete,
+        question_index=next_index,
+    ) or user
+    if complete:
+        await _reply_to_message(context, msg, onboarding_complete_message(updated))
+    else:
+        await _reply_to_message(context, msg, onboarding_prompt(updated, repo))
 
 
 async def _broadcast_cooldown_attempt(

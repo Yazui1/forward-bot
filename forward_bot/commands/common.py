@@ -56,6 +56,7 @@ async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tup
         tg.username,
         float(config.get("credits.starting_balance", 20.0) or 20.0),
         config.get("bot.admin_ids", []) or [],
+        onboarding_acknowledged=not bool(repo.list_ack_rules()),
     )
 
 

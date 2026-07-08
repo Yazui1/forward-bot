@@ -29,6 +29,7 @@ from forward_bot.commands.common import (
 from forward_bot.commands.help_registry import HelpRegistry
 from forward_bot.crypto.tripcode import make_tripcode
 from forward_bot.features.credits import apply_credit, daily_caps, loss_rate, maybe_apply_negative_cooldown, tax_rate
+from forward_bot.features.onboarding import onboarding_prompt, requires_onboarding_answers
 from forward_bot.features.remove_votes import vote_to_remove
 from forward_bot.features.tombstones import remove_message
 from forward_bot.logging_utils import log_telegram_error
@@ -106,13 +107,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     pass
     if joining_now:
         initial = int(config.get("onboarding.initial_cooldown_seconds", 0) or 0)
+        prompt = onboarding_prompt(user, repo) if requires_onboarding_answers(user, repo) else ""
         if initial > 0 and not user.is_mod_or_admin:
             repo.set_cooldown(user.telegram_id, initial, "onboarding", None, stack=False)
-            await msg.reply_text(f"Started. Initial cooldown: {human_seconds(initial)}. Invites can clear inviter cooldowns.")
+            text = f"Started. Initial cooldown: {human_seconds(initial)}. Invites can clear inviter cooldowns."
         else:
-            await msg.reply_text("Started.")
+            text = "Started."
+        if prompt:
+            text = f"{text}\n\n{prompt}"
+        await msg.reply_text(text)
     else:
-        await msg.reply_text("Receiving enabled.")
+        prompt = onboarding_prompt(user, repo) if requires_onboarding_answers(user, repo) else ""
+        if prompt:
+            await msg.reply_text(f"Receiving enabled.\n\n{prompt}")
+        else:
+            await msg.reply_text("Receiving enabled.")
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

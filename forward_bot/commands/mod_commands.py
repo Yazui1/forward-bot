@@ -41,6 +41,8 @@ def register_mod_commands(registry: HelpRegistry) -> None:
     add("unban", "Admin", "Unban a user.", unban, admin=True)
     add("purgebanned", "Admin", "Remove cached messages from banned users.", purgebanned, admin=True)
     add("adminsay", "Admin", "Urgently broadcast as admin.", adminsay, admin=True)
+    add("addack", "Admin", "Add an onboarding acknowledgement question as text:answer.", addack, admin=True)
+    add("dropack", "Admin", "Drop the last onboarding acknowledgement question.", dropack, admin=True)
     add("reload", "Admin", "Reload config without restarting workers.", reload_config, admin=True)
     add("status", "Admin", "Show delivery queue and cache status.", status, admin=True)
     add("warn", "Moderation", "Warn a user by reply or reference.", warn, mod=True)
@@ -85,6 +87,32 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = _status_report(queue.snapshot(), get_repo(context), get_store(context))
     await command_reply(update, context, text, prefer_target=False)
+
+
+async def addack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update, context):
+        return
+    raw = args_text(context)
+    if ":" not in raw:
+        await command_reply(update, context, "Use /addack <text>:<answer>", prefer_target=False)
+        return
+    question, answer = (part.strip() for part in raw.rsplit(":", 1))
+    if not question or not answer:
+        await command_reply(update, context, "Question and answer must both be non-empty.", prefer_target=False)
+        return
+    rules = get_repo(context).add_ack_rule(question, answer)
+    await command_reply(update, context, f"Added acknowledgement question #{len(rules)}.", prefer_target=False)
+
+
+async def dropack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update, context):
+        return
+    repo = get_repo(context)
+    dropped = repo.drop_last_ack_rule()
+    if not dropped:
+        await command_reply(update, context, "No acknowledgement questions are configured.", prefer_target=False)
+        return
+    await command_reply(update, context, f"Dropped acknowledgement question. Remaining: {len(repo.list_ack_rules())}.", prefer_target=False)
 
 
 def _status_report(snapshot: dict, repo, store) -> str:

@@ -30,6 +30,8 @@ cache:
 
 delivery:
   telegram_rate_limit_per_second: 25
+  pool_timeout_seconds: 120
+  connection_pool_size: 64
   active_window_hours: 72
   worker_count: 1
 

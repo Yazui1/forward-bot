@@ -155,6 +155,8 @@ def _migrate_users(src: sqlite3.Connection, dst: sqlite3.Connection) -> set[int]
             int(_row_value(row, "downvotes_received", 0)),
             round_credits(float(_row_value(row, "credits", 0))),
             _int_flag(row.get("about_seen")),
+            0,
+            0,
             cooldown.get("until_at"),
             cooldown.get("reason"),
             cooldown.get("applied_by"),
@@ -174,9 +176,10 @@ def _migrate_users(src: sqlite3.Connection, dst: sqlite3.Connection) -> set[int]
             hide_potentially_unwanted, filter_duplicates, fights_enabled,
             sign_enabled, tripcode_enabled, tripcode_name, tripcode_hash,
             warning_count, upvotes_received, downvotes_received, credits,
-            about_seen, cooldown_until, cooldown_reason, cooldown_applied_by,
+            about_seen, onboarding_acknowledged, onboarding_question_index,
+            cooldown_until, cooldown_reason, cooldown_applied_by,
             downvote_streak, last_downvote_at, last_daily_tax_date
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         users,
     )

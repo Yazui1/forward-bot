@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS users (
     downvotes_received INTEGER NOT NULL DEFAULT 0,
     credits REAL NOT NULL DEFAULT 0,
     about_seen INTEGER NOT NULL DEFAULT 0,
+    onboarding_acknowledged INTEGER NOT NULL DEFAULT 0,
+    onboarding_question_index INTEGER NOT NULL DEFAULT 0,
     cooldown_until TEXT,
     cooldown_reason TEXT,
     cooldown_applied_by INTEGER,
@@ -135,6 +137,22 @@ def init_schema(path: str | Path) -> None:
         for table in DISALLOWED_TABLES:
             conn.execute(f"DROP TABLE IF EXISTS {table}")
         conn.executescript(SCHEMA_SQL)
+        _ensure_user_columns(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _ensure_user_columns(conn: sqlite3.Connection) -> None:
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(users)").fetchall()
+    }
+    if "onboarding_acknowledged" not in columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN onboarding_acknowledged INTEGER NOT NULL DEFAULT 1"
+        )
+    if "onboarding_question_index" not in columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN onboarding_question_index INTEGER NOT NULL DEFAULT 0"
+        )
