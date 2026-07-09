@@ -242,7 +242,7 @@ def _mod_note_markup(user: User, msg, has_voters: bool, *, sender_banned: bool =
         buttons.append(InlineKeyboardButton("Remove for mods", callback_data=f"mrm:{msg.id}:{msg.sender_id or 0}"))
     if not sender_banned and has_voters and not msg.punishment_confirmed and not msg.reverted:
         buttons.append(InlineKeyboardButton("Revert", callback_data=f"mrev:{msg.id}:{msg.sender_id or 0}"))
-    if user.is_admin and msg.sender_id and not sender_banned:
+    if user.is_mod_or_admin and msg.sender_id and not sender_banned:
         buttons.append(InlineKeyboardButton("Ban", callback_data=f"mban:{msg.id}:{msg.sender_id}"))
     return InlineKeyboardMarkup([[button] for button in buttons]) if buttons else None
 

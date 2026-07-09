@@ -557,8 +557,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer(text, show_alert=True)
         return
     if data.startswith("mban:"):
-        if not user or not user.is_admin:
-            await query.answer("Admin only.", show_alert=True)
+        if not user or not user.is_mod_or_admin:
+            await query.answer("Not allowed.", show_alert=True)
             return
         _, message_id_s, sender_id_s = data.split(":", 2)
         message_id = int(message_id_s)
@@ -572,20 +572,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not sender_id:
             await query.answer("Sender not found.", show_alert=True)
             return
-        banned_sender = repo.set_role(sender_id, banned=True)
-        purged = 0
-        for cached in list(store.messages.values()):
-            if cached.sender_id != sender_id:
-                continue
-            touched = False
-            if not cached.deleted:
-                await remove_message(context.bot, repo, store, config, cached.id, reason="banned", remove_for_mods=False, notify_sender=False, send_note=False)
-                touched = True
-            if not cached.removed_for_mods:
-                await remove_message(context.bot, repo, store, config, cached.id, reason="banned", remove_for_mods=True, notify_sender=False, send_note=False)
-                touched = True
-            if touched:
-                purged += 1
+        sender = repo.get_user(sender_id)
+        if sender and sender.is_mod_or_admin and not user.is_admin:
+            await query.answer("Only admins can ban moderators or admins.", show_alert=True)
+            return
+        from forward_bot.commands.mod_commands import ban_and_purge_user
+        banned_sender, purged = await ban_and_purge_user(context.bot, repo, store, config, sender_id)
         if source:
             source.metadata["ban_purged_count"] = purged
             await send_mod_notes(
@@ -699,6 +691,15 @@ async def _fight_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
     await query.answer("Fight resolved.")
 
 
+async def _notify_reaction_action(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_to: int, text: str) -> None:
+    try:
+        await context.bot.send_message(user_id, text, reply_to_message_id=reply_to)
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "reaction.mod_action_notify", exc, aggregate=context.application.bot_data.get(
+            "aggregate_logger"), repo=get_repo(context), user_id=user_id, reply_to=reply_to)
+        pass
+
+
 async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reaction = update.message_reaction
     if not reaction or not reaction.user or not reaction.chat:
@@ -716,18 +717,25 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     delivery = store.resolve_delivery(user.telegram_id, reaction.message_id)
     wdel = store.resolve_whisper_delivery(
         user.telegram_id, reaction.message_id)
+    mod_note = store.resolve_mod_note(user.telegram_id, reaction.message_id)
     delete_emoji = normalize_emoji(
         str(config.get("moderation.delete_reaction_emoji", "✍️")))
     if delete_emoji in emojis:
         if user.is_mod_or_admin:
-            if delivery:
+            if mod_note:
+                reason = "deleted by moderator"
+                await mark_for_moderation_action(context.bot, repo, store, config, mod_note.id)
+                count = await remove_message(context.bot, repo, store, config, mod_note.id, reason=reason, remove_for_mods=False)
+                await _notify_reaction_action(context, user.telegram_id, reaction.message_id, f"Deleted ({count} copies).")
+            elif delivery:
                 reason = "deleted by moderator"
                 subject = store.get_message(delivery.message_id)
                 if subject:
                     subject.metadata.setdefault(
                         "mod_actions", []).append(reason)
                 await mark_for_moderation_action(context.bot, repo, store, config, delivery.message_id)
-                await remove_message(context.bot, repo, store, config, delivery.message_id, reason=reason, remove_for_mods=False)
+                count = await remove_message(context.bot, repo, store, config, delivery.message_id, reason=reason, remove_for_mods=False)
+                await _notify_reaction_action(context, user.telegram_id, reaction.message_id, f"Deleted ({count} copies).")
             elif wdel:
                 whisper = store.whispers.get(wdel.whisper_id)
                 if not whisper or whisper.deleted:
@@ -739,7 +747,8 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         pass
                 else:
                     whisper_id = _merge_related_modwhispers(store, whisper)
-                    await remove_whisper(context.bot, repo, store, config, whisper_id, "deleted by moderator")
+                    count = await remove_whisper(context.bot, repo, store, config, whisper_id, "deleted by moderator")
+                    await _notify_reaction_action(context, user.telegram_id, reaction.message_id, f"Deleted whisper ({count} copies).")
             else:
                 try:
                     await context.bot.send_message(user.telegram_id, MSG_CACHE_MISS, reply_to_message_id=reaction.message_id)

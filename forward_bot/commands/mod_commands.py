@@ -23,6 +23,7 @@ from forward_bot.commands.common import (
 )
 from forward_bot.commands.help_registry import HelpRegistry
 from forward_bot.config import Config
+from forward_bot.db.repository import User
 from forward_bot.features.credits import loss_rate, tax_rate
 from forward_bot.features.tombstones import mark_for_moderation_action, remove_message, remove_whisper
 from forward_bot.logging_utils import log_telegram_error
@@ -37,7 +38,7 @@ def register_mod_commands(registry: HelpRegistry) -> None:
     add("togglemod", "Admin", "Toggle moderator status.", togglemod, admin=True)
     add("mod", "Admin", "Promote a moderator.", mod, admin=True)
     add("unmod", "Admin", "Demote a moderator.", unmod, admin=True)
-    add("ban", "Admin", "Ban a user.", ban, admin=True)
+    add("ban", "Moderation", "Ban a user and purge cached messages.", ban, mod=True)
     add("unban", "Admin", "Unban a user.", unban, admin=True)
     add("purgebanned", "Admin", "Remove cached messages from banned users.", purgebanned, admin=True)
     add("adminsay", "Admin", "Urgently broadcast as admin.", adminsay, admin=True)
@@ -374,16 +375,22 @@ async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _ban_set(update: Update, context: ContextTypes.DEFAULT_TYPE, value: bool) -> None:
-    caller = await _require_admin(update, context)
+    caller = await _require_mod(update, context) if value else await _require_admin(update, context)
     if not caller:
         return
     target, error, _ = await _resolve_target(update, context, caller)
     if not target:
         await command_reply(update, context, "Use /ban <user> or /unban <user>, or reply to a message.")
         return
-    target = get_repo(context).set_role(target.telegram_id, banned=value)
-    action = "Banned" if value else "Unbanned"
-    await command_reply(update, context, f"{action} {display_identity_html(target, get_config(context), viewer=caller)}", parse_mode="HTML")
+    if value and target.is_mod_or_admin and not caller.is_admin:
+        await command_reply(update, context, "Only admins can ban moderators or admins.")
+        return
+    if value:
+        target, purged = await ban_and_purge_user(context.bot, get_repo(context), get_store(context), get_config(context), target.telegram_id)
+        await command_reply(update, context, f"Banned {display_identity_html(target, get_config(context), viewer=caller)}. Purged {purged} cached messages.", parse_mode="HTML")
+    else:
+        target = get_repo(context).set_role(target.telegram_id, banned=False)
+        await command_reply(update, context, f"Unbanned {display_identity_html(target, get_config(context), viewer=caller)}", parse_mode="HTML")
     try:
         await context.bot.send_message(target.telegram_id, "You are banned." if value else "You are unbanned.", reply_to_message_id=await reply_to_for_target(update, context, target.telegram_id))
     except TelegramError as exc:
@@ -422,12 +429,13 @@ async def cooldown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     seconds, reason = parse_duration_seconds(rest, default)
     reason = reason or "cooldown"
     get_repo(context).set_cooldown(target.telegram_id, seconds, reason, caller.telegram_id, stack=True)
+    updated = get_repo(context).get_user(target.telegram_id) or target
     try:
-        await context.bot.send_message(target.telegram_id, f"Cooldown: {human_seconds(seconds)}. Reason: {reason}", reply_to_message_id=await reply_to_for_target(update, context, target.telegram_id))
+        await context.bot.send_message(target.telegram_id, f"Cooldown added: {human_seconds(seconds)}. Total remaining: {human_seconds(updated.active_cooldown_seconds)}. Reason: {reason}", reply_to_message_id=await reply_to_for_target(update, context, target.telegram_id))
     except TelegramError as exc:
         log_telegram_error(LOGGER, "mod.cooldown_notify", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=get_repo(context), user_id=target.telegram_id)
         pass
-    await command_reply(update, context, f"Cooldown applied for {human_seconds(seconds)}.")
+    await command_reply(update, context, f"Cooldown added: {human_seconds(seconds)}. Total remaining: {human_seconds(updated.active_cooldown_seconds)}.")
 
 
 async def uncooldown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -482,6 +490,24 @@ async def purgebanned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await remove_message(context.bot, repo, store, get_config(context), msg.id, reason="purged banned sender", remove_for_mods=True, notify_sender=False, send_note=False)
             count += 1
     await update.effective_message.reply_text(f"Purged {count} cached messages.")
+
+
+async def ban_and_purge_user(bot, repo, store, config, user_id: int) -> tuple[User, int]:
+    target = repo.set_role(user_id, banned=True)
+    purged = 0
+    for cached in list(store.messages.values()):
+        if cached.sender_id != user_id:
+            continue
+        touched = False
+        if not cached.deleted:
+            await remove_message(bot, repo, store, config, cached.id, reason="banned", remove_for_mods=False, notify_sender=False, send_note=False)
+            touched = True
+        if not cached.removed_for_mods:
+            await remove_message(bot, repo, store, config, cached.id, reason="banned", remove_for_mods=True, notify_sender=False, send_note=False)
+            touched = True
+        if touched:
+            purged += 1
+    return target, purged
 
 
 async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

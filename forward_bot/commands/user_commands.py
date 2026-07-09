@@ -47,12 +47,18 @@ def register_user_commands(registry: HelpRegistry) -> None:
     add("about", "Info", "Show bot rules/about text.", about)
     add("users", "Info", "Show user counts.", users_cmd)
     add("info", "Info", "Show your info, or target info for mods/admins.", info_cmd)
-    add("toggleconfirmation", "Preferences", "Toggle questionable-message confirmations.", toggle_confirmation)
-    add("togglevotebutton", "Preferences", "Toggle inline remove-vote buttons.", toggle_vote_button)
-    add("togglepotentiallyunwanted", "Preferences", "Toggle hiding potentially unwanted messages.", toggle_puw)
-    add("toggledups", "Preferences", "Toggle duplicate-media recipient filtering.", toggle_dups)
-    add("togglesign", "Identity", "Toggle persistent signing when enabled in config.", toggle_sign)
-    add("toggletripcode", "Identity", "Toggle persistent tripcode when enabled in config.", toggle_tripcode)
+    add("toggleconfirmation", "Preferences",
+        "Toggle questionable-message confirmations.", toggle_confirmation)
+    add("togglevotebutton", "Preferences",
+        "Toggle inline remove-vote buttons.", toggle_vote_button)
+    add("togglepotentiallyunwanted", "Preferences",
+        "Toggle hiding potentially unwanted messages.", toggle_puw)
+    add("toggledups", "Preferences",
+        "Toggle duplicate-media recipient filtering.", toggle_dups)
+    add("togglesign", "Identity",
+        "Toggle persistent signing when enabled in config.", toggle_sign)
+    add("toggletripcode", "Identity",
+        "Toggle persistent tripcode when enabled in config.", toggle_tripcode)
     add("settripcode", "Identity", "Set tripcode with name#secret.", set_tripcode)
     add("unsettripcode", "Identity", "Clear tripcode.", unset_tripcode)
     add("s", "Identity", "Send one signed message.", signed_send)
@@ -60,12 +66,15 @@ def register_user_commands(registry: HelpRegistry) -> None:
     add("block", "Safety", "Block a sender by reply or visible user reference.", block)
     add("unblock", "Safety", "Remove your most recent block.", unblock)
     add("credit", "Credits", "Transfer credits by reply or reference.", credit)
-    add("creditstats", "Credits", "Show credit leaderboard and economy details.", creditstats)
+    add("creditstats", "Credits",
+        "Show credit leaderboard and economy details.", creditstats)
     add("gamble", "Credits", "Gamble credits with 50% odds.", gamble)
     add("invite", "Invites", "Create or show your invite link.", invite)
-    add("sendinvite", "Invites", "Forward a described Telegram invite link.", sendinvite)
+    add("sendinvite", "Invites",
+        "Forward a described Telegram invite link.", sendinvite)
     add("unsend", "Moderation", "Remove your own replied message for a cost.", unsend)
-    add("deletevote", "Moderation", "Vote to remove a replied message. You can also react with ✍️ on a message.", deletevote)
+    add("deletevote", "Moderation",
+        "Vote to remove a replied message. You can also react with ✍️ on a message.", deletevote)
     add("reactions", "Preferences", "Toggle vote reaction notifications.", reactions)
     add("w", "Whispers", "Whisper to a user by reply or reference.", whisper)
     add("wmods", "Whispers", "Whisper to moderators/admins.", wmods)
@@ -97,19 +106,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         invite_info = repo.redeem_invite(context.args[0], user.telegram_id)
         if invite_info:
             inviter_id = int(invite_info["inviter_id"])
-            reward, inviter = apply_credit(repo, config, inviter_id, float(config.get("credits.invite_reward", 5) or 5), "invite_reward")
+            reward, inviter = apply_credit(repo, config, inviter_id, float(
+                config.get("credits.invite_reward", 5) or 5), "invite_reward")
             repo.clear_cooldown(inviter_id)
             if inviter and inviter.has_started:
                 try:
                     await context.bot.send_message(inviter_id, f"Invite used. Reward: {reward:.2f} credits. Balance: {inviter.credits:.2f}. Cooldown cleared.")
                 except TelegramError as exc:
-                    log_telegram_error(LOGGER, "invite.notify_inviter", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=inviter_id)
+                    log_telegram_error(LOGGER, "invite.notify_inviter", exc, aggregate=context.application.bot_data.get(
+                        "aggregate_logger"), repo=repo, user_id=inviter_id)
                     pass
     if joining_now:
-        initial = int(config.get("onboarding.initial_cooldown_seconds", 0) or 0)
-        prompt = onboarding_prompt(user, repo) if requires_onboarding_answers(user, repo) else ""
+        initial = int(config.get(
+            "onboarding.initial_cooldown_seconds", 0) or 0)
+        prompt = onboarding_prompt(
+            user, repo) if requires_onboarding_answers(user, repo) else ""
         if initial > 0 and not user.is_mod_or_admin:
-            repo.set_cooldown(user.telegram_id, initial, "onboarding", None, stack=False)
+            repo.set_cooldown(user.telegram_id, initial,
+                              "onboarding", None, stack=False)
             text = f"Started. Initial cooldown: {human_seconds(initial)}. Invites can clear inviter cooldowns."
         else:
             text = "Started."
@@ -117,7 +131,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             text = f"{text}\n\n{prompt}"
         await msg.reply_text(text)
     else:
-        prompt = onboarding_prompt(user, repo) if requires_onboarding_answers(user, repo) else ""
+        prompt = onboarding_prompt(
+            user, repo) if requires_onboarding_answers(user, repo) else ""
         if prompt:
             await msg.reply_text(f"Receiving enabled.\n\n{prompt}")
         else:
@@ -160,7 +175,8 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def _command_payload(update: Update, command: str) -> str:
     msg = update.effective_message
     text = msg.text or msg.caption or "" if msg else ""
-    match = re.match(rf"^/{re.escape(command)}(?:@\w+)?(?:\s+([\s\S]*))?$", text)
+    match = re.match(
+        rf"^/{re.escape(command)}(?:@\w+)?(?:\s+([\s\S]*))?$", text)
     return (match.group(1) or "").strip() if match else ""
 
 
@@ -204,12 +220,28 @@ async def _toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, column: st
     await update.effective_message.reply_text(f"{label}: {'on' if new else 'off'}")
 
 
-async def toggle_confirmation(update, context): await _toggle(update, context, "confirmation_enabled", "Confirmations")
-async def toggle_vote_button(update, context): await _toggle(update, context, "vote_buttons_enabled", "Vote buttons")
-async def toggle_puw(update, context): await _toggle(update, context, "hide_potentially_unwanted", "Hide potentially unwanted")
-async def toggle_dups(update, context): await _toggle(update, context, "filter_duplicates", "Duplicate filtering")
-async def reactions(update, context): await _toggle(update, context, "votes_enabled", "Vote notifications")
-async def togglefight(update, context): await _toggle(update, context, "fights_enabled", "Fight requests")
+async def toggle_confirmation(update, context): await _toggle(
+    update, context, "confirmation_enabled", "Confirmations")
+
+
+async def toggle_vote_button(update, context): await _toggle(
+    update, context, "vote_buttons_enabled", "Vote buttons")
+
+
+async def toggle_puw(update, context): await _toggle(
+    update, context, "hide_potentially_unwanted", "Hide potentially unwanted")
+
+
+async def toggle_dups(update, context): await _toggle(
+    update, context, "filter_duplicates", "Duplicate filtering")
+
+
+async def reactions(update, context): await _toggle(
+    update, context, "votes_enabled", "Vote notifications")
+
+
+async def togglefight(update, context): await _toggle(
+    update, context, "fights_enabled", "Fight requests")
 
 
 async def toggle_sign(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -236,7 +268,8 @@ async def set_tripcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     name, secret = raw.split("#", 1)
     try:
-        name, code = make_tripcode(name, secret, str(get_config(context).get("bot.global_salt", "")))
+        name, code = make_tripcode(name, secret, str(
+            get_config(context).get("bot.global_salt", "")))
     except ValueError as exc:
         await update.effective_message.reply_text(str(exc))
         return
@@ -330,22 +363,26 @@ async def credit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if user.credits < amount:
             await command_reply(update, context, "Insufficient credits.")
             return
-        sender, target = repo.transfer_credits(user.telegram_id, target.telegram_id, amount)
+        sender, target = repo.transfer_credits(
+            user.telegram_id, target.telegram_id, amount)
         touch_activity(context, user.telegram_id)
         await command_reply(update, context, f"Sent {amount:.2f} credits to {display_identity_html(target, config, viewer=user)}. Balance: {sender.credits:.2f}", parse_mode="HTML")
         try:
             await context.bot.send_message(target.telegram_id, f"You received {amount:.2f} credits.", reply_to_message_id=await reply_to_for_target(update, context, target.telegram_id))
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "credit.notify_target", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=target.telegram_id)
+            log_telegram_error(LOGGER, "credit.notify_target", exc, aggregate=context.application.bot_data.get(
+                "aggregate_logger"), repo=repo, user_id=target.telegram_id)
             pass
     else:
-        applied, target = repo.apply_credit_change(target.telegram_id, amount, "admin_adjustment", daily_caps=None)
+        applied, target = repo.apply_credit_change(
+            target.telegram_id, amount, "admin_adjustment", daily_caps=None)
         maybe_apply_negative_cooldown(repo, config, target)
         await command_reply(update, context, f"Adjusted {display_identity_html(target, config, viewer=user)} by {applied:.2f}. Balance: {target.credits:.2f}", parse_mode="HTML")
         try:
             await context.bot.send_message(target.telegram_id, f"Admin credit adjustment: {applied:.2f}. Balance: {target.credits:.2f}", reply_to_message_id=await reply_to_for_target(update, context, target.telegram_id))
         except TelegramError as exc:
-            log_telegram_error(LOGGER, "credit.admin_notify_target", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=target.telegram_id)
+            log_telegram_error(LOGGER, "credit.admin_notify_target", exc, aggregate=context.application.bot_data.get(
+                "aggregate_logger"), repo=repo, user_id=target.telegram_id)
             pass
 
 
@@ -362,14 +399,17 @@ async def creditstats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     config = get_config(context)
     values = repo.credit_values(started_only=True)
     mn, med, mx = mean_median(values)
-    lines = ["<b>Credit Stats</b>", "", "<b>Leaderboards</b>", "Current balance:"]
+    lines = ["<b>Credit Stats</b>", "",
+             "<b>Leaderboards</b>", "Current balance:"]
     for i, top in enumerate(repo.top_current_credits(10), 1):
-        lines.append(f"{i}. {display_identity_html(top, config, viewer=user)}: {top.credits:.2f}")
+        lines.append(
+            f"{i}. {display_identity_html(top, config, viewer=user)}: {top.credits:.2f}")
     daily = repo.top_daily_earners(10)
     lines.append("")
     lines.append("Today's earners:")
     lines.extend(
-        [f"{i}. {display_identity_html(top, config, viewer=user)}: +{earned:.2f}" for i, (top, earned) in enumerate(daily, 1)]
+        [f"{i}. {display_identity_html(top, config, viewer=user)}: +{earned:.2f}" for i,
+         (top, earned) in enumerate(daily, 1)]
         or ["No earnings recorded today."]
     )
     caller = user.credits if user else 0
@@ -409,13 +449,16 @@ async def creditstats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "",
         "<b>Daily Earning Caps</b>",
     ])
-    lines.extend([f"{_credit_reason_label(reason)}: {'unlimited' if cap < 0 else f'{cap:.2f}'}" for reason, cap in sorted(caps.items())] or ["No caps configured."])
+    lines.extend([f"{_credit_reason_label(reason)}: {'unlimited' if cap < 0 else f'{cap:.2f}'}" for reason,
+                 cap in sorted(caps.items())] or ["No caps configured."])
     lines.append("")
     lines.append("<b>Downvote Cost Schedule</b>")
-    lines.extend([f"After {item.get('minute')} minute(s): {float(item.get('cost', 0)):.2f}" for item in downvote_schedule] or ["No schedule configured."])
+    lines.extend([f"After {item.get('minute')} minute(s): {float(item.get('cost', 0)):.2f}" for item in downvote_schedule] or [
+                 "No schedule configured."])
     lines.append("")
     lines.append("<b>Loss Rate Schedule</b>")
-    lines.extend([f"At {float(item.get('credits', 0)):.2f} credits: {float(item.get('loss_rate', 0)) * 100:.2f}%" for item in loss_schedule] or ["No schedule configured."])
+    lines.extend([f"At {float(item.get('credits', 0)):.2f} credits: {float(item.get('loss_rate', 0)) * 100:.2f}%" for item in loss_schedule]
+                 or ["No schedule configured."])
     await update.effective_message.reply_html("\n".join(lines))
 
 
@@ -448,17 +491,20 @@ async def gamble(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("Use /gamble <amount>")
         return
     amount = _parse_amount(context.args[0])
-    max_amount = float(get_config(context).get("gamble.max_amount", 1000) or 1000)
+    max_amount = float(get_config(context).get(
+        "gamble.max_amount", 1000) or 1000)
     if amount is None or amount < 0.01 or amount > user.credits or amount > max_amount:
         await update.effective_message.reply_text("Invalid gamble amount.")
         return
     repo = get_repo(context)
     config = get_config(context)
     if random.random() < 0.5:
-        applied, updated = apply_credit(repo, config, user.telegram_id, amount, "gamble_win")
+        applied, updated = apply_credit(
+            repo, config, user.telegram_id, amount, "gamble_win")
         result = f"Won {applied:.2f}"
     else:
-        applied, updated = apply_credit(repo, config, user.telegram_id, -amount, "gamble_loss", cap_positive=False)
+        applied, updated = apply_credit(
+            repo, config, user.telegram_id, -amount, "gamble_loss", cap_positive=False)
         result = f"Lost {abs(applied):.2f}"
     touch_activity(context, user.telegram_id)
     await update.effective_message.reply_text(f"{result}. Balance: {updated.credits:.2f}")
@@ -481,9 +527,10 @@ async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     touch_activity(context, user.telegram_id)
     try:
         me = await context.bot.get_me()
-        text = f"https://t.me/{me.username}?start={code}" if me.username else code
+        text = f"Earn credits by sharing this invite: https://t.me/{me.username}?start={code}" if me.username else code
     except TelegramError as exc:
-        log_telegram_error(LOGGER, "invite.get_me", exc, aggregate=context.application.bot_data.get("aggregate_logger"), user_id=user.telegram_id)
+        log_telegram_error(LOGGER, "invite.get_me", exc, aggregate=context.application.bot_data.get(
+            "aggregate_logger"), user_id=user.telegram_id)
         text = code
     await update.effective_message.reply_text(text)
 
@@ -493,7 +540,8 @@ async def sendinvite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/", text, re.I):
         await update.effective_message.reply_text("Use /sendinvite <Telegram invite link> <description>")
         return
-    without_links = re.sub(r"https?://\S+|(?:t\.me|telegram\.me)/\S+", "", text, flags=re.I)
+    without_links = re.sub(
+        r"https?://\S+|(?:t\.me|telegram\.me)/\S+", "", text, flags=re.I)
     if len(re.sub(r"\W+", "", without_links)) < 3:
         await update.effective_message.reply_text("Add a meaningful description to the invite link.")
         return
@@ -516,7 +564,8 @@ async def unsend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     repo = get_repo(context)
     if not user.is_admin:
-        apply_credit(repo, get_config(context), user.telegram_id, -cost, "unsend_cost", cap_positive=False)
+        apply_credit(repo, get_config(context), user.telegram_id, -
+                     cost, "unsend_cost", cap_positive=False)
     count = await remove_message(context.bot, repo, get_store(context), get_config(context), msg.id, reason="unsent by sender", notify_sender=False, remove_for_mods=True)
     updated = repo.get_user(user.telegram_id)
     await command_reply(update, context, f"Unsent. Removed {count} copies. Cost: {cost:.2f}. Balance: {updated.credits:.2f}.")
@@ -551,7 +600,8 @@ async def whisper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         normal_msg, _, _ = await resolve_message_from_reply(update, context)
         if normal_msg:
             reply_to_message_id = normal_msg.id
-        wdel = store.resolve_whisper_delivery(user.telegram_id, update.effective_message.reply_to_message.message_id)
+        wdel = store.resolve_whisper_delivery(
+            user.telegram_id, update.effective_message.reply_to_message.message_id)
         if wdel:
             reply_to_whisper_id = wdel.whisper_id
     elif len(context.args or []) >= 2:
@@ -570,7 +620,8 @@ async def _send_whisper(update: Update, context: ContextTypes.DEFAULT_TYPE, user
     if target.telegram_id == user.telegram_id:
         await command_reply(update, context, "You cannot whisper yourself.")
         return
-    cost = 0.0 if user.is_mod_or_admin or modwhisper else float(config.get("credits.whisper_cost", 1) or 1)
+    cost = 0.0 if user.is_mod_or_admin or modwhisper else float(
+        config.get("credits.whisper_cost", 1) or 1)
     unlock = float(config.get("credits.whisper_unlock_credits", 30) or 30)
     if not user.is_mod_or_admin and not modwhisper and user.credits < unlock:
         await command_reply(update, context, "You need more credits to unlock whispers.")
@@ -609,9 +660,11 @@ async def _send_whisper(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         if prior_msg and prior_msg.sender_id == target.telegram_id and prior_msg.source_chat_id == target.telegram_id:
             reply_to = prior_msg.source_message_id
         else:
-            reply_to = store.delivery_reply_for_recipient(reply_to_message_id, target.telegram_id)
+            reply_to = store.delivery_reply_for_recipient(
+                reply_to_message_id, target.telegram_id)
     elif reply_to_whisper_id:
-        priorw = next((d for d in store.deliveries_for_whisper(reply_to_whisper_id) if d.recipient_id == target.telegram_id), None)
+        priorw = next((d for d in store.deliveries_for_whisper(
+            reply_to_whisper_id) if d.recipient_id == target.telegram_id), None)
         reply_to = priorw.telegram_message_id if priorw else None
     if (reply_to_message_id or reply_to_whisper_id) and not reply_to:
         await command_reply(update, context, "Reply target is not available for the recipient.")
@@ -619,24 +672,32 @@ async def _send_whisper(update: Update, context: ContextTypes.DEFAULT_TYPE, user
     try:
         sent = await context.bot.send_message(target.telegram_id, body, parse_mode="HTML", reply_to_message_id=reply_to)
     except TelegramError as exc:
-        log_telegram_error(LOGGER, "whisper.send_target", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=target.telegram_id)
+        log_telegram_error(LOGGER, "whisper.send_target", exc, aggregate=context.application.bot_data.get(
+            "aggregate_logger"), repo=repo, user_id=target.telegram_id)
         await command_reply(update, context, "Recipient unavailable.")
         return
-    whisper_obj = store.add_whisper(sender_id=user.telegram_id, target_id=target.telegram_id, text=body, is_modwhisper=modwhisper, reply_to_message_id=reply_to_message_id, reply_to_whisper_id=reply_to_whisper_id)
+    whisper_obj = store.add_whisper(sender_id=user.telegram_id, target_id=target.telegram_id, text=body,
+                                    is_modwhisper=modwhisper, reply_to_message_id=reply_to_message_id, reply_to_whisper_id=reply_to_whisper_id)
     if update.effective_message:
-        store.add_whisper_delivery(whisper_obj.id, user.telegram_id, update.effective_message.message_id)
-    store.add_whisper_delivery(whisper_obj.id, target.telegram_id, sent.message_id)
+        store.add_whisper_delivery(
+            whisper_obj.id, user.telegram_id, update.effective_message.message_id)
+    store.add_whisper_delivery(
+        whisper_obj.id, target.telegram_id, sent.message_id)
     for mod in repo.list_users():
         if mod.is_mod_or_admin and mod.has_started and mod.telegram_id not in {user.telegram_id, target.telegram_id}:
             try:
-                mirror_reply_to = _whisper_mirror_reply_to(store, mod.telegram_id, reply_to_message_id, reply_to_whisper_id)
+                mirror_reply_to = _whisper_mirror_reply_to(
+                    store, mod.telegram_id, reply_to_message_id, reply_to_whisper_id)
                 mirror = await context.bot.send_message(mod.telegram_id, body, parse_mode="HTML", reply_to_message_id=mirror_reply_to)
-                store.add_whisper_delivery(whisper_obj.id, mod.telegram_id, mirror.message_id)
+                store.add_whisper_delivery(
+                    whisper_obj.id, mod.telegram_id, mirror.message_id)
             except TelegramError as exc:
-                log_telegram_error(LOGGER, "whisper.send_mirror", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=mod.telegram_id)
+                log_telegram_error(LOGGER, "whisper.send_mirror", exc, aggregate=context.application.bot_data.get(
+                    "aggregate_logger"), repo=repo, user_id=mod.telegram_id)
                 pass
     if cost:
-        _, user = apply_credit(repo, config, user.telegram_id, -cost, "whisper_cost", cap_positive=False)
+        _, user = apply_credit(
+            repo, config, user.telegram_id, -cost, "whisper_cost", cap_positive=False)
     touch_activity(context, user.telegram_id)
     await command_reply(update, context, f"Whisper sent. Cost: {cost:.2f}. Balance: {user.credits:.2f}")
 
@@ -648,7 +709,8 @@ def _whisper_mirror_reply_to(store, recipient_id: int, reply_to_message_id: int 
             return prior_msg.source_message_id
         return store.delivery_reply_for_recipient(reply_to_message_id, recipient_id)
     if reply_to_whisper_id:
-        delivery = next((d for d in store.deliveries_for_whisper(reply_to_whisper_id) if d.recipient_id == recipient_id), None)
+        delivery = next((d for d in store.deliveries_for_whisper(
+            reply_to_whisper_id) if d.recipient_id == recipient_id), None)
         return delivery.telegram_message_id if delivery else None
     return None
 
@@ -662,18 +724,22 @@ async def wmods(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     repo = get_repo(context)
     store = get_store(context)
     body = f"<i><b>Modwhisper:</b></i> {html_escape(text)}"
-    whisper_obj = store.add_whisper(sender_id=user.telegram_id, target_id=0, text=body, is_modwhisper=True)
+    whisper_obj = store.add_whisper(
+        sender_id=user.telegram_id, target_id=0, text=body, is_modwhisper=True)
     if update.effective_message:
-        store.add_whisper_delivery(whisper_obj.id, user.telegram_id, update.effective_message.message_id)
+        store.add_whisper_delivery(
+            whisper_obj.id, user.telegram_id, update.effective_message.message_id)
     sent_count = 0
     for target in repo.list_users():
         if target.is_mod_or_admin and target.has_started and target.telegram_id != user.telegram_id:
             try:
                 msg = await context.bot.send_message(target.telegram_id, body, parse_mode="HTML")
-                store.add_whisper_delivery(whisper_obj.id, target.telegram_id, msg.message_id)
+                store.add_whisper_delivery(
+                    whisper_obj.id, target.telegram_id, msg.message_id)
                 sent_count += 1
             except TelegramError as exc:
-                log_telegram_error(LOGGER, "wmods.send", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=target.telegram_id)
+                log_telegram_error(LOGGER, "wmods.send", exc, aggregate=context.application.bot_data.get(
+                    "aggregate_logger"), repo=repo, user_id=target.telegram_id)
                 pass
     touch_activity(context, user.telegram_id)
     await update.effective_message.reply_text(f"Message sent ({sent_count} mod copies).")
@@ -712,7 +778,8 @@ async def sauce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if user.credits < cutoff:
             await command_reply(update, context, "You need enough credits to use /sauce.")
             return
-    file_id = msg.thumbnail_file_id if msg.content_type in {"video", "animation", "video_note", "sticker"} else msg.media_file_id
+    file_id = msg.thumbnail_file_id if msg.content_type in {
+        "video", "animation", "video_note", "sticker"} else msg.media_file_id
     file_id = file_id or msg.media_file_id or msg.thumbnail_file_id
     if not file_id:
         await command_reply(update, context, "No searchable media.")
@@ -722,7 +789,8 @@ async def sauce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         tg_file = await context.bot.get_file(file_id)
         url = tg_file.file_path
         import aiohttp
-        params = {"api_key": config.get("saucenao.api_key"), "url": url, "numres": int(config.get("saucenao.num_results", 6) or 6), "output_type": 2}
+        params = {"api_key": config.get("saucenao.api_key"), "url": url, "numres": int(
+            config.get("saucenao.num_results", 6) or 6), "output_type": 2}
         async with aiohttp.ClientSession() as session:
             async with session.get("https://saucenao.com/search.php", params=params, timeout=20) as resp:
                 data = await resp.json()
@@ -749,7 +817,8 @@ def _format_sauce(data) -> str:
         f"Similarity: {header.get('similarity', '?')}%",
     ]
     if item.get("author_name") or item.get("member_name"):
-        lines.append(f"Author: {item.get('author_name') or item.get('member_name')}")
+        lines.append(
+            f"Author: {item.get('author_name') or item.get('member_name')}")
     lines.extend(urls[:3])
     return "\n".join(lines)
 
@@ -759,8 +828,10 @@ def _sauce_remaining_text(store, config, user_id: int, *, user_used: int | None 
         user_used, global_used = store.get_sauce_usage(user_id)
     per_user = int(config.get("saucenao.per_user_daily_limit", -1) or -1)
     global_limit = int(config.get("saucenao.global_daily_limit", -1) or -1)
-    user_remaining = "unlimited" if per_user < 0 else str(max(0, per_user - user_used))
-    global_remaining = "unlimited" if global_limit < 0 else str(max(0, global_limit - global_used))
+    user_remaining = "unlimited" if per_user < 0 else str(
+        max(0, per_user - user_used))
+    global_remaining = "unlimited" if global_limit < 0 else str(
+        max(0, global_limit - global_used))
     return f"Remaining today: user {user_remaining}, global {global_remaining}."
 
 
@@ -772,7 +843,8 @@ async def fight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not user or not config.get("fights.enabled", True):
         await command_reply(update, context, "Fights are disabled.")
         return
-    cooldown_left = store.latest_fight_request_seconds_left(user.telegram_id, int(config.get("fights.cooldown_seconds", 300) or 300))
+    cooldown_left = store.latest_fight_request_seconds_left(
+        user.telegram_id, int(config.get("fights.cooldown_seconds", 300) or 300))
     if cooldown_left > 0:
         await command_reply(update, context, f"Fight cooldown: {human_seconds(cooldown_left)}.")
         return
@@ -792,24 +864,32 @@ async def fight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await command_reply(update, context, "Use /fight in reply or /fight <user> [amount]. Amount must be numeric.")
             return
     else:
-        stake = round_credits(min(max_cap, max(1.0, math.sqrt(max(0.0, user.credits)))))
+        stake = round_credits(
+            min(max_cap, max(1.0, math.sqrt(max(0.0, user.credits)))))
     if stake < 0.01 or stake > max_cap or user.credits < stake:
         await command_reply(update, context, "Invalid stake.")
         return
-    fee = round_credits(min(float(config.get("fights.initiation_fee_max", 20) or 20), max(float(config.get("fights.initiation_fee_min", 1) or 1), stake * float(config.get("fights.initiation_fee_percent", 0.05) or 0.05))))
+    fee = round_credits(min(float(config.get("fights.initiation_fee_max", 20) or 20), max(float(config.get(
+        "fights.initiation_fee_min", 1) or 1), stake * float(config.get("fights.initiation_fee_percent", 0.05) or 0.05))))
     if user.credits < stake + fee:
         await command_reply(update, context, "Insufficient credits for stake plus fee.")
         return
-    tier_diff = math.floor(math.log2(max(1.0, user.credits))) - math.floor(math.log2(max(1.0, target.credits)))
+    tier_diff = math.floor(math.log2(max(1.0, user.credits))) - \
+        math.floor(math.log2(max(1.0, target.credits)))
     matchup = "even"
-    if tier_diff >= 2: matchup = "advantage"
-    elif tier_diff == 1: matchup = "slight advantage"
-    elif tier_diff == -1: matchup = "slight disadvantage"
-    elif tier_diff <= -2: matchup = "disadvantage"
+    if tier_diff >= 2:
+        matchup = "advantage"
+    elif tier_diff == 1:
+        matchup = "slight advantage"
+    elif tier_diff == -1:
+        matchup = "slight disadvantage"
+    elif tier_diff <= -2:
+        matchup = "disadvantage"
     timeout = int(config.get("fights.request_timeout_seconds", 300) or 300)
     from datetime import timedelta
     from forward_bot.utils import now_utc
-    fight_req = store.add_fight(sender_id=user.telegram_id, target_id=target.telegram_id, stake=stake, fee=fee, matchup=matchup, command_message_id=update.effective_message.message_id, expires_at=now_utc() + timedelta(seconds=timeout))
+    fight_req = store.add_fight(sender_id=user.telegram_id, target_id=target.telegram_id, stake=stake, fee=fee, matchup=matchup,
+                                command_message_id=update.effective_message.message_id, expires_at=now_utc() + timedelta(seconds=timeout))
     markup = InlineKeyboardMarkup([[
         InlineKeyboardButton("Accept", callback_data=f"facc:{fight_req.id}"),
         InlineKeyboardButton("Decline", callback_data=f"fdec:{fight_req.id}"),
@@ -822,12 +902,14 @@ async def fight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         sent = await context.bot.send_message(target.telegram_id, f"Fight request: stake {stake:.2f}, matchup {matchup}.", reply_to_message_id=reply_to, reply_markup=markup)
     except TelegramError as exc:
-        log_telegram_error(LOGGER, "fight.send_request", exc, aggregate=context.application.bot_data.get("aggregate_logger"), repo=repo, user_id=target.telegram_id)
+        log_telegram_error(LOGGER, "fight.send_request", exc, aggregate=context.application.bot_data.get(
+            "aggregate_logger"), repo=repo, user_id=target.telegram_id)
         store.fights.pop(fight_req.id, None)
         await command_reply(update, context, "Recipient unavailable.")
         return
     fight_req.target_message_id = sent.message_id
-    _, updated = apply_credit(repo, config, user.telegram_id, -fee, "fight_fee", cap_positive=False)
+    _, updated = apply_credit(
+        repo, config, user.telegram_id, -fee, "fight_fee", cap_positive=False)
     touch_activity(context, user.telegram_id)
     balance = updated.credits if updated else user.credits - fee
     await command_reply(update, context, f"Fight sent. Fee: {fee:.2f}. Balance: {balance:.2f}.")
