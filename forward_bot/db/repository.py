@@ -27,6 +27,7 @@ class User:
     vote_buttons_enabled: bool
     hide_potentially_unwanted: bool
     filter_duplicates: bool
+    preserve_forwards: bool
     fights_enabled: bool
     sign_enabled: bool
     tripcode_enabled: bool
@@ -180,6 +181,7 @@ class Repository:
             "vote_buttons_enabled",
             "hide_potentially_unwanted",
             "filter_duplicates",
+            "preserve_forwards",
             "fights_enabled",
             "sign_enabled",
             "tripcode_enabled",
@@ -708,6 +710,7 @@ def _row_to_user(row: sqlite3.Row) -> User:
         vote_buttons_enabled=bool(row["vote_buttons_enabled"]),
         hide_potentially_unwanted=bool(row["hide_potentially_unwanted"]),
         filter_duplicates=bool(row["filter_duplicates"]),
+        preserve_forwards=bool(row["preserve_forwards"]),
         fights_enabled=bool(row["fights_enabled"]),
         sign_enabled=bool(row["sign_enabled"]),
         tripcode_enabled=bool(row["tripcode_enabled"]),

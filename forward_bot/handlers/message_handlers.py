@@ -145,6 +145,9 @@ async def _broadcast_cooldown_attempt(
     repo = get_repo(context)
     config = get_config(context)
     store = get_store(context)
+    if not user.preserve_forwards:
+        payload["forward_from_chat_id"] = None
+        payload["forward_from_message_id"] = None
     recipients = [u for u in repo.list_users(
     ) if u.has_started and u.is_mod_or_admin and not u.is_banned]
     for recipient in recipients:
@@ -228,6 +231,11 @@ async def _process_payload(
     source_message: Message,
     identity_mode: str | None = None,
 ) -> TransientMessage | None:
+    # Decide this once for the source message. Every fanout item then uses the
+    # same already-normalized payload instead of repeating conversion work.
+    if not user.preserve_forwards:
+        payload["forward_from_chat_id"] = None
+        payload["forward_from_message_id"] = None
     text = payload.get("text") or ""
     payload["text"], identity_parse_mode = _apply_identity(
         text, user, identity_mode, payload.get("content_type", "text"))
@@ -266,7 +274,26 @@ async def _process_payload(
     media_service = context.application.bot_data["media"]
     inspection = await media_service.inspect(context.bot, tm.id, payload)
     tagger = context.application.bot_data["tagger"]
-    result = await tagger.classify(payload, inspection)
+    result = await tagger.classify(payload, inspection, include_duplicates=False)
+
+    # Inspection and AI classification can yield, so refresh the sender
+    # immediately before the duplicate checker records a hash. A cooldown
+    # applied meanwhile must leave the hash unregistered for a later retry.
+    current_user = get_repo(context).get_user(user.telegram_id) or user
+    if current_user.active_cooldown_seconds > 0 and not current_user.is_mod_or_admin:
+        _aggregate(context, "pipeline.cooldown_attempt")
+        await _reply_to_message(
+            context,
+            source_message,
+            f"Cooldown active: {human_seconds(current_user.active_cooldown_seconds)}. Reason: {current_user.cooldown_reason or 'cooldown'}",
+        )
+        await _broadcast_cooldown_attempt(
+            update, context, current_user, payload,
+            source_message=source_message, identity_mode="",
+        )
+        media_service.release(tm.id)
+        return None
+    result = tagger.classify_duplicate(payload, inspection, result)
     tm.tag = result.tag
     tm.tag_reason = result.reason
     tm.media_hash = result.media_hash

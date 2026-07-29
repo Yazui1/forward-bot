@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
     vote_buttons_enabled INTEGER NOT NULL DEFAULT 1,
     hide_potentially_unwanted INTEGER NOT NULL DEFAULT 0,
     filter_duplicates INTEGER NOT NULL DEFAULT 1,
+    preserve_forwards INTEGER NOT NULL DEFAULT 0,
     fights_enabled INTEGER NOT NULL DEFAULT 1,
     sign_enabled INTEGER NOT NULL DEFAULT 0,
     tripcode_enabled INTEGER NOT NULL DEFAULT 0,
@@ -155,4 +156,8 @@ def _ensure_user_columns(conn: sqlite3.Connection) -> None:
     if "onboarding_question_index" not in columns:
         conn.execute(
             "ALTER TABLE users ADD COLUMN onboarding_question_index INTEGER NOT NULL DEFAULT 0"
+        )
+    if "preserve_forwards" not in columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN preserve_forwards INTEGER NOT NULL DEFAULT 0"
         )

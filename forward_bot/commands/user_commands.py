@@ -55,6 +55,8 @@ def register_user_commands(registry: HelpRegistry) -> None:
         "Toggle hiding potentially unwanted messages.", toggle_puw)
     add("toggledups", "Preferences",
         "Toggle duplicate-media recipient filtering.", toggle_dups)
+    add("toggleforwards", "Preferences",
+        "Toggle preserving Telegram forwards.", toggle_forwards)
     add("togglesign", "Identity",
         "Toggle persistent signing when enabled in config.", toggle_sign)
     add("toggletripcode", "Identity",
@@ -234,6 +236,10 @@ async def toggle_puw(update, context): await _toggle(
 
 async def toggle_dups(update, context): await _toggle(
     update, context, "filter_duplicates", "Duplicate filtering")
+
+
+async def toggle_forwards(update, context): await _toggle(
+    update, context, "preserve_forwards", "Forward preservation")
 
 
 async def reactions(update, context): await _toggle(

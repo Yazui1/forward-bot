@@ -44,7 +44,13 @@ class TaggingPipeline:
         self.questionable_terms = [str(x).lower() for x in config.get("tagging.questionable_terms", []) or []]
         self.potentially_unwanted_terms = [str(x).lower() for x in config.get("tagging.potentially_unwanted_terms", []) or []]
 
-    async def classify(self, payload: dict[str, Any], inspection: MediaInspection) -> TagResult:
+    async def classify(
+        self,
+        payload: dict[str, Any],
+        inspection: MediaInspection,
+        *,
+        include_duplicates: bool = True,
+    ) -> TagResult:
         result = TagResult()
         text = (payload.get("text") or "").lower()
 
@@ -89,6 +95,16 @@ class TaggingPipeline:
                 result.tag = TAG_QUESTIONABLE
                 result.reason = ai_reason or "ai-questionable"
 
+        if include_duplicates:
+            self.classify_duplicate(payload, inspection, result)
+        return result
+
+    def classify_duplicate(
+        self,
+        payload: dict[str, Any],
+        inspection: MediaInspection,
+        result: TagResult,
+    ) -> TagResult:
         if self.config.get("duplicates.enabled", True) and inspection.image_like and payload.get("content_type") != "sticker":
             digest = media_digest(inspection.preview_bytes)
             if digest:

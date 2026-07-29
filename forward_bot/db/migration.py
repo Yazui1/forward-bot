@@ -145,6 +145,7 @@ def _migrate_users(src: sqlite3.Connection, dst: sqlite3.Connection) -> set[int]
             _int_flag(row.get("vote_buttons_enabled"), True),
             _int_flag(row.get("hide_potentially_unwanted")),
             _int_flag(row.get("filter_duplicates"), True),
+            _int_flag(row.get("preserve_forwards")),
             _int_flag(row.get("fights_enabled"), True),
             _int_flag(row.get("sign_enabled")),
             _int_flag(row.get("tripcode_enabled")),
@@ -173,13 +174,13 @@ def _migrate_users(src: sqlite3.Connection, dst: sqlite3.Connection) -> set[int]
             telegram_id, username, has_started, created_at, last_activity,
             is_banned, is_moderator, is_admin,
             confirmation_enabled, votes_enabled, vote_buttons_enabled,
-            hide_potentially_unwanted, filter_duplicates, fights_enabled,
+            hide_potentially_unwanted, filter_duplicates, preserve_forwards, fights_enabled,
             sign_enabled, tripcode_enabled, tripcode_name, tripcode_hash,
             warning_count, upvotes_received, downvotes_received, credits,
             about_seen, onboarding_acknowledged, onboarding_question_index,
             cooldown_until, cooldown_reason, cooldown_applied_by,
             downvote_streak, last_downvote_at, last_daily_tax_date
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         users,
     )
