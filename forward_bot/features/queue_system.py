@@ -20,7 +20,7 @@ from forward_bot.db.repository import Repository, User
 from forward_bot.features.credits import loss_rate
 from forward_bot.features.media import MediaService
 from forward_bot.features.tombstone_media import removed_photo_media
-from forward_bot.logging_utils import AggregateLogger, log_telegram_error
+from forward_bot.logging_utils import AggregateLogger, is_message_not_found_error, log_telegram_error
 from forward_bot.utils import html_escape, now_utc, parse_dt
 
 
@@ -794,15 +794,20 @@ class DeliveryQueue:
         except TelegramError as exc:
             log_telegram_error(LOGGER, "delivery.tombstone_edit", exc, aggregate=self._aggregate_logger,
                                recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
-            pass
+            if is_message_not_found_error(exc):
+                self.store.mark_delivery_deleted(
+                    delivery.id, tombstone_message_id=None, kind="already_missing")
+                return
         try:
             await self._bot.delete_message(delivery.recipient_id, delivery.telegram_message_id)
         except TelegramError as exc:
             log_telegram_error(LOGGER, "delivery.tombstone_delete", exc, aggregate=self._aggregate_logger,
                                recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
-            pass
+            kind = "already_missing" if is_message_not_found_error(exc) else "deleted"
+        else:
+            kind = "deleted"
         self.store.mark_delivery_deleted(
-            delivery.id, tombstone_message_id=None, kind="deleted")
+            delivery.id, tombstone_message_id=None, kind=kind)
 
     def _message_deleted(self, message_id: int) -> bool:
         message = self.store.get_message(message_id)

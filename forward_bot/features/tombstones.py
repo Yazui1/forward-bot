@@ -17,7 +17,7 @@ from forward_bot.db.repository import Repository, User
 from forward_bot.features.credits import apply_credit, maybe_apply_negative_cooldown
 from forward_bot.features.tombstone_media import removed_photo_media
 from forward_bot.identity import display_identity_html
-from forward_bot.logging_utils import log_telegram_error
+from forward_bot.logging_utils import is_message_not_found_error, log_telegram_error
 from forward_bot.utils import html_escape, round_credits
 
 
@@ -152,13 +152,19 @@ async def _tombstone_delivery(
         return True
     except TelegramError as exc:
         log_telegram_error(LOGGER, "tombstone.edit", exc, aggregate=_aggregate(store), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
-        pass
+        if is_message_not_found_error(exc):
+            store.mark_delivery_deleted(delivery.id, tombstone_message_id=None, kind="already_missing")
+            return True
     try:
         await bot.delete_message(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id)
     except TelegramError as exc:
         log_telegram_error(LOGGER, "tombstone.delete", exc, aggregate=_aggregate(store), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
-        store.mark_delivery_deleted(delivery.id, tombstone_message_id=None, kind="delete_failed")
-        return False
+        store.mark_delivery_deleted(
+            delivery.id,
+            tombstone_message_id=None,
+            kind="already_missing" if is_message_not_found_error(exc) else "delete_failed",
+        )
+        return is_message_not_found_error(exc)
     store.mark_delivery_deleted(delivery.id, tombstone_message_id=None, kind="deleted")
     return True
 

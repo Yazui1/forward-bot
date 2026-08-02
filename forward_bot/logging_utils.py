@@ -16,6 +16,7 @@ COMMON_TELEGRAM_ERROR_MARKERS = (
     "forbidden",
     "user is deactivated",
     "message to edit not found",
+    "message to delete not found",
     "message to forward not found",
     "message is not modified",
     "message to be replied not found",
@@ -101,6 +102,11 @@ def is_unreachable_telegram_error(exc: TelegramError) -> bool:
         return True
     text = str(exc).lower()
     return any(marker in text for marker in UNREACHABLE_TELEGRAM_ERROR_MARKERS)
+
+
+def is_message_not_found_error(exc: TelegramError) -> bool:
+    text = str(exc).lower()
+    return "message to edit not found" in text or "message to delete not found" in text
 
 
 async def aggregate_log_worker(aggregate: AggregateLogger, interval_seconds: int, stop_event: asyncio.Event) -> None:
