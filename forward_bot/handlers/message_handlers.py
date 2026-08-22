@@ -151,11 +151,9 @@ async def _broadcast_cooldown_attempt(
     recipients = [u for u in repo.list_users(
     ) if u.has_started and u.is_mod_or_admin and not u.is_banned]
     for recipient in recipients:
-        body, identity_parse_mode = _apply_identity(payload.get(
-            "text") or "", user, identity_mode, payload.get("content_type", "text"))
-        parse_mode = identity_parse_mode or payload.get("parse_mode")
         text = _cooldown_attempt_text(
-            user, recipient, config, body, parse_mode)
+            user, recipient, config, payload.get("text") or "",
+            payload.get("parse_mode"), identity_mode)
         reply_target_id = _resolve_reply_target(source_message, user, context)
         tm = store.add_message(
             sender_id=user.telegram_id,
@@ -183,11 +181,22 @@ async def _broadcast_cooldown_attempt(
         context.application.bot_data["queue"].enqueue_message(tm, [recipient])
 
 
-def _cooldown_attempt_text(user: User, viewer: User, config, body: str, parse_mode: str | None) -> str:
-    header = (
-        f"<i>In cooldown (Left: {html_escape(human_seconds(user.active_cooldown_seconds))}):</i> "
-        f"{display_identity_html(user, config, viewer=viewer)}"
-    )
+def _cooldown_attempt_text(
+    user: User,
+    viewer: User,
+    config,
+    body: str,
+    parse_mode: str | None,
+    identity_mode: str | None = None,
+) -> str:
+    if identity_mode == "signed" or (identity_mode is None and user.sign_enabled):
+        identity = f"@{html_escape(user.username)}" if user.username else "signed"
+    elif ((identity_mode == "tripcode" or (identity_mode is None and user.tripcode_enabled))
+          and user.tripcode_name and user.tripcode_hash):
+        identity = f"<b>{html_escape(user.tripcode_name)}</b> !{html_escape(user.tripcode_hash)}"
+    else:
+        identity = display_identity_html(user, config, viewer=viewer)
+    header = f"Cooled down for {html_escape(human_seconds(user.active_cooldown_seconds))} - {identity}:"
     if not body:
         return header
     if parse_mode == "HTML":
@@ -237,6 +246,8 @@ async def _process_payload(
         payload["forward_from_chat_id"] = None
         payload["forward_from_message_id"] = None
     text = payload.get("text") or ""
+    classification_payload = dict(payload)
+    classification_payload["text"] = text
     payload["text"], identity_parse_mode = _apply_identity(
         text, user, identity_mode, payload.get("content_type", "text"))
     if identity_parse_mode:
@@ -274,7 +285,7 @@ async def _process_payload(
     media_service = context.application.bot_data["media"]
     inspection = await media_service.inspect(context.bot, tm.id, payload)
     tagger = context.application.bot_data["tagger"]
-    result = await tagger.classify(payload, inspection, include_duplicates=False)
+    result = await tagger.classify(classification_payload, inspection, include_duplicates=False)
 
     # Inspection and AI classification can yield, so refresh the sender
     # immediately before the duplicate checker records a hash. A cooldown
@@ -288,12 +299,28 @@ async def _process_payload(
             f"Cooldown active: {human_seconds(current_user.active_cooldown_seconds)}. Reason: {current_user.cooldown_reason or 'cooldown'}",
         )
         await _broadcast_cooldown_attempt(
-            update, context, current_user, payload,
-            source_message=source_message, identity_mode="",
+            update, context, current_user, classification_payload,
+            source_message=source_message, identity_mode=identity_mode,
         )
         media_service.release(tm.id)
         return None
-    result = tagger.classify_duplicate(payload, inspection, result)
+    if result.tag == TAG_POTENTIALLY_UNWANTED:
+        if payload.get("content_type") in {"text", None}:
+            _aggregate(context, "pipeline.potentially_unwanted_blocked")
+            await _reply_to_message(context, source_message, "Message filtered: potentially unwanted text.")
+            media_service.release(tm.id)
+            return None
+        # Keep the media but remove the entire caption containing the unwanted
+        # term. Forwarding the source would preserve that caption, so force a
+        # fresh media send as well.
+        payload["text"] = ""
+        payload["parse_mode"] = None
+        tm.text = ""
+        tm.parse_mode = None
+        tm.metadata["forward_from_chat_id"] = None
+        tm.metadata["forward_from_message_id"] = None
+        result.tag = TAG_OK
+    result = tagger.classify_duplicate(classification_payload, inspection, result)
     tm.tag = result.tag
     tm.tag_reason = result.reason
     tm.media_hash = result.media_hash

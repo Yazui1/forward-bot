@@ -1,5 +1,6 @@
 __pycache__
 venv
+.venv
 data/*.db
 model.keras
 e2e/telethon_config.yml

@@ -168,4 +168,7 @@ async def _remove_collateral(bot: Bot, repo: Repository, store: TransientStore, 
         if after:
             neighbors.append(after.pop(0))
     for msg in neighbors:
-        await remove_message(bot, repo, store, config, msg.id, reason="collateral removal", notify_sender=False)
+        await remove_message(
+            bot, repo, store, config, msg.id,
+            reason="collateral removal", notify_sender=False, send_note=False,
+        )

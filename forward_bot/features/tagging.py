@@ -83,10 +83,6 @@ class TaggingPipeline:
                     result.reason = f"questionable-term:{term}"
                     break
 
-        if inspection.empty_preview and payload.get("content_type") not in {"text", None}:
-            result.tag = TAG_QUESTIONABLE
-            result.reason = result.reason or "empty-media-preview"
-
         if inspection.image_like and inspection.preview_bytes:
             ai_tag, ai_reason = await self.ai.classify(inspection.preview_bytes)
             if ai_tag == TAG_BLOCKED:

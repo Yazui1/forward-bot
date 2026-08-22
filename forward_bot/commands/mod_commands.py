@@ -461,16 +461,22 @@ async def moderated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     repo = get_repo(context)
     config = get_config(context)
+    users = [
+        user for user in repo.list_users()
+        if caller.is_admin or not user.is_admin
+    ]
     lines = ["Banned:"]
-    for user in repo.list_users():
+    for user in users:
         if user.is_banned:
             lines.append(f"- {display_identity_html(user, config, viewer=caller)}")
     lines.append("\nAdmins/moderators:")
-    for user in repo.list_users():
+    for user in users:
         if user.is_admin or user.is_moderator:
             lines.append(f"- {display_identity_html(user, config, viewer=caller)} ({'admin' if user.is_admin else 'mod'})")
     lines.append("\nActive cooldowns:")
     for user, left, reason in repo.list_active_cooldowns():
+        if user.is_admin and not caller.is_admin:
+            continue
         lines.append(f"- {display_identity_html(user, config, viewer=caller)}: {human_seconds(left)} {html_escape(reason)}")
     await update.effective_message.reply_html("\n".join(lines))
 

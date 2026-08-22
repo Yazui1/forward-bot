@@ -34,12 +34,15 @@ class MediaService:
         file_id = _preview_file_id(payload)
         if not file_id:
             return MediaInspection()
-        content_type = payload.get("content_type")
         try:
             tg_file = await bot.get_file(file_id)
             data = bytes(await tg_file.download_as_bytearray())
         except Exception:
-            return MediaInspection(empty_preview=True)
+            # Telegram thumbnails are optional.  A missing/inaccessible preview
+            # must not turn otherwise valid video or animation media into a
+            # confirmation prompt.  Image media already falls back to the image
+            # itself in _preview_file_id; if that also fails, fail open.
+            return MediaInspection()
         self._preview_cache[message_id] = data
         width = height = None
         image_like = False
@@ -48,7 +51,7 @@ class MediaService:
                 width, height = img.size
                 image_like = True
         except Exception:
-            image_like = content_type in {"photo", "sticker"}
+            image_like = payload.get("content_type") in {"photo", "sticker"}
         return MediaInspection(
             preview_bytes=data,
             width=width,
@@ -251,8 +254,16 @@ def _preview_file_id(payload: dict[str, Any]) -> str | None:
     content_type = payload.get("content_type")
     thumbnail = payload.get("thumbnail_file_id")
     media = payload.get("media_file_id")
-    if content_type in {"video", "animation", "video_note", "document"}:
+    # Never fall back to downloading a complete video/GIF merely to classify
+    # it. Telegram's separate thumbnail is the cheap first-frame preview.
+    if content_type in {"video", "animation", "video_note"}:
         return thumbnail
     if content_type == "sticker" and (payload.get("is_animated") or payload.get("is_video")):
         return thumbnail
+    # Image documents do not always have a Telegram-generated thumbnail. They
+    # are safe to inspect by downloading the image itself; arbitrary documents
+    # (which may be very large) are not.
+    if content_type == "document":
+        mime_type = str(payload.get("mime_type") or "").lower()
+        return thumbnail or (media if mime_type.startswith("image/") else None)
     return thumbnail or media
