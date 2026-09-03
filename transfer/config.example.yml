@@ -1,3 +1,46 @@
-api_id: 123456
-api_hash: "0123456789abcdef0123456789abcdef"
-session: ".session/transfer"
+# Copy this file to config.yml and keep config.yml mode 0600.
+telegram:
+  api_id: "123456"
+  api_hash: "telegram-api-hash"
+  main:
+    username: "@MainOwnerAccount"
+    session: ".session/main"
+  # Empty means replacements are transferred directly to main.
+  pool: []
+  # To enable the privacy proxy, replace the empty list with ordered accounts:
+  # pool:
+  #   - username: "@PoolAccountOne"
+  #     session: ".session/pool-one"
+  #   - username: "@PoolAccountTwo"
+  #     session: ".session/pool-two"
+
+announcement:
+  channel: "@YourAnnouncementChannel"
+  recovery_template: |
+    {friendly_name} is being restored. Create a bot named {handle_prefix}<number>bot,
+    then send its username to {anonymous_link}.
+  restored_template: "{friendly_name} has been restored: {new_handle}"
+
+cloudflare:
+  account_id: "your-cloudflare-account-id"
+  project_name: "your-pages-project"
+  pages_url: "https://your-pages-project.pages.dev"
+  # Prefer an environment variable set through systemd's EnvironmentFile.
+  api_token_env: "CLOUDFLARE_API_TOKEN"
+  # api_token: "not-recommended: keep this only in a mode-0600 config.yml"
+
+# State contains only handles and temporary anonymous links; tokens never enter it.
+state_path: ".state/recovery.json"
+snapshot_dir: ".state/snapshots"
+
+bots:
+  - handle_prefix: "ExampleRelay"
+    friendly_name: "Example relay"
+    # Current bot handle: checked when the recovery service starts and used to
+    # create the first snapshot. It is updated automatically after recovery.
+    handle: "@AnyExistingSnapshotSourceBot"
+    # Use an absolute path in production. Relative paths are based on transfer/.
+    config_path: "/srv/example-relay/config.yml"
+    # Dotted key in the deployed bot's YAML configuration.
+    token_path: "telegram.token"
+    restart_command: ["systemctl", "restart", "example-relay.service"]
