@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Any
 
 from forward_bot.config import Config
 from forward_bot.db.repository import Repository
 from forward_bot.features.duplicate_media import media_digest
 from forward_bot.features.media import AIClassifier, MediaInspection
-from forward_bot.utils import now_utc, parse_dt
 
 
 TAG_OK = "OK"
@@ -104,20 +102,15 @@ class TaggingPipeline:
         if self.config.get("duplicates.enabled", True) and inspection.image_like and payload.get("content_type") != "sticker":
             digest = media_digest(inspection.preview_bytes)
             if digest:
-                existing = self.repo.get_media_hash(digest)
-                if existing:
-                    result.media_hash = digest
-                    result.media_hash_first_seen_at = existing.get("first_seen_at")
-                    first = parse_dt(existing.get("first_seen_at"))
-                    retention = int(self.config.get("duplicates.sender_block_retention_days", 3) or 3)
-                    if first and first + timedelta(days=retention) >= now_utc():
-                        result.tag = TAG_DUPLICATE
-                        result.reason = "duplicate-media"
-                    self.repo.upsert_media_hash(digest, first_seen_at=existing.get("first_seen_at"))
-                else:
-                    info = self.repo.upsert_media_hash(digest)
-                    result.media_hash = digest
-                    result.media_hash_first_seen_at = info.get("first_seen_at")
+                retention = int(
+                    self.config.get("duplicates.sender_block_retention_days", 3) or 3
+                )
+                info, duplicate = self.repo.claim_media_hash(digest, retention)
+                result.media_hash = digest
+                result.media_hash_first_seen_at = info.get("first_seen_at")
+                if duplicate:
+                    result.tag = TAG_DUPLICATE
+                    result.reason = "duplicate-media"
         return result
 
     def _invite_result(self, text: str) -> str | None:

@@ -67,7 +67,13 @@ class DeliveryQueue:
             "delivery.per_recipient_rate_limit_per_second", 1) or 1)
         self.active_window = timedelta(hours=float(
             config.get("delivery.active_window_hours", 72) or 72))
-        self.worker_count = int(config.get("delivery.worker_count", 1) or 1)
+        # Workers wait on network I/O, while wait_for_global_rate controls the
+        # actual Telegram request rate. A single worker therefore limits the
+        # queue to roughly one request latency instead of the configured rate.
+        self.worker_count = max(
+            1,
+            int(config.get("delivery.worker_count", 32) or 32),
+        )
         self._bot: Bot | None = None
         self._aggregate_logger = aggregate_logger
         self._queue: list[tuple[float, int, DeliveryItem]] = []
@@ -621,7 +627,7 @@ class DeliveryQueue:
             self._schedule_recipient_wake(item.recipient_id, wait)
             return "requeued"
         self._mark_recipient_send(item.recipient_id)
-        await self._respect_global_rate()
+        await self.wait_for_global_rate()
         if current_message.removed_for_mods and recipient.is_mod_or_admin:
             try:
                 return await self._send_deleted_tombstone(item, reply_to)
@@ -771,39 +777,39 @@ class DeliveryQueue:
 
     async def _tombstone_existing_delivery(self, delivery, reply_to: int | None, content_type: str) -> None:
         assert self._bot is not None
-        try:
-            if content_type == "text":
-                await self._bot.edit_message_text(
-                    chat_id=delivery.recipient_id,
-                    message_id=delivery.telegram_message_id,
-                    text="<i>Message removed.</i>",
-                    parse_mode="HTML",
-                )
-            elif content_type in {"photo", "video", "animation", "document"}:
-                await self._bot.edit_message_media(
-                    chat_id=delivery.recipient_id,
-                    message_id=delivery.telegram_message_id,
-                    media=removed_photo_media("<i>Message removed.</i>"),
-                )
-            else:
-                raise TelegramError(
-                    "content type cannot be tombstoned in-place")
-            self.store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id,
-                                             kind="media_edited" if content_type != "text" else "edited")
-            return
-        except TelegramError as exc:
-            log_telegram_error(LOGGER, "delivery.tombstone_edit", exc, aggregate=self._aggregate_logger,
-                               recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
-            if is_message_not_found_error(exc):
-                self.store.mark_delivery_deleted(
-                    delivery.id, tombstone_message_id=None, kind="already_missing")
+        if content_type == "text" or content_type in {"photo", "video", "animation", "document"}:
+            try:
+                await self.wait_for_global_rate()
+                if content_type == "text":
+                    await self._bot.edit_message_text(
+                        chat_id=delivery.recipient_id,
+                        message_id=delivery.telegram_message_id,
+                        text="<i>Message removed.</i>",
+                        parse_mode="HTML",
+                    )
+                else:
+                    await self._bot.edit_message_media(
+                        chat_id=delivery.recipient_id,
+                        message_id=delivery.telegram_message_id,
+                        media=removed_photo_media("<i>Message removed.</i>"),
+                    )
+                self.store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id,
+                                                 kind="media_edited" if content_type != "text" else "edited")
                 return
+            except TelegramError as exc:
+                log_telegram_error(LOGGER, "delivery.tombstone_edit", exc, aggregate=self._aggregate_logger,
+                                   recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
+                if is_message_not_found_error(exc):
+                    self.store.mark_delivery_deleted(
+                        delivery.id, tombstone_message_id=None, kind="already_missing")
+                    return
         try:
+            await self.wait_for_global_rate()
             await self._bot.delete_message(delivery.recipient_id, delivery.telegram_message_id)
         except TelegramError as exc:
             log_telegram_error(LOGGER, "delivery.tombstone_delete", exc, aggregate=self._aggregate_logger,
                                recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
-            kind = "already_missing" if is_message_not_found_error(exc) else "deleted"
+            kind = "already_missing" if is_message_not_found_error(exc) else "delete_failed"
         else:
             kind = "deleted"
         self.store.mark_delivery_deleted(
@@ -813,7 +819,7 @@ class DeliveryQueue:
         message = self.store.get_message(message_id)
         return bool(message and message.deleted)
 
-    async def _respect_global_rate(self) -> None:
+    async def wait_for_global_rate(self) -> None:
         async with self._rate_lock:
             loop = asyncio.get_running_loop()
             min_gap = 1.0 / max(1.0, self.rate_per_second)

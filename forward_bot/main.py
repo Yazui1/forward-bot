@@ -215,6 +215,7 @@ async def run(config_path: str = "config.yml") -> None:
         for task in background_tasks:
             task.cancel()
         await asyncio.gather(*background_tasks, return_exceptions=True)
+        repo.flush_activity()
         await queue.stop()
         await app.shutdown()
 

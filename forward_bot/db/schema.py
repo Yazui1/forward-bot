@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -52,9 +53,8 @@ CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 
 CREATE TABLE IF NOT EXISTS media_hashes (
     hash TEXT PRIMARY KEY,
-    first_seen_at TEXT NOT NULL,
-    latest_seen_at TEXT NOT NULL
-);
+    first_seen_at TEXT NOT NULL
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS user_blocks (
     blocker_id INTEGER NOT NULL,
@@ -90,24 +90,17 @@ CREATE TABLE IF NOT EXISTS invite_redemptions (
 );
 
 CREATE TABLE IF NOT EXISTS credit_daily_earnings (
-    user_id INTEGER NOT NULL,
     day TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
     reason TEXT NOT NULL,
     positive_amount REAL NOT NULL DEFAULT 0,
-    PRIMARY KEY (user_id, day, reason)
-);
-
-CREATE TABLE IF NOT EXISTS credit_daily_net (
-    user_id INTEGER NOT NULL,
-    day TEXT NOT NULL,
-    net_amount REAL NOT NULL DEFAULT 0,
-    PRIMARY KEY (user_id, day)
-);
+    PRIMARY KEY (day, user_id, reason)
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS credit_global_daily (
     day TEXT PRIMARY KEY,
     net_amount REAL NOT NULL DEFAULT 0
-);
+) WITHOUT ROWID;
 """
 
 
@@ -126,6 +119,7 @@ DISALLOWED_TABLES = (
     "sauce_cache",
     "blocks",
     "schema_migrations",
+    "credit_daily_net",
 )
 
 
@@ -135,10 +129,13 @@ def init_schema(path: str | Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(SCHEMA_SQL)
         for table in DISALLOWED_TABLES:
             conn.execute(f"DROP TABLE IF EXISTS {table}")
-        conn.executescript(SCHEMA_SQL)
         _ensure_user_columns(conn)
+        _prune_credit_aggregates(conn)
+        _migrate_media_hashes(conn)
+        _migrate_credit_tables(conn)
         conn.commit()
     finally:
         conn.close()
@@ -161,3 +158,93 @@ def _ensure_user_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE users ADD COLUMN preserve_forwards INTEGER NOT NULL DEFAULT 0"
         )
+
+
+def _migrate_credit_tables(conn: sqlite3.Connection) -> None:
+    earnings_sql = _table_sql(conn, "credit_daily_earnings")
+    compact_earnings = "WITHOUT ROWID" in earnings_sql.upper()
+    day_first = "PRIMARY KEY (DAY, USER_ID, REASON)" in earnings_sql.upper()
+    if not compact_earnings or not day_first:
+        conn.execute("DROP TABLE IF EXISTS credit_daily_earnings_new")
+        conn.execute(
+            """
+            CREATE TABLE credit_daily_earnings_new (
+                day TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                positive_amount REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (day, user_id, reason)
+            ) WITHOUT ROWID
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO credit_daily_earnings_new (day, user_id, reason, positive_amount)
+            SELECT day, user_id, reason, positive_amount FROM credit_daily_earnings
+            """
+        )
+        conn.execute("DROP TABLE credit_daily_earnings")
+        conn.execute(
+            "ALTER TABLE credit_daily_earnings_new RENAME TO credit_daily_earnings"
+        )
+
+    global_sql = _table_sql(conn, "credit_global_daily")
+    if "WITHOUT ROWID" not in global_sql.upper():
+        conn.execute("DROP TABLE IF EXISTS credit_global_daily_new")
+        conn.execute(
+            """
+            CREATE TABLE credit_global_daily_new (
+                day TEXT PRIMARY KEY,
+                net_amount REAL NOT NULL DEFAULT 0
+            ) WITHOUT ROWID
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO credit_global_daily_new (day, net_amount)
+            SELECT day, net_amount FROM credit_global_daily
+            """
+        )
+        conn.execute("DROP TABLE credit_global_daily")
+        conn.execute("ALTER TABLE credit_global_daily_new RENAME TO credit_global_daily")
+
+
+def _migrate_media_hashes(conn: sqlite3.Connection) -> None:
+    media_sql = _table_sql(conn, "media_hashes")
+    if "WITHOUT ROWID" in media_sql.upper() and "LATEST_SEEN_AT" not in media_sql.upper():
+        return
+    conn.execute("DROP TABLE IF EXISTS media_hashes_new")
+    conn.execute(
+        """
+        CREATE TABLE media_hashes_new (
+            hash TEXT PRIMARY KEY,
+            first_seen_at TEXT NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO media_hashes_new (hash, first_seen_at)
+        SELECT hash, first_seen_at FROM media_hashes
+        """
+    )
+    conn.execute("DROP TABLE media_hashes")
+    conn.execute("ALTER TABLE media_hashes_new RENAME TO media_hashes")
+
+
+def _prune_credit_aggregates(conn: sqlite3.Connection) -> None:
+    today = datetime.now(UTC).date()
+    conn.execute(
+        "DELETE FROM credit_daily_earnings WHERE day < ?", (today.isoformat(),)
+    )
+    conn.execute(
+        "DELETE FROM credit_global_daily WHERE day < ?",
+        ((today - timedelta(days=6)).isoformat(),),
+    )
+
+
+def _table_sql(conn: sqlite3.Connection, table: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    return str(row[0] or "") if row else ""

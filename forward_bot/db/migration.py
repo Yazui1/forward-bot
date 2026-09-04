@@ -234,7 +234,16 @@ def _migrate_media_hashes(src: sqlite3.Connection, dst: sqlite3.Connection) -> i
     if {"hash", "first_seen_at", "latest_seen_at"}.issubset(cols):
         rows = src.execute(
             """
-            SELECT hash, MIN(first_seen_at) AS first_seen_at, MAX(latest_seen_at) AS latest_seen_at
+            SELECT hash, MIN(first_seen_at) AS first_seen_at
+            FROM media_hashes
+            WHERE hash IS NOT NULL AND hash != ''
+            GROUP BY hash
+            """
+        ).fetchall()
+    elif {"hash", "first_seen_at"}.issubset(cols):
+        rows = src.execute(
+            """
+            SELECT hash, MIN(first_seen_at) AS first_seen_at
             FROM media_hashes
             WHERE hash IS NOT NULL AND hash != ''
             GROUP BY hash
@@ -243,7 +252,7 @@ def _migrate_media_hashes(src: sqlite3.Connection, dst: sqlite3.Connection) -> i
     elif {"hash", "created_at"}.issubset(cols):
         rows = src.execute(
             """
-            SELECT hash, MIN(created_at) AS first_seen_at, MAX(created_at) AS latest_seen_at
+            SELECT hash, MIN(created_at) AS first_seen_at
             FROM media_hashes
             WHERE hash IS NOT NULL AND hash != ''
             GROUP BY hash
@@ -253,10 +262,10 @@ def _migrate_media_hashes(src: sqlite3.Connection, dst: sqlite3.Connection) -> i
         return 0
     dst.executemany(
         """
-        INSERT OR REPLACE INTO media_hashes (hash, first_seen_at, latest_seen_at)
-        VALUES (?, ?, ?)
+        INSERT OR REPLACE INTO media_hashes (hash, first_seen_at)
+        VALUES (?, ?)
         """,
-        [(row["hash"], row["first_seen_at"], row["latest_seen_at"])
+        [(row["hash"], row["first_seen_at"])
          for row in rows],
     )
     return len(rows)
@@ -345,12 +354,10 @@ def _migrate_credit_aggregates(
     if not _table_exists(src, "credit_transactions"):
         return {
             "credit_daily_earnings": 0,
-            "credit_daily_net": 0,
             "credit_global_daily": 0,
         }
 
     daily_earnings: dict[tuple[int, str, str], float] = defaultdict(float)
-    daily_net: dict[tuple[int, str], float] = defaultdict(float)
     global_daily: dict[str, float] = defaultdict(float)
     for row in src.execute("SELECT user_id, amount, reason, created_at FROM credit_transactions"):
         user_id = int(row["user_id"])
@@ -361,16 +368,10 @@ def _migrate_credit_aggregates(
             continue
         amount = round_credits(float(row["amount"]))
         reason = str(row["reason"] or "unknown")
-        daily_net[(user_id, day)] += amount
         global_daily[day] += amount
         if amount > 0:
             daily_earnings[(user_id, day, reason)] += amount
 
-    dst.executemany(
-        "INSERT OR REPLACE INTO credit_daily_net (user_id, day, net_amount) VALUES (?, ?, ?)",
-        [(user_id, day, round_credits(amount))
-         for (user_id, day), amount in daily_net.items()],
-    )
     dst.executemany(
         "INSERT OR REPLACE INTO credit_global_daily (day, net_amount) VALUES (?, ?)",
         [(day, round_credits(amount)) for day, amount in global_daily.items()],
@@ -387,6 +388,5 @@ def _migrate_credit_aggregates(
     )
     return {
         "credit_daily_earnings": len(daily_earnings),
-        "credit_daily_net": len(daily_net),
         "credit_global_daily": len(global_daily),
     }

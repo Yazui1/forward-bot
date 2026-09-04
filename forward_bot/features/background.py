@@ -22,11 +22,13 @@ async def daily_tax_worker(bot: Bot, repo: Repository, config_ref: dict, stop_ev
     while not stop_event.is_set():
         config: Config = config_ref["config"]
         if config.get("credits.daily_tax_enabled", True):
-            for user in repo.list_users():
-                if user.is_banned:
-                    continue
-                amount, updated = repo.apply_daily_tax_once(user, tax_rate(config, user.credits))
-                if amount and updated:
+            user_rates = [
+                (user, tax_rate(config, user.credits))
+                for user in repo.list_users()
+                if not user.is_banned
+            ]
+            for amount, updated in repo.apply_daily_taxes(user_rates):
+                if amount:
                     maybe_apply_negative_cooldown(repo, config, updated)
         await _sleep(stop_event, int(config.get("credits.daily_tax_check_interval_seconds", 3600) or 3600))
 
@@ -69,6 +71,7 @@ async def cleanup_worker(bot: Bot, repo: Repository, store: TransientStore, medi
         store.cleanup()
         for message_id in expired_media_ids:
             media.release(message_id)
+        repo.flush_activity()
         await _sleep(stop_event, 300)
 
 

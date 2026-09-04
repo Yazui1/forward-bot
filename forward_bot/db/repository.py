@@ -63,6 +63,7 @@ class Repository:
         self.about_text = self._load_about_text(about_text)
         self._users: dict[int, User] = {}
         self._blocks: set[tuple[int, int]] = set()
+        self._dirty_activity: dict[int, str] = {}
         self._load_cache()
 
     @contextmanager
@@ -84,20 +85,28 @@ class Repository:
         onboarding_acknowledged: bool = False,
     ) -> tuple[User, bool]:
         admin = int(telegram_id in set(int(x) for x in admin_ids))
+        existing = self.get_user(telegram_id)
+        if existing and existing.username == username and existing.is_admin == bool(admin):
+            return existing, False
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
             created = row is None
             if created:
+                initial_credits = round_credits(starting_balance)
                 conn.execute(
                     """
                     INSERT INTO users (
                         telegram_id, username, created_at, credits, is_admin, onboarding_acknowledged
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (telegram_id, username, iso(),
-                     round_credits(starting_balance), admin, int(onboarding_acknowledged or bool(admin))),
+                    (telegram_id, username, iso(), initial_credits, admin,
+                     int(onboarding_acknowledged or bool(admin))),
                 )
+                if initial_credits:
+                    day = today_key()
+                    self._prune_credit_aggregates(conn, day)
+                    self._record_global_credit_delta(conn, day, initial_credits)
             else:
                 conn.execute(
                     "UPDATE users SET username=?, is_admin=? WHERE telegram_id=?",
@@ -145,11 +154,27 @@ class Repository:
         self.set_started(user_id, False)
 
     def touch_activity(self, user_id: int) -> None:
+        user = self.get_user(user_id)
+        if not user:
+            return
+        activity_at = iso()
+        user.last_activity = activity_at
+        self._dirty_activity[user_id] = activity_at
+
+    def flush_activity(self) -> int:
+        pending = list(self._dirty_activity.items())
+        if not pending:
+            return 0
         with self.connect() as conn:
-            conn.execute(
-                "UPDATE users SET last_activity=? WHERE telegram_id=?", (iso(), user_id))
+            conn.executemany(
+                "UPDATE users SET last_activity=? WHERE telegram_id=?",
+                [(activity_at, user_id) for user_id, activity_at in pending],
+            )
             conn.commit()
-        self._refresh_user(user_id)
+        for user_id, activity_at in pending:
+            if self._dirty_activity.get(user_id) == activity_at:
+                self._dirty_activity.pop(user_id, None)
+        return len(pending)
 
     def set_about_seen(self, user_id: int) -> None:
         with self.connect() as conn:
@@ -349,24 +374,44 @@ class Repository:
         reason: str,
         *,
         daily_caps: dict[str, float] | None = None,
+        record_activity: bool = False,
     ) -> tuple[float, User | None]:
         amount = round_credits(amount)
-        if amount > 0 and daily_caps is not None:
-            cap = daily_caps.get(reason)
-            if cap is not None and cap >= 0:
-                earned = self.positive_credits_today(user_id, reason)
-                amount = round_credits(min(amount, max(0.0, cap - earned)))
+        if record_activity:
+            self.touch_activity(user_id)
         if amount == 0:
             return 0.0, self.get_user(user_id)
         with self.connect() as conn:
-            conn.execute(
-                "UPDATE users SET credits=ROUND(credits + ?, 2) WHERE telegram_id=?",
-                (amount, user_id),
-            )
+            if amount > 0 and daily_caps is not None:
+                cap = daily_caps.get(reason)
+                if cap is not None and cap >= 0:
+                    row = conn.execute(
+                        "SELECT positive_amount FROM credit_daily_earnings WHERE user_id=? AND day=? AND reason=?",
+                        (user_id, today_key(), reason),
+                    ).fetchone()
+                    earned = float(row["positive_amount"]) if row else 0.0
+                    amount = round_credits(min(amount, max(0.0, cap - earned)))
+            if amount == 0:
+                return 0.0, self.get_user(user_id)
+            activity_at = self._dirty_activity.get(user_id)
+            if activity_at:
+                conn.execute(
+                    "UPDATE users SET credits=ROUND(credits + ?, 2), last_activity=? WHERE telegram_id=?",
+                    (amount, activity_at, user_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE users SET credits=ROUND(credits + ?, 2) WHERE telegram_id=?",
+                    (amount, user_id),
+                )
             self._record_credit_delta(conn, user_id, amount, reason)
             conn.commit()
-        self._refresh_user(user_id)
-        return amount, self.get_user(user_id)
+        if activity_at and self._dirty_activity.get(user_id) == activity_at:
+            self._dirty_activity.pop(user_id, None)
+        user = self.get_user(user_id)
+        if user:
+            user.credits = round_credits(user.credits + amount)
+        return amount, user
 
     def transfer_credits(self, sender_id: int, target_id: int, amount: float, reason: str = "transfer") -> tuple[User | None, User | None]:
         amount = round_credits(amount)
@@ -390,23 +435,25 @@ class Repository:
             conn.commit()
         self._refresh_user(user_id)
 
-    def positive_credits_today(self, user_id: int, reason: str) -> float:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT positive_amount FROM credit_daily_earnings WHERE user_id=? AND day=? AND reason=?",
-                (user_id, today_key(), reason),
-            ).fetchone()
-        return float(row["positive_amount"]) if row else 0.0
-
     def _record_credit_delta(self, conn: sqlite3.Connection, user_id: int, amount: float, reason: str) -> None:
         day = today_key()
-        conn.execute(
-            """
-            INSERT INTO credit_daily_net (user_id, day, net_amount) VALUES (?, ?, ?)
-            ON CONFLICT(user_id, day) DO UPDATE SET net_amount=ROUND(net_amount + excluded.net_amount, 2)
-            """,
-            (user_id, day, amount),
-        )
+        self._prune_credit_aggregates(conn, day)
+        self._record_global_credit_delta(conn, day, amount)
+        if amount > 0:
+            conn.execute(
+                """
+                INSERT INTO credit_daily_earnings (user_id, day, reason, positive_amount) VALUES (?, ?, ?, ?)
+                ON CONFLICT(day, user_id, reason) DO UPDATE SET positive_amount=ROUND(positive_amount + excluded.positive_amount, 2)
+                """,
+                (user_id, day, reason, amount),
+            )
+
+    def _record_global_credit_delta(
+        self,
+        conn: sqlite3.Connection,
+        day: str,
+        amount: float,
+    ) -> None:
         conn.execute(
             """
             INSERT INTO credit_global_daily (day, net_amount) VALUES (?, ?)
@@ -414,14 +461,11 @@ class Repository:
             """,
             (day, amount),
         )
-        if amount > 0:
-            conn.execute(
-                """
-                INSERT INTO credit_daily_earnings (user_id, day, reason, positive_amount) VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id, day, reason) DO UPDATE SET positive_amount=ROUND(positive_amount + excluded.positive_amount, 2)
-                """,
-                (user_id, day, reason, amount),
-            )
+
+    def _prune_credit_aggregates(self, conn: sqlite3.Connection, day: str) -> None:
+        cutoff = (now_utc().date() - timedelta(days=6)).isoformat()
+        conn.execute("DELETE FROM credit_daily_earnings WHERE day < ?", (day,))
+        conn.execute("DELETE FROM credit_global_daily WHERE day < ?", (cutoff,))
 
     def top_current_credits(self, limit: int = 10) -> list[User]:
         with self.connect() as conn:
@@ -460,6 +504,13 @@ class Repository:
             ).fetchone()
         return float(row["net"] or 0.0)
 
+    def current_credit_supply(self) -> float:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(credits), 0.0) AS supply FROM users"
+            ).fetchone()
+        return float(row["supply"])
+
     def credit_values(self, *, started_only: bool = True) -> list[float]:
         query = "SELECT credits FROM users WHERE is_banned=0"
         if started_only:
@@ -494,44 +545,62 @@ class Repository:
             conn.commit()
         self._refresh_user(user_id)
 
-    def apply_daily_tax_once(self, user: User, rate: float, reason: str = "daily_tax") -> tuple[float, User | None]:
+    def apply_daily_taxes(
+        self,
+        user_rates: Iterable[tuple[User, float]],
+    ) -> list[tuple[float, User]]:
         day = today_key()
-        if user.last_daily_tax_date == day or user.is_banned:
-            return 0.0, user
-        amount = -round_credits(max(0.0, user.credits * rate))
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE users SET last_daily_tax_date=?, credits=ROUND(credits + ?, 2) WHERE telegram_id=?",
-                (day, amount, user.telegram_id),
-            )
-            if amount:
-                self._record_credit_delta(
-                    conn, user.telegram_id, amount, reason)
-            conn.commit()
-        self._refresh_user(user.telegram_id)
-        return amount, self.get_user(user.telegram_id)
+        pending: list[tuple[User, float]] = []
+        for user, rate in user_rates:
+            if user.last_daily_tax_date == day or user.is_banned:
+                continue
+            amount = -round_credits(max(0.0, user.credits * rate))
+            pending.append((user, amount))
+        if not pending:
+            return []
 
-    def get_media_hash(self, digest: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            conn.executemany(
+                "UPDATE users SET last_daily_tax_date=?, credits=ROUND(credits + ?, 2) WHERE telegram_id=?",
+                [(day, amount, user.telegram_id) for user, amount in pending],
+            )
+            self._prune_credit_aggregates(conn, day)
+            total = round_credits(sum(amount for _, amount in pending))
+            if total:
+                self._record_global_credit_delta(conn, day, total)
+            conn.commit()
+
+        applied: list[tuple[float, User]] = []
+        for previous, amount in pending:
+            user = self.get_user(previous.telegram_id)
+            if not user:
+                continue
+            user.last_daily_tax_date = day
+            user.credits = round_credits(user.credits + amount)
+            applied.append((amount, user))
+        return applied
+
+    def claim_media_hash(self, digest: str, retention_days: int) -> tuple[dict[str, Any], bool]:
+        now = now_utc()
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM media_hashes WHERE hash=?", (digest,)).fetchone()
-        return dict(row) if row else None
-
-    def upsert_media_hash(self, digest: str, *, first_seen_at: str | None = None) -> dict[str, Any]:
-        now = iso()
-        first = first_seen_at or now
-        with self.connect() as conn:
+            if row:
+                first = parse_dt(row["first_seen_at"])
+                if first and first + timedelta(days=retention_days) >= now:
+                    return dict(row), True
+            first_seen_at = iso(now)
             conn.execute(
                 """
-                INSERT INTO media_hashes (hash, first_seen_at, latest_seen_at) VALUES (?, ?, ?)
-                ON CONFLICT(hash) DO UPDATE SET latest_seen_at=excluded.latest_seen_at
+                INSERT INTO media_hashes (hash, first_seen_at) VALUES (?, ?)
+                ON CONFLICT(hash) DO UPDATE SET first_seen_at=excluded.first_seen_at
                 """,
-                (digest, first, now),
+                (digest, first_seen_at),
             )
             row = conn.execute(
                 "SELECT * FROM media_hashes WHERE hash=?", (digest,)).fetchone()
             conn.commit()
-        return dict(row)
+        return dict(row), False
 
     def get_blocked_sticker_set(self, set_name: str | None) -> dict[str, Any] | None:
         if not set_name:
@@ -662,10 +731,14 @@ class Repository:
 
     def _load_cache(self) -> None:
         with self.connect() as conn:
-            self._users = {
+            users = {
                 int(row["telegram_id"]): _row_to_user(row)
                 for row in conn.execute("SELECT * FROM users").fetchall()
             }
+            for user_id, activity_at in self._dirty_activity.items():
+                if user_id in users:
+                    users[user_id].last_activity = activity_at
+            self._users = users
             self._blocks = {
                 (int(row["blocker_id"]), int(row["blocked_id"]))
                 for row in conn.execute("SELECT blocker_id, blocked_id FROM user_blocks").fetchall()
@@ -690,9 +763,13 @@ class Repository:
             row = conn.execute(
                 "SELECT * FROM users WHERE telegram_id=?", (user_id,)).fetchone()
         if row:
-            self._users[int(user_id)] = _row_to_user(row)
+            user = _row_to_user(row)
+            if user_id in self._dirty_activity:
+                user.last_activity = self._dirty_activity[user_id]
+            self._users[int(user_id)] = user
         else:
             self._users.pop(int(user_id), None)
+            self._dirty_activity.pop(int(user_id), None)
 
 
 def _row_to_user(row: sqlite3.Row) -> User:

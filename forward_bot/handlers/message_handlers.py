@@ -431,8 +431,14 @@ async def distribute_message(context: ContextTypes.DEFAULT_TYPE, tm: TransientMe
     if sender and not tm.is_system:
         reason = "text_message_reward" if tm.content_type == "text" else "media_message_reward"
         reward = float(config.get(f"credits.{reason}", 0) or 0)
-        apply_credit(repo, config, sender.telegram_id, reward, reason)
-        touch_activity(context, sender.telegram_id)
+        apply_credit(
+            repo,
+            config,
+            sender.telegram_id,
+            reward,
+            reason,
+            record_activity=True,
+        )
 
 
 async def _deliver_to_mods(context: ContextTypes.DEFAULT_TYPE, tm: TransientMessage, notice: str) -> None:

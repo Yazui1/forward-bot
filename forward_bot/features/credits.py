@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import timedelta
 
 from forward_bot.config import Config
@@ -21,6 +22,26 @@ def loss_rate(config: Config, credits: float) -> float:
     return interpolate(config.get("loss_rate.schedule", []), "credits", "loss_rate", credits, 0.0)
 
 
+def inflation_rate(current_supply: float, net_issuance: float) -> float | None:
+    """Return supply growth as a fraction of the period's opening supply.
+
+    A non-positive opening supply has no meaningful percentage growth rate.  In
+    particular, substituting a tiny positive denominator here turns an
+    undefined rate into a huge, misleading number.
+    """
+    current_supply = float(current_supply)
+    net_issuance = float(net_issuance)
+    opening_supply = current_supply - net_issuance
+    if not all(
+        math.isfinite(value)
+        for value in (current_supply, net_issuance, opening_supply)
+    ):
+        return None
+    if opening_supply <= 0:
+        return None
+    return net_issuance / opening_supply
+
+
 def apply_credit(
     repo: Repository,
     config: Config,
@@ -29,9 +50,16 @@ def apply_credit(
     reason: str,
     *,
     cap_positive: bool = True,
+    record_activity: bool = False,
 ) -> tuple[float, User | None]:
     caps = daily_caps(config) if cap_positive else None
-    applied, user = repo.apply_credit_change(user_id, round_credits(amount), reason, daily_caps=caps)
+    applied, user = repo.apply_credit_change(
+        user_id,
+        round_credits(amount),
+        reason,
+        daily_caps=caps,
+        record_activity=record_activity,
+    )
     maybe_apply_negative_cooldown(repo, config, user)
     return applied, user
 

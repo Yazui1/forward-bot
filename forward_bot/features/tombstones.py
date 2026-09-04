@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -52,7 +53,8 @@ async def remove_message(
         except Exception:
             pass
     sender = repo.get_user(msg.sender_id) if msg.sender_id else None
-    updated = 0
+    unique_targets: dict[tuple[int, int], TransientDelivery] = {}
+    duplicate_targets: dict[tuple[int, int], list[TransientDelivery]] = {}
     for delivery in store.deliveries_for_message(message_id):
         user = repo.get_user(delivery.recipient_id)
         if not user or delivery.deleted:
@@ -61,8 +63,32 @@ async def remove_message(
             continue
         if user.is_mod_or_admin and not remove_for_mods:
             continue
-        if await _tombstone_delivery(bot, store, delivery, "<i>Message removed.</i>", content_type=msg.content_type):
-            updated += 1
+        target = (delivery.recipient_id, delivery.telegram_message_id)
+        if target in unique_targets:
+            duplicate_targets.setdefault(target, []).append(delivery)
+            continue
+        unique_targets[target] = delivery
+
+    deliveries = list(unique_targets.values())
+    results = await asyncio.gather(*(
+        _tombstone_delivery(
+            bot,
+            store,
+            delivery,
+            "<i>Message removed.</i>",
+            content_type=msg.content_type,
+        )
+        for delivery in deliveries
+    ))
+    updated = sum(bool(result) for result in results)
+    for target, duplicates in duplicate_targets.items():
+        canonical = unique_targets[target]
+        for delivery in duplicates:
+            store.mark_delivery_deleted(
+                delivery.id,
+                tombstone_message_id=canonical.tombstone_message_id,
+                kind=canonical.tombstone_kind or "duplicate_record",
+            )
     if notify_sender and sender:
         try:
             await bot.send_message(
@@ -137,25 +163,26 @@ async def _tombstone_delivery(
     *,
     content_type: str = "text",
 ) -> bool:
-    try:
-        if content_type == "text":
-            await bot.edit_message_text(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, text=text, parse_mode="HTML")
-        elif content_type in {"photo", "video", "animation", "document"}:
-            await bot.edit_message_media(
-                chat_id=delivery.recipient_id,
-                message_id=delivery.telegram_message_id,
-                media=removed_photo_media(text),
-            )
-        else:
-            raise TelegramError("content type cannot be tombstoned in-place")
-        store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id, kind="media_edited" if content_type != "text" else "edited")
-        return True
-    except TelegramError as exc:
-        log_telegram_error(LOGGER, "tombstone.edit", exc, aggregate=_aggregate(store), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
-        if is_message_not_found_error(exc):
-            store.mark_delivery_deleted(delivery.id, tombstone_message_id=None, kind="already_missing")
+    if content_type == "text" or content_type in {"photo", "video", "animation", "document"}:
+        try:
+            await _wait_for_delivery_rate(store)
+            if content_type == "text":
+                await bot.edit_message_text(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id, text=text, parse_mode="HTML")
+            else:
+                await bot.edit_message_media(
+                    chat_id=delivery.recipient_id,
+                    message_id=delivery.telegram_message_id,
+                    media=removed_photo_media(text),
+                )
+            store.mark_delivery_deleted(delivery.id, tombstone_message_id=delivery.telegram_message_id, kind="media_edited" if content_type != "text" else "edited")
             return True
+        except TelegramError as exc:
+            log_telegram_error(LOGGER, "tombstone.edit", exc, aggregate=_aggregate(store), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id, content_type=content_type)
+            if is_message_not_found_error(exc):
+                store.mark_delivery_deleted(delivery.id, tombstone_message_id=None, kind="already_missing")
+                return True
     try:
+        await _wait_for_delivery_rate(store)
         await bot.delete_message(chat_id=delivery.recipient_id, message_id=delivery.telegram_message_id)
     except TelegramError as exc:
         log_telegram_error(LOGGER, "tombstone.delete", exc, aggregate=_aggregate(store), recipient_id=delivery.recipient_id, telegram_message_id=delivery.telegram_message_id)
@@ -667,3 +694,10 @@ def _append_mod_action(msg, text: str) -> None:
 def _aggregate(store: TransientStore):
     queue = getattr(store, "delivery_queue", None)
     return getattr(queue, "_aggregate_logger", None)
+
+
+async def _wait_for_delivery_rate(store: TransientStore) -> None:
+    queue = getattr(store, "delivery_queue", None)
+    wait_for_rate = getattr(queue, "wait_for_global_rate", None)
+    if wait_for_rate is not None:
+        await wait_for_rate()

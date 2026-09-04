@@ -33,7 +33,7 @@ delivery:
   pool_timeout_seconds: 120
   connection_pool_size: 64
   active_window_hours: 72
-  worker_count: 1
+  worker_count: 32
 
 identity:
   allow_sign_toggle: true

@@ -25,7 +25,7 @@ from forward_bot.commands.help_registry import HelpRegistry
 from forward_bot.config import Config
 from forward_bot.db.repository import User
 from forward_bot.features.credits import loss_rate, tax_rate
-from forward_bot.features.tombstones import mark_for_moderation_action, remove_message, remove_whisper
+from forward_bot.features.tombstones import remove_message, remove_whisper
 from forward_bot.logging_utils import log_telegram_error
 from forward_bot.utils import html_escape, human_seconds, now_utc, parse_dt, parse_duration_seconds
 
@@ -531,14 +531,16 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         await command_reply(update, context, error or "Message is not in cache anymore.")
         return
-    if caller.is_admin:
-        await mark_for_moderation_action(context.bot, get_repo(context), get_store(context), get_config(context), msg.id)
-        count = await remove_message(context.bot, get_repo(context), get_store(context), get_config(context), msg.id, reason="deleted by moderator", remove_for_mods=False)
-        await command_reply(update, context, f"Deleted ({count} copies).")
-    else:
-        await mark_for_moderation_action(context.bot, get_repo(context), get_store(context), get_config(context), msg.id)
-        count = await remove_message(context.bot, get_repo(context), get_store(context), get_config(context), msg.id, reason="deleted by moderator", remove_for_mods=False)
-        await command_reply(update, context, f"Deleted ({count} copies).")
+    count = await remove_message(
+        context.bot,
+        get_repo(context),
+        get_store(context),
+        get_config(context),
+        msg.id,
+        reason="deleted by moderator",
+        remove_for_mods=False,
+    )
+    await command_reply(update, context, f"Deleted ({count} copies).")
 
 
 async def blocksticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

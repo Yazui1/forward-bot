@@ -28,7 +28,14 @@ from forward_bot.commands.common import (
 )
 from forward_bot.commands.help_registry import HelpRegistry
 from forward_bot.crypto.tripcode import make_tripcode
-from forward_bot.features.credits import apply_credit, daily_caps, loss_rate, maybe_apply_negative_cooldown, tax_rate
+from forward_bot.features.credits import (
+    apply_credit,
+    daily_caps,
+    inflation_rate,
+    loss_rate,
+    maybe_apply_negative_cooldown,
+    tax_rate,
+)
 from forward_bot.features.onboarding import onboarding_prompt, requires_onboarding_answers
 from forward_bot.features.remove_votes import vote_to_remove
 from forward_bot.features.tombstones import remove_message
@@ -424,11 +431,21 @@ async def creditstats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     caps = daily_caps(config)
     downvote_schedule = config.get("credits.downvote_cost_schedule", []) or []
     loss_schedule = config.get("loss_rate.schedule", []) or []
+    supply = repo.current_credit_supply()
+    daily_net = repo.net_issuance_since_days(1)
+    weekly_net = repo.net_issuance_since_days(7)
+    daily_inflation = inflation_rate(supply, daily_net)
+    weekly_inflation = inflation_rate(supply, weekly_net)
+
+    def render_inflation(rate: float | None) -> str:
+        return "unavailable" if rate is None else f"{rate * 100:.2f}%"
+
     lines.extend([
         "",
         "<b>Economy</b>",
-        f"Daily net issuance: {repo.net_issuance_since_days(1):.2f}",
-        f"Weekly net issuance: {repo.net_issuance_since_days(7):.2f}",
+        f"Current supply: {supply:.2f}",
+        f"Daily inflation: {render_inflation(daily_inflation)} (net {daily_net:+.2f})",
+        f"Weekly inflation: {render_inflation(weekly_inflation)} (net {weekly_net:+.2f})",
         f"Started-user balances: min {mn:.2f}, median {med:.2f}, max {mx:.2f}",
         "",
         "<b>Your Account</b>",
