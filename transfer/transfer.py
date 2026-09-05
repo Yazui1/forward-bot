@@ -231,6 +231,7 @@ class Service:
             except (OSError, RPCError, RecoveryError) as exc:
                 self.log.error("Pool account %s is unavailable: %s", account.username, exc)
         await self._check_configured_bots()
+        await self._resume_recoveries()
         self.log.info("Recovery service started as %s", self.config.main.username)
         await asyncio.gather(self.main_client.run_until_disconnected(), *(client.run_until_disconnected() for client in self.pool_clients.values()))
 
@@ -306,13 +307,10 @@ class Service:
             if pending.new_handle not in message_handles(event.message):
                 self.log.warning("Ignoring unmatched pool ownership message: %s", response_text(event.message))
                 return
-            pending.stage = "waiting_main"
+            pending.stage = "transferring"
             self._save_state()
         try:
-            assert pending.new_handle
-            await self.main_client.send_message(pending.new_handle, "/start")
-            await transfer_ownership(self.pool_clients[pool], pending.new_handle, self.config.main.username)
-            self.log.info("Transferred %s from %s to main account", pending.new_handle, pool)
+            await self._transfer_to_main(pending, pool)
         except Exception:
             self.log.exception("Could not transfer %s from pool %s to main", pending.new_handle, pool)
 
@@ -407,7 +405,7 @@ class Service:
     async def _on_main_ownership(self, message: object) -> None:
         handles = message_handles(message)
         async with self.lock:
-            recovery = next((item for item in self.recoveries.values() if item.stage == "waiting_main" and item.new_handle in handles), None)
+            recovery = next((item for item in self.recoveries.values() if item.stage in {"transferring", "waiting_main"} and item.new_handle in handles), None)
             if recovery is None:
                 return
             recovery.stage = "finalizing"
@@ -417,43 +415,119 @@ class Service:
         except Exception:
             self.log.exception("Recovery finalization failed for %s", recovery.new_handle)
             async with self.lock:
+                self._save_state()
+
+    async def _transfer_to_main(self, recovery: Recovery, pool: str) -> None:
+        assert recovery.new_handle
+        await self.main_client.send_message(recovery.new_handle, "/start")
+        await transfer_ownership(
+            self.pool_clients[pool], recovery.new_handle, self.config.main.username
+        )
+        async with self.lock:
+            if self.recoveries.get(recovery.key) is recovery and recovery.stage == "transferring":
                 recovery.stage = "waiting_main"
                 self._save_state()
+        self.log.info("Transferred %s from %s to main account", recovery.new_handle, pool)
+
+    async def _resume_recoveries(self) -> None:
+        resumable_stages = {
+            "transferring",
+            "waiting_main",
+            "finalizing",
+            "finalizing_restore",
+            "finalizing_about",
+            "finalizing_config",
+            "finalizing_publish",
+            "finalizing_announce",
+            "finalizing_cleanup",
+            "finalizing_revoke",
+        }
+        for recovery in list(self.recoveries.values()):
+            # Passive stages continue through the event handlers after startup.
+            # These stages mean an operation was already in progress when the
+            # service stopped, so resume the finalization flow immediately.
+            if recovery.stage not in resumable_stages:
+                continue
+            try:
+                if recovery.stage == "transferring":
+                    await self._transfer_to_main(
+                        recovery, recovery.receiver_username.casefold()
+                    )
+                    continue
+                await self._finalize(recovery)
+            except Exception:
+                self.log.exception(
+                    "Could not resume recovery for %s; it remains at stage %s",
+                    recovery.new_handle,
+                    recovery.stage,
+                )
+                async with self.lock:
+                    if self.recoveries.get(recovery.key) is recovery:
+                        self._save_state()
 
     async def _finalize(self, recovery: Recovery) -> None:
         mapping = self._mapping(recovery)
         assert recovery.new_handle
-        token = await restore_bot_snapshot(
-            self.main_client,
-            self.config,
-            mapping,
-            recovery.old_handle,
-            recovery.new_handle,
-        )
-        write_yaml_value(mapping.config_path, mapping.token_path, token)
-        restart(mapping.restart_command)
-        await update_runtime_about(
-            self.main_client,
-            recovery.new_handle,
-            recovery.old_handle,
-        )
-        update_configured_handle(self.config, mapping, recovery.new_handle)
-        await publish_page(self.config, mapping, recovery.new_handle)
-        await self.main_client.send_message(self.config.announcement_channel, format_template(
-            self.config.restored_template, friendly_name=mapping.friendly_name,
-            new_handle=recovery.new_handle, old_handle=recovery.old_handle))
-        anonymous_client = self._client_for(recovery.receiver_username.casefold())
-        if recovery.anonymous_message_id is not None:
-            await anonymous_client.send_message(
-                ANONYMOUS_BOT,
-                f"Thank you. {mapping.friendly_name} has been restored as {recovery.new_handle}.",
-                reply_to=recovery.anonymous_message_id,
+
+        async def checkpoint(stage: str) -> None:
+            async with self.lock:
+                recovery.stage = stage
+                self._save_state()
+
+        if recovery.stage in {"waiting_main", "finalizing"}:
+            await checkpoint("finalizing_restore")
+
+        if recovery.stage == "finalizing_restore":
+            token = await restore_bot_snapshot(
+                self.main_client,
+                self.config,
+                mapping,
+                recovery.old_handle,
+                recovery.new_handle,
             )
-        await revoke_anonymous_link(anonymous_client, ANONYMOUS_BOT)
-        async with self.lock:
-            self.recoveries.pop(recovery.key, None)
-            self._save_state()
-        self.log.info("Recovery complete for %s", mapping.friendly_name)
+            write_yaml_value(mapping.config_path, mapping.token_path, token)
+            restart(mapping.restart_command)
+            await checkpoint("finalizing_about")
+
+        if recovery.stage == "finalizing_about":
+            await update_runtime_about(
+                self.main_client,
+                recovery.new_handle,
+                recovery.old_handle,
+            )
+            await checkpoint("finalizing_config")
+
+        if recovery.stage == "finalizing_config":
+            update_configured_handle(self.config, mapping, recovery.new_handle)
+            await checkpoint("finalizing_publish")
+
+        if recovery.stage == "finalizing_publish":
+            await publish_page(self.config, mapping, recovery.new_handle)
+            await checkpoint("finalizing_announce")
+
+        if recovery.stage == "finalizing_announce":
+            await self.main_client.send_message(self.config.announcement_channel, format_template(
+                self.config.restored_template, friendly_name=mapping.friendly_name,
+                new_handle=recovery.new_handle, old_handle=recovery.old_handle))
+            await checkpoint("finalizing_cleanup")
+
+        if recovery.stage == "finalizing_cleanup":
+            anonymous_client = self._client_for(recovery.receiver_username.casefold())
+            if recovery.anonymous_message_id is not None:
+                await anonymous_client.send_message(
+                    ANONYMOUS_BOT,
+                    f"Thank you. {mapping.friendly_name} has been restored as {recovery.new_handle}.",
+                    reply_to=recovery.anonymous_message_id,
+                )
+            await checkpoint("finalizing_revoke")
+
+        if recovery.stage == "finalizing_revoke":
+            anonymous_client = self._client_for(recovery.receiver_username.casefold())
+            await revoke_anonymous_link(anonymous_client, ANONYMOUS_BOT)
+            async with self.lock:
+                self.recoveries.pop(recovery.key, None)
+                self._save_state()
+            self.log.info("Recovery complete for %s", mapping.friendly_name)
 
     def _mapping(self, recovery: Recovery) -> BotMapping:
         mapping = next((item for item in self.config.bots if item.handle_prefix.casefold() == recovery.key), None)
@@ -811,8 +885,8 @@ async def bot_needs_recovery(client: TelegramClient, handle: str) -> bool:
         if getattr(settings, "blocked", False):
             return True
         async with client.conversation(handle, timeout=45, exclusive=True) as conv:
-            await conv.send_message("/about")
-            await conv.get_response()
+            sent = await conv.send_message("/about")
+            await conv.get_reply(sent)
         return False
     except (asyncio.TimeoutError, OSError, RPCError, ValueError):
         return True
@@ -824,8 +898,8 @@ async def update_runtime_about(
     old_handle: str,
 ) -> None:
     async with client.conversation(new_handle, timeout=90, exclusive=True) as conv:
-        await conv.send_message("/about")
-        current = await conv.get_response()
+        sent = await conv.send_message("/about")
+        current = await conv.get_reply(sent)
         updated, replacements = re.subn(
             re.escape(old_handle),
             new_handle,
@@ -833,8 +907,8 @@ async def update_runtime_about(
             flags=re.IGNORECASE,
         )
         if replacements:
-            await conv.send_message("/about " + updated)
-            about_result = await conv.get_response()
+            sent = await conv.send_message("/about " + updated)
+            about_result = await conv.get_reply(sent)
             about_text = response_text(about_result).casefold()
             if any(word in about_text for word in ("error", "invalid", "admin only", "failed")):
                 raise RecoveryError(
@@ -848,8 +922,8 @@ async def update_runtime_about(
             )
         else:
             return
-        await conv.send_message("/reload")
-        reload_result = await conv.get_response()
+        sent = await conv.send_message("/reload")
+        reload_result = await conv.get_reply(sent)
         reload_text = response_text(reload_result).casefold()
         if any(word in reload_text for word in ("error", "invalid", "admin only", "failed")):
             raise RecoveryError(
