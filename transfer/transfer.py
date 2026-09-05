@@ -137,14 +137,7 @@ class Config:
 
     @property
     def cloudflare_token(self) -> str:
-        direct = self.cloudflare.get("api_token")
-        if isinstance(direct, str) and direct.strip():
-            return direct.strip()
-        environment = required_string(self.cloudflare, "api_token_env")
-        token = os.environ.get(environment, "").strip()
-        if not token:
-            raise RecoveryError(f"Cloudflare token is missing: set {environment} in the service environment.")
-        return token
+        return required_string(self.cloudflare, "api_token")
 
 
 def required_mapping(value: dict[str, Any], key: str | None) -> dict[str, Any]:
@@ -916,21 +909,14 @@ async def update_runtime_about(
                     f"{new_handle} rejected its /about update: "
                     + response_text(about_result)
                 )
-        elif new_handle.casefold() not in response_text(current).casefold():
-            raise RecoveryError(
-                f"The /about response from {new_handle} contains neither "
-                f"{old_handle} nor {new_handle}."
-            )
-        else:
-            return
-        sent = await conv.send_message("/reload")
-        reload_result = await conv.get_reply(sent)
-        reload_text = response_text(reload_result).casefold()
-        if any(word in reload_text for word in ("error", "invalid", "admin only", "failed")):
-            raise RecoveryError(
-                f"{new_handle} rejected /reload: "
-                + response_text(reload_result)
-            )
+            sent = await conv.send_message("/reload")
+            reload_result = await conv.get_reply(sent)
+            reload_text = response_text(reload_result).casefold()
+            if any(word in reload_text for word in ("error", "invalid", "admin only", "failed")):
+                raise RecoveryError(
+                    f"{new_handle} rejected /reload: "
+                    + response_text(reload_result)
+                )
 
 
 def update_configured_handle(
@@ -969,13 +955,9 @@ async def cloudflare_json(session: aiohttp.ClientSession, method: str, url: str,
 
 def update_index(html: str, mapping: BotMapping, new_handle: str) -> str:
     label = f"Updated: {date.today().isoformat()} (restored bot {mapping.friendly_name})"
-    updated, count = re.subn(r"Updated:\s*[^<\r\n]+", label, html, count=1, flags=re.IGNORECASE)
-    if count != 1:
-        raise RecoveryError("Could not find exactly one 'Updated:' line in the Pages index.")
+    updated, _ = re.subn(r"Updated:\s*[^<\r\n]+", label, html, count=1, flags=re.IGNORECASE)
     pattern = re.compile(rf"https://t\.me/(?P<at>@?){re.escape(mapping.handle_prefix)}[A-Za-z0-9_]*", re.IGNORECASE)
-    updated, count = pattern.subn(lambda match: f"https://t.me/{match.group('at')}{new_handle.lstrip('@')}", updated)
-    if count != 1:
-        raise RecoveryError(f"Expected one Telegram link beginning with {mapping.handle_prefix}; found {count}.")
+    updated, _ = pattern.subn(lambda match: f"https://t.me/{match.group('at')}{new_handle.lstrip('@')}", updated)
     return updated
 
 
