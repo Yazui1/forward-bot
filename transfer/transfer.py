@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
-import hashlib
 import json
 import logging
 import os
@@ -14,6 +12,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -134,11 +133,6 @@ class Config:
         if len(matches) > 1:
             raise RecoveryError(f"More than one mapping matches @{clean}.")
         return matches[0] if matches else None
-
-    @property
-    def cloudflare_token(self) -> str:
-        return required_string(self.cloudflare, "api_token")
-
 
 def required_mapping(value: dict[str, Any], key: str | None) -> dict[str, Any]:
     item = value.get(key) if key else value
@@ -945,14 +939,6 @@ def update_configured_handle(
     temporary.replace(config.source)
 
 
-async def cloudflare_json(session: aiohttp.ClientSession, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
-    async with session.request(method, url, **kwargs) as response:
-        body = await response.json(content_type=None)
-        if response.status >= 400 or not body.get("success", False):
-            raise RecoveryError(f"Cloudflare API {method} {url} failed: {body}")
-        return body
-
-
 def update_index(html: str, mapping: BotMapping, new_handle: str) -> str:
     label = f"Updated: {date.today().isoformat()} (restored bot {mapping.friendly_name})"
     updated, _ = re.subn(r"Updated:\s*[^<\r\n]+", label, html, count=1, flags=re.IGNORECASE)
@@ -963,31 +949,26 @@ def update_index(html: str, mapping: BotMapping, new_handle: str) -> str:
 
 async def publish_page(config: Config, mapping: BotMapping, new_handle: str) -> None:
     cf = config.cloudflare
-    account_id = required_string(cf, "account_id")
     project = required_string(cf, "project_name")
     pages_url = required_string(cf, "pages_url").rstrip("/") + "/"
-    headers = {"Authorization": f"Bearer {config.cloudflare_token}"}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
         async with session.get(pages_url) as response:
             if response.status >= 400:
                 raise RecoveryError(f"Could not fetch Pages index ({response.status}).")
             original = await response.text()
-        content = update_index(original, mapping, new_handle).encode("utf-8")
-        digest = hashlib.sha256(content).hexdigest()
-        token_response = await cloudflare_json(session, "GET", f"https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects/{project}/upload-token", headers=headers)
-        upload_token = token_response.get("result", {}).get("jwt")
-        if not isinstance(upload_token, str) or not upload_token:
-            raise RecoveryError("Cloudflare did not return a Pages upload JWT.")
-        await cloudflare_json(session, "POST", "https://api.cloudflare.com/client/v4/pages/assets/upload", headers={"Authorization": f"Bearer {upload_token}", "Content-Type": "application/json"}, json=[{
-            "key": digest, "value": base64.b64encode(content).decode("ascii"), "base64": True,
-            "metadata": {"content-type": "text/html"},
-        }])
-        form = aiohttp.FormData()
-        form.add_field("manifest", json.dumps({"index.html": digest}))
-        form.add_field("commit_dirty", "true")
-        form.add_field("commit_message", f"Restore {mapping.friendly_name}")
-        form.add_field("pages_build_output_dir", ".")
-        await cloudflare_json(session, "POST", f"https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects/{project}/deployments", headers=headers, data=form)
+        content = update_index(original, mapping, new_handle)
+    with tempfile.TemporaryDirectory(prefix="forward-bot-pages-") as output_dir:
+        Path(output_dir, "index.html").write_text(content, encoding="utf-8")
+        process = await asyncio.create_subprocess_exec(
+            "npx", "wrangler", "pages", "deploy", output_dir,
+            "--project", project,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode:
+            detail = (stderr or stdout).decode(errors="replace").strip()
+            raise RecoveryError(f"Wrangler Pages deploy failed: {detail}")
 
 
 def load_config(path: Path) -> Config:

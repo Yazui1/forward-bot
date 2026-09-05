@@ -22,12 +22,9 @@ announcement:
   restored_template: "{friendly_name} has been restored: {new_handle}"
 
 cloudflare:
-  account_id: "your-cloudflare-account-id"
   project_name: "your-pages-project"
   pages_url: "https://your-pages-project.pages.dev"
-  # Prefer an environment variable set through systemd's EnvironmentFile.
-  api_token_env: "CLOUDFLARE_API_TOKEN"
-  # api_token: "not-recommended: keep this only in a mode-0600 config.yml"
+  # Authenticate Wrangler separately, for example with `wrangler login`.
 
 # State contains only handles and temporary anonymous links; tokens never enter it.
 state_path: ".state/recovery.json"
