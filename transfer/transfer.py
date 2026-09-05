@@ -487,6 +487,7 @@ class Service:
             )
             write_yaml_value(mapping.config_path, mapping.token_path, token)
             restart(mapping.restart_command)
+            await asyncio.sleep(10)
             await checkpoint("finalizing_about")
 
         if recovery.stage == "finalizing_about":
