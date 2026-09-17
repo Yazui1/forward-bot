@@ -16,6 +16,7 @@ telegram:
 
 announcement:
   channel: "@YourAnnouncementChannel"
+  group: "@YourAnnouncementGroup"
   recovery_template: |
     {friendly_name} is being restored. Create a bot named {handle_prefix}<number>bot,
     then send its username to {anonymous_link}.
@@ -26,7 +27,7 @@ cloudflare:
   pages_url: "https://your-pages-project.pages.dev"
   # Authenticate Wrangler separately, for example with `wrangler login`.
 
-# State contains only handles and temporary anonymous links; tokens never enter it.
+# State contains handles, message IDs, and temporary anonymous links; tokens never enter it.
 state_path: ".state/recovery.json"
 snapshot_dir: ".state/snapshots"
 
