@@ -334,10 +334,13 @@ class Service:
         error_message: str | None = None
         incoming_handles = message_handles(event.message)
         async with self.lock:
+            pending_recoveries = [
+                item for item in self.recoveries.values()
+                if item.receiver_username.casefold() == receiver
+                and item.stage == "waiting_submission"
+            ]
             matches = []
-            for item in self.recoveries.values():
-                if item.receiver_username.casefold() != receiver or item.stage != "waiting_submission":
-                    continue
+            for item in pending_recoveries:
                 mapping = self._mapping(item)
                 valid = [
                     handle for handle in incoming_handles
@@ -345,11 +348,16 @@ class Service:
                 ]
                 if valid:
                     matches.append((item, mapping, valid))
-            if len(matches) != 1:
+            if len(matches) == 1:
+                pending, mapping, valid = matches[0]
+            elif len(pending_recoveries) == 1:
+                pending = pending_recoveries[0]
+                mapping = self._mapping(pending)
+                valid = []
+            else:
                 if len(matches) > 1:
                     self.log.warning("Ambiguous replacement message: %s", response_text(event.message))
                 return
-            pending, mapping, valid = matches[0]
             if len(valid) != 1:
                 error_message = (
                     f"Your message does not contain a valid bot. Create a bot named "
