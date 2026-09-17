@@ -961,7 +961,7 @@ async def publish_page(config: Config, mapping: BotMapping, new_handle: str) -> 
         Path(output_dir, "index.html").write_text(content, encoding="utf-8")
         process = await asyncio.create_subprocess_exec(
             "npx", "wrangler", "pages", "deploy", output_dir,
-            "--project", project,
+            "--project-name", project,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
