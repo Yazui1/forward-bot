@@ -13,7 +13,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -237,7 +237,12 @@ class Service:
         await self._check_configured_bots()
         await self._resume_recoveries()
         self.log.info("Recovery service started as %s", self.config.main.username)
-        await asyncio.gather(self.main_client.run_until_disconnected(), *(client.run_until_disconnected() for client in self.pool_clients.values()))
+        deleted_bot_monitor = asyncio.create_task(self._monitor_deleted_bots())
+        try:
+            await asyncio.gather(self.main_client.run_until_disconnected(), *(client.run_until_disconnected() for client in self.pool_clients.values()))
+        finally:
+            deleted_bot_monitor.cancel()
+            await asyncio.gather(deleted_bot_monitor, return_exceptions=True)
 
     async def _ensure_snapshots(self) -> None:
         for mapping in self.config.bots:
@@ -265,6 +270,33 @@ class Service:
                 return
             self.log.warning(
                 "Configured bot %s (%s) is unavailable; starting recovery.",
+                mapping.friendly_name,
+                mapping.handle,
+            )
+            await self._start_recovery_for_mapping(mapping, mapping.handle)
+
+        await asyncio.gather(*(check(mapping) for mapping in self.config.bots))
+
+    async def _monitor_deleted_bots(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await self._check_deleted_bots()
+            except Exception:
+                self.log.exception("Configured-bot deletion check failed")
+
+    async def _check_deleted_bots(self) -> None:
+        async def check(mapping: BotMapping) -> None:
+            if mapping.handle is None:
+                return
+            try:
+                entity = await self.main_client.get_entity(mapping.handle)
+            except (asyncio.TimeoutError, OSError, RPCError, ValueError):
+                return
+            if not getattr(entity, "deleted", False):
+                return
+            self.log.warning(
+                "Configured bot %s (%s) is deleted; starting recovery.",
                 mapping.friendly_name,
                 mapping.handle,
             )
@@ -1091,7 +1123,7 @@ async def update_chat_description(
     current = str(getattr(full_chat, "about", "") or "")
     updated = replace_usernames(current, replacements)
     if updated != current:
-        await client(functions.channels.EditAboutRequest(channel=chat, about=updated))
+        await client(functions.messages.EditChatAboutRequest(peer=chat, about=updated))
 
 
 def update_configured_handle(
@@ -1118,6 +1150,10 @@ def update_configured_handle(
         encoding="utf-8",
     )
     temporary.replace(config.source)
+    config.bots = tuple(
+        replace(item, handle=new_handle) if item is mapping else item
+        for item in config.bots
+    )
 
 
 def update_index(
