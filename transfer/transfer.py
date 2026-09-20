@@ -21,7 +21,13 @@ from typing import Any
 import aiohttp
 import yaml
 from telethon import TelegramClient, events, functions, types
-from telethon.errors import MessageIdInvalidError, RPCError
+from telethon.errors import (
+    ChatAboutNotModifiedError,
+    MessageIdInvalidError,
+    RPCError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+)
 from telethon.sessions import StringSession
 
 
@@ -279,7 +285,7 @@ class Service:
 
     async def _monitor_deleted_bots(self) -> None:
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(300)
             try:
                 await self._check_deleted_bots()
             except Exception:
@@ -291,9 +297,11 @@ class Service:
                 return
             try:
                 entity = await self.main_client.get_entity(mapping.handle)
+            except (UsernameInvalidError, UsernameNotOccupiedError):
+                entity = None
             except (asyncio.TimeoutError, OSError, RPCError, ValueError):
                 return
-            if not getattr(entity, "deleted", False):
+            if entity is not None and not getattr(entity, "deleted", False):
                 return
             self.log.warning(
                 "Configured bot %s (%s) is deleted; starting recovery.",
@@ -1123,7 +1131,10 @@ async def update_chat_description(
     current = str(getattr(full_chat, "about", "") or "")
     updated = replace_usernames(current, replacements)
     if updated != current:
-        await client(functions.messages.EditChatAboutRequest(peer=chat, about=updated))
+        try:
+            await client(functions.messages.EditChatAboutRequest(peer=chat, about=updated))
+        except ChatAboutNotModifiedError:
+            pass
 
 
 def update_configured_handle(
