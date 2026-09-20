@@ -293,8 +293,9 @@ class Service:
 
     async def _check_deleted_bots(self) -> None:
         async def check(mapping: BotMapping) -> None:
-            if mapping.handle is None:
-                return
+            async with self.lock:
+                if mapping.handle is None or mapping.handle_prefix.casefold() in self.recoveries:
+                    return
             try:
                 entity = await self.main_client.get_entity(mapping.handle)
             except (UsernameInvalidError, UsernameNotOccupiedError):
