@@ -38,7 +38,7 @@ automatic_recovery:
     api_id: "123456"
     api_hash: "creator-telegram-api-hash"
 
-# State contains handles, backup handles, message IDs, and temporary anonymous links; tokens never enter it.
+# State contains handles, backup handles, pending creator handles, message IDs, and temporary anonymous links; tokens never enter it.
 state_path: ".state/recovery.json"
 snapshot_dir: ".state/snapshots"
 

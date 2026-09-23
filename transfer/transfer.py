@@ -14,6 +14,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass, replace
 from datetime import date
 from pathlib import Path
@@ -38,6 +39,7 @@ BOTFATHER = "BotFather"
 ABUSE_NOTIFICATION = "AbuseNotification"
 ANONYMOUS_BOT = "@IncogNoteBot"
 TOKEN_RE = re.compile(r"\b\d{5,}:[A-Za-z0-9_-]{20,}\b")
+CREATOR_CREATE_INTERVAL = 300
 BOT_USERNAME_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]{4,})\b")
 URL_RE = re.compile(r"https://t\.me/IncogNoteBot\?start=[A-Za-z0-9_-]+")
 OWNERSHIP_PHRASE = "ownership of the bot"
@@ -246,6 +248,8 @@ class Service:
         )
         self.recoveries: dict[str, Recovery] = {}
         self.backups: dict[str, list[str]] = {}
+        self.pending_creations: dict[str, str] = {}
+        self.creator_next_create_at = 0.0
         self.lock = asyncio.Lock()
         self.recovery_locks: dict[str, asyncio.Lock] = {}
         account_keys = [config.main.username.casefold(), *(account.username.casefold() for account in config.pool)]
@@ -585,14 +589,31 @@ class Service:
             raise RecoveryError("Automatic recovery creator account is not configured.")
         creator_key = self.config.creator.username.casefold()
         async with self.botfather_locks[creator_key]:
-            handle = await create_bot(self.creator_client, mapping.handle_prefix)
-            await self.main_client.send_message(handle, "/start")
-            await transfer_ownership(
-                self.creator_client,
-                handle,
-                self.config.main.username,
-            )
+            key = mapping.handle_prefix.casefold()
+            async with self.lock:
+                handle = self.pending_creations.get(key)
+            if handle is None:
+                wait = self.creator_next_create_at - time.time()
+                if wait > 0:
+                    self.log.info("Waiting %.0f seconds before creating the next backup bot", wait)
+                    await asyncio.sleep(wait)
+                handle = await create_bot(self.creator_client, mapping.handle_prefix)
+                async with self.lock:
+                    self.pending_creations[key] = handle
+                    self.creator_next_create_at = time.time() + CREATOR_CREATE_INTERVAL
+                    self._save_state()
+                self.log.info("Created backup bot %s; ownership transfer is pending", handle)
+            try:
+                await transfer_ownership(
+                    self.creator_client,
+                    handle,
+                    self.config.main.username,
+                )
+            except Exception:
+                if not await bot_owned_by(self.main_client, handle):
+                    raise
         async with self.lock:
+            self.pending_creations.pop(mapping.handle_prefix.casefold(), None)
             self.backups.setdefault(mapping.handle_prefix.casefold(), []).append(handle)
             self._save_state()
         self.log.info("Prepared backup %s for %s", handle, mapping.friendly_name)
@@ -956,6 +977,14 @@ class Service:
                 if not isinstance(handles, list):
                     raise ValueError(f"backups.{key} must be a JSON list.")
                 self.backups[str(key)] = [normalize_username(str(handle)) for handle in handles]
+            loaded_pending = loaded.get("pending_creations", {})
+            if not isinstance(loaded_pending, dict):
+                raise ValueError("pending_creations must be a JSON object.")
+            self.pending_creations = {
+                str(key): normalize_username(str(handle))
+                for key, handle in loaded_pending.items()
+            }
+            self.creator_next_create_at = float(loaded.get("creator_next_create_at", 0.0) or 0.0)
         except (OSError, ValueError, TypeError) as exc:
             raise RecoveryError(f"Could not load recovery state: {exc}") from exc
 
@@ -964,6 +993,8 @@ class Service:
         payload = json.dumps({
             "recoveries": [asdict(item) for item in self.recoveries.values()],
             "backups": self.backups,
+            "pending_creations": self.pending_creations,
+            "creator_next_create_at": self.creator_next_create_at,
         }, indent=2)
         temporary = self.config.state_path.with_suffix(".tmp")
         temporary.write_text(payload + "\n", encoding="utf-8")
@@ -1293,6 +1324,14 @@ def restart(command: tuple[str, ...]) -> None:
         subprocess.run(command, check=True, timeout=60, capture_output=True, text=True)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RecoveryError(f"Restart command failed ({' '.join(command)}): {exc}") from exc
+
+
+async def bot_owned_by(client: TelegramClient, handle: str) -> bool:
+    try:
+        entity = await client.get_entity(handle)
+        return bool(getattr(entity, "bot", False) and not getattr(entity, "deleted", False))
+    except (asyncio.TimeoutError, OSError, RPCError, ValueError):
+        return False
 
 
 async def bot_needs_recovery(client: TelegramClient, handle: str) -> bool:
