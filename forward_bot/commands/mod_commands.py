@@ -43,7 +43,8 @@ def register_mod_commands(registry: HelpRegistry) -> None:
     add("purgebanned", "Admin", "Remove cached messages from banned users.", purgebanned, admin=True)
     add("adminsay", "Admin", "Urgently broadcast as admin.", adminsay, admin=True)
     add("addack", "Admin", "Add an onboarding acknowledgement question as text:answer.", addack, admin=True)
-    add("dropack", "Admin", "Drop the last onboarding acknowledgement question.", dropack, admin=True)
+    add("listack", "Admin", "List onboarding acknowledgement questions with indexes.", listack, admin=True)
+    add("dropack", "Admin", "Drop an acknowledgement question by index, or the last one.", dropack, admin=True)
     add("reload", "Admin", "Reload config without restarting workers.", reload_config, admin=True)
     add("status", "Admin", "Show delivery queue and cache status.", status, admin=True)
     add("warn", "Moderation", "Warn a user by reply or reference.", warn, mod=True)
@@ -109,11 +110,30 @@ async def dropack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_admin(update, context):
         return
     repo = get_repo(context)
-    dropped = repo.drop_last_ack_rule()
+    rules = repo.list_ack_rules()
+    index = len(rules)
+    if context.args:
+        try:
+            index = int(context.args[0])
+        except ValueError:
+            index = 0
+    dropped = repo.drop_ack_rule(index)
     if not dropped:
+        text = "No acknowledgement questions are configured." if not rules else "Use a valid acknowledgement index from /listack."
+        await command_reply(update, context, text, prefer_target=False)
+        return
+    await command_reply(update, context, f"Dropped acknowledgement question {index}. Remaining: {len(repo.list_ack_rules())}.", prefer_target=False)
+
+
+async def listack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update, context):
+        return
+    rules = get_repo(context).list_ack_rules()
+    if not rules:
         await command_reply(update, context, "No acknowledgement questions are configured.", prefer_target=False)
         return
-    await command_reply(update, context, f"Dropped acknowledgement question. Remaining: {len(repo.list_ack_rules())}.", prefer_target=False)
+    lines = [f"{index}. {item['question']} -> {item['answer']}" for index, item in enumerate(rules, 1)]
+    await command_reply(update, context, "Acknowledgement questions:\n" + "\n".join(lines), prefer_target=False)
 
 
 def _status_report(snapshot: dict, repo, store) -> str:

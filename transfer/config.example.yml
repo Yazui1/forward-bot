@@ -27,7 +27,18 @@ cloudflare:
   pages_url: "https://your-pages-project.pages.dev"
   # Authenticate Wrangler separately, for example with `wrangler login`.
 
-# State contains handles, message IDs, and temporary anonymous links; tokens never enter it.
+# Set enabled to true to create replacement bots automatically with the creator account.
+# Set prepare_bots to true to keep one already-transferred backup per configured bot.
+automatic_recovery:
+  enabled: false
+  prepare_bots: false
+  creator:
+    username: "@BackupBotCreatorAccount"
+    session: ".session/creator"
+    api_id: "123456"
+    api_hash: "creator-telegram-api-hash"
+
+# State contains handles, backup handles, message IDs, and temporary anonymous links; tokens never enter it.
 state_path: ".state/recovery.json"
 snapshot_dir: ".state/snapshots"
 

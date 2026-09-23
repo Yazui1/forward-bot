@@ -73,7 +73,8 @@ def register_user_commands(registry: HelpRegistry) -> None:
     add("s", "Identity", "Send one signed message.", signed_send)
     add("t", "Identity", "Send one tripcoded message.", tripcode_send)
     add("block", "Safety", "Block a sender by reply or visible user reference.", block)
-    add("unblock", "Safety", "Remove your most recent block.", unblock)
+    add("listblocked", "Safety", "List blocked users with indexes.", listblocked)
+    add("unblock", "Safety", "Remove a block by index, or the most recent block.", unblock)
     add("credit", "Credits", "Transfer credits by reply or reference.", credit)
     add("creditstats", "Credits",
         "Show credit leaderboard and economy details.", creditstats)
@@ -130,7 +131,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "onboarding.initial_cooldown_seconds", 0) or 0)
         prompt = onboarding_prompt(
             user, repo) if requires_onboarding_answers(user, repo) else ""
-        if initial > 0 and not user.is_mod_or_admin:
+        if first_seen and initial > 0 and not user.is_mod_or_admin:
             repo.set_cooldown(user.telegram_id, initial,
                               "onboarding", None, stack=False)
             text = f"Started. Initial cooldown: {human_seconds(initial)}. Invites can clear inviter cooldowns."
@@ -338,10 +339,39 @@ async def block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user, _ = await ensure_user(update, context)
     repo = get_repo(context)
-    removed = repo.remove_latest_block(user.telegram_id) if user else None
+    index = 1
+    if context.args:
+        try:
+            index = int(context.args[0])
+        except ValueError:
+            index = 0
+    removed = repo.remove_block(user.telegram_id, index) if user else None
     if user:
         touch_activity(context, user.telegram_id)
-    await update.effective_message.reply_text("Most recent block removed." if removed else "You have no blocked users.")
+    if not removed and index != 0 and not repo.list_blocks(user.telegram_id if user else 0):
+        text = "You have no blocked users."
+    elif not removed:
+        text = "Use a valid block index from /listblocked."
+    else:
+        text = f"Block {index} removed."
+    await update.effective_message.reply_text(text)
+
+
+async def listblocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    if not user:
+        return
+    blocked = get_repo(context).list_blocks(user.telegram_id)
+    touch_activity(context, user.telegram_id)
+    if not blocked:
+        await command_reply(update, context, "You have no blocked users.")
+        return
+    config = get_config(context)
+    lines = [
+        f"{index}. {display_identity_html(target, config, viewer=user)}"
+        for index, target in enumerate(blocked, 1)
+    ]
+    await command_reply(update, context, "Blocked users:\n" + "\n".join(lines), parse_mode="HTML")
 
 
 async def credit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

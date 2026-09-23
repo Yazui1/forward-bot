@@ -302,10 +302,23 @@ class Repository:
         self._blocks.add((blocker_id, blocked_id))
 
     def remove_latest_block(self, blocker_id: int) -> int | None:
+        return self.remove_block(blocker_id, 1)
+
+    def list_blocks(self, blocker_id: int) -> list[User]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT blocked_id FROM user_blocks WHERE blocker_id=? ORDER BY created_at DESC",
+                (blocker_id,),
+            ).fetchall()
+        return [user for row in rows if (user := self.get_user(int(row["blocked_id"]))) is not None]
+
+    def remove_block(self, blocker_id: int, index: int) -> int | None:
+        if index < 1:
+            return None
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT blocked_id FROM user_blocks WHERE blocker_id=? ORDER BY created_at DESC LIMIT 1",
-                (blocker_id,),
+                "SELECT blocked_id FROM user_blocks WHERE blocker_id=? ORDER BY created_at DESC LIMIT 1 OFFSET ?",
+                (blocker_id, index - 1),
             ).fetchone()
             if not row:
                 return None
@@ -710,10 +723,13 @@ class Repository:
         return rules
 
     def drop_last_ack_rule(self) -> dict[str, str] | None:
+        return self.drop_ack_rule(len(self.list_ack_rules()))
+
+    def drop_ack_rule(self, index: int) -> dict[str, str] | None:
         rules = self.list_ack_rules()
-        if not rules:
+        if index < 1 or index > len(rules):
             return None
-        dropped = rules.pop()
+        dropped = rules.pop(index - 1)
         self._save_ack_rules(rules)
         return dropped
 

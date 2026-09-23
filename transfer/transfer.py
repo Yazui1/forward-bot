@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -85,6 +86,20 @@ class Config:
         self.pool = tuple(account_from(item, None, source.parent) for item in optional_list(self.telegram, "pool"))
         self.api_id = int(required_string(self.telegram, "api_id"))
         self.api_hash = required_string(self.telegram, "api_hash")
+        automatic = value.get("automatic_recovery", {})
+        if not isinstance(automatic, dict):
+            raise ValueError("automatic_recovery must be a YAML mapping.")
+        self.automatic_recovery = optional_bool(automatic, "enabled", False)
+        self.prepare_bots = optional_bool(automatic, "prepare_bots", False)
+        if self.automatic_recovery or self.prepare_bots:
+            creator = required_mapping(automatic, "creator")
+            self.creator = account_from(creator, None, source.parent)
+            self.creator_api_id = int(required_string(creator, "api_id"))
+            self.creator_api_hash = required_string(creator, "api_hash")
+        else:
+            self.creator = None
+            self.creator_api_id = None
+            self.creator_api_hash = None
         self.announcement_channel = required_string(self.announcement, "channel")
         self.announcement_group = required_string(self.announcement, "group")
         self.recovery_template = required_string(self.announcement, "recovery_template")
@@ -165,6 +180,13 @@ def optional_list(value: dict[str, Any], key: str) -> list[Any]:
     return item
 
 
+def optional_bool(value: dict[str, Any], key: str, default: bool) -> bool:
+    item = value.get(key, default)
+    if not isinstance(item, bool):
+        raise ValueError(f"{key} must be true or false.")
+    return item
+
+
 def required_string(value: dict[str, Any], key: str) -> str:
     item = value.get(key)
     if not isinstance(item, str) or not item.strip():
@@ -217,10 +239,18 @@ class Service:
         self.config = config
         self.main_client = make_client(config.main, config)
         self.pool_clients = {account.username.casefold(): make_client(account, config) for account in config.pool}
+        self.creator_client = (
+            make_client(config.creator, config, config.creator_api_id, config.creator_api_hash)
+            if config.creator is not None
+            else None
+        )
         self.recoveries: dict[str, Recovery] = {}
+        self.backups: dict[str, list[str]] = {}
         self.lock = asyncio.Lock()
         self.recovery_locks: dict[str, asyncio.Lock] = {}
         account_keys = [config.main.username.casefold(), *(account.username.casefold() for account in config.pool)]
+        if config.creator is not None:
+            account_keys.append(config.creator.username.casefold())
         self.anonymous_locks = {key: asyncio.Lock() for key in account_keys}
         self.botfather_locks = {key: asyncio.Lock() for key in account_keys}
         self.config_file_lock = asyncio.Lock()
@@ -232,6 +262,11 @@ class Service:
         self._load_state()
         self._register_handlers()
         await self._start_client(self.main_client, self.config.main)
+        if self.creator_client is not None and self.config.creator is not None:
+            try:
+                await self._start_client(self.creator_client, self.config.creator)
+            except (OSError, RPCError, RecoveryError) as exc:
+                self.log.error("Creator account %s is unavailable: %s", self.config.creator.username, exc)
         await self._ensure_snapshots()
         for account in self.config.pool:
             try:
@@ -240,6 +275,7 @@ class Service:
                 )
             except (OSError, RPCError, RecoveryError) as exc:
                 self.log.error("Pool account %s is unavailable: %s", account.username, exc)
+        await self._ensure_prepared_bots()
         await self._check_configured_bots()
         await self._resume_recoveries()
         self.log.info("Recovery service started as %s", self.config.main.username)
@@ -450,6 +486,9 @@ class Service:
     async def _start_recovery_for_mapping(
         self, mapping: BotMapping, old_handle: str
     ) -> None:
+        if self.config.automatic_recovery:
+            await self._start_automatic_recovery(mapping, old_handle)
+            return
         async with self.lock:
             key = mapping.handle_prefix.casefold()
             if key in self.recoveries:
@@ -472,6 +511,92 @@ class Service:
             await self._prepare_recovery(recovery, mapping)
         except Exception:
             self.log.exception("Could not start recovery for %s", mapping.friendly_name)
+
+    async def _start_automatic_recovery(
+        self, mapping: BotMapping, old_handle: str
+    ) -> None:
+        async with self.lock:
+            key = mapping.handle_prefix.casefold()
+            if key in self.recoveries:
+                self.log.info("Recovery for %s is already active", mapping.friendly_name)
+                return
+            recovery = Recovery(
+                key=key,
+                old_handle=old_handle,
+                receiver_username=self.config.main.username.casefold(),
+                anonymous_link="",
+                stage="automatic_preparing",
+            )
+            self.recoveries[key] = recovery
+            self._save_state()
+        try:
+            await self._run_automatic_recovery(recovery, mapping)
+        except Exception:
+            self.log.exception("Could not start automatic recovery for %s", mapping.friendly_name)
+
+    async def _run_automatic_recovery(
+        self, recovery: Recovery, mapping: BotMapping
+    ) -> None:
+        if recovery.new_handle is None:
+            recovery.new_handle = await self._claim_backup(mapping)
+            async with self.lock:
+                if self.recoveries.get(recovery.key) is not recovery:
+                    return
+                recovery.stage = "finalizing"
+                self._save_state()
+        await self._configure_recovered_bot_dialog(recovery)
+        await self._finalize(recovery)
+        if self.config.prepare_bots:
+            try:
+                await self._ensure_backup(mapping)
+            except Exception:
+                self.log.exception("Could not replenish the backup for %s", mapping.friendly_name)
+
+    async def _ensure_prepared_bots(self) -> None:
+        if not self.config.automatic_recovery or not self.config.prepare_bots:
+            return
+        async def prepare(mapping: BotMapping) -> None:
+            try:
+                await self._ensure_backup(mapping)
+            except Exception:
+                self.log.exception("Could not prepare a backup for %s", mapping.friendly_name)
+        await asyncio.gather(*(prepare(mapping) for mapping in self.config.bots))
+
+    async def _ensure_backup(self, mapping: BotMapping) -> None:
+        async with self.lock:
+            if self.backups.get(mapping.handle_prefix.casefold()):
+                return
+        await self._create_backup(mapping)
+
+    async def _claim_backup(self, mapping: BotMapping) -> str:
+        key = mapping.handle_prefix.casefold()
+        async with self.lock:
+            prepared = self.backups.get(key, [])
+            if prepared:
+                handle = prepared.pop(0)
+                return handle
+        handle = await self._create_backup(mapping)
+        async with self.lock:
+            self.backups.get(key, []).remove(handle)
+        return handle
+
+    async def _create_backup(self, mapping: BotMapping) -> str:
+        if self.creator_client is None or self.config.creator is None:
+            raise RecoveryError("Automatic recovery creator account is not configured.")
+        creator_key = self.config.creator.username.casefold()
+        async with self.botfather_locks[creator_key]:
+            handle = await create_bot(self.creator_client, mapping.handle_prefix)
+            await self.main_client.send_message(handle, "/start")
+            await transfer_ownership(
+                self.creator_client,
+                handle,
+                self.config.main.username,
+            )
+        async with self.lock:
+            self.backups.setdefault(mapping.handle_prefix.casefold(), []).append(handle)
+            self._save_state()
+        self.log.info("Prepared backup %s for %s", handle, mapping.friendly_name)
+        return handle
 
     async def _prepare_recovery(self, recovery: Recovery, mapping: BotMapping) -> None:
         receiver = recovery.receiver_username.casefold()
@@ -521,6 +646,7 @@ class Service:
             recovery.stage = "finalizing"
             self._save_state()
         try:
+            await self._configure_recovered_bot_dialog(recovery)
             await self._finalize(recovery)
         except Exception:
             self.log.exception("Recovery finalization failed for %s", recovery.new_handle)
@@ -538,9 +664,45 @@ class Service:
                     self._save_state()
             self.log.info("Transferred %s from %s to main account", recovery.new_handle, pool)
 
+    async def _configure_recovered_bot_dialog(self, recovery: Recovery) -> None:
+        assert recovery.new_handle
+        try:
+            old_peer = await self.main_client.get_input_entity(recovery.old_handle)
+        except (OSError, RPCError, ValueError):
+            old_peer = None
+            try:
+                old_key = handle_key(recovery.old_handle)
+                for dialog in await self.main_client.get_dialogs():
+                    if handle_key(str(getattr(dialog.entity, "username", "") or "")) == old_key:
+                        old_peer = await self.main_client.get_input_entity(dialog.entity)
+                        break
+            except (OSError, RPCError, ValueError):
+                pass
+        if old_peer is not None:
+            try:
+                await self.main_client(functions.messages.ToggleDialogPinRequest(
+                    peer=old_peer,
+                    pinned=False,
+                ))
+            except (OSError, RPCError, ValueError) as exc:
+                self.log.warning("Could not unpin old bot %s: %s", recovery.old_handle, exc)
+        try:
+            new_peer = await self.main_client.get_input_entity(recovery.new_handle)
+            await self.main_client(functions.account.UpdateNotifySettingsRequest(
+                peer=types.InputNotifyPeer(peer=new_peer),
+                settings=types.InputPeerNotifySettings(mute_until=2147483647),
+            ))
+            await self.main_client(functions.messages.ToggleDialogPinRequest(
+                peer=new_peer,
+                pinned=True,
+            ))
+        except (OSError, RPCError, ValueError) as exc:
+            self.log.warning("Could not mute/pin recovered bot chat %s: %s", recovery.new_handle, exc)
+
     async def _resume_recoveries(self) -> None:
         resumable_stages = {
             "starting",
+            "automatic_preparing",
             "transferring",
             "waiting_main",
             "finalizing",
@@ -564,12 +726,30 @@ class Service:
                 if recovery.stage == "starting":
                     await self._prepare_recovery(recovery, self._mapping(recovery))
                     return
+                if recovery.stage == "automatic_preparing":
+                    await self._run_automatic_recovery(recovery, self._mapping(recovery))
+                    return
                 if recovery.stage == "transferring":
                     pool = recovery.receiver_username.casefold()
                     async with self.botfather_locks[pool]:
                         await self._transfer_to_main(recovery, pool)
                     return
-                await self._finalize(recovery)
+                automatic = (
+                    self.config.automatic_recovery
+                    and not recovery.anonymous_link
+                    and recovery.receiver_username.casefold() == self.config.main.username.casefold()
+                )
+                if automatic and recovery.stage == "finalizing":
+                    await self._run_automatic_recovery(recovery, self._mapping(recovery))
+                else:
+                    if not automatic:
+                        await self._configure_recovered_bot_dialog(recovery)
+                    await self._finalize(recovery)
+                    if automatic and self.config.prepare_bots:
+                        try:
+                            await self._ensure_backup(self._mapping(recovery))
+                        except Exception:
+                            self.log.exception("Could not replenish the backup after recovery")
             except Exception:
                 self.log.exception(
                     "Could not resume recovery for %s; it remains at stage %s",
@@ -619,6 +799,7 @@ class Service:
                 recovery.new_handle,
                 recovery.old_handle,
                 source_handle,
+                mapping.handle,
             )
             await checkpoint("finalizing_config")
 
@@ -700,7 +881,7 @@ class Service:
                         and item.receiver_username.casefold() == recovery.receiver_username.casefold()
                         for item in self.recoveries.values()
                     )
-                if not other_recoveries:
+                if recovery.anonymous_link and not other_recoveries:
                     await revoke_anonymous_link(anonymous_client, ANONYMOUS_BOT)
                 async with self.lock:
                     self.recoveries.pop(recovery.key, None)
@@ -767,12 +948,23 @@ class Service:
                     item["receiver_username"] = item.pop("pool_username")
                 recoveries.append(Recovery(**item))
             self.recoveries = {item.key: item for item in recoveries}
+            loaded_backups = loaded.get("backups", {})
+            if not isinstance(loaded_backups, dict):
+                raise ValueError("backups must be a JSON object.")
+            self.backups = {}
+            for key, handles in loaded_backups.items():
+                if not isinstance(handles, list):
+                    raise ValueError(f"backups.{key} must be a JSON list.")
+                self.backups[str(key)] = [normalize_username(str(handle)) for handle in handles]
         except (OSError, ValueError, TypeError) as exc:
             raise RecoveryError(f"Could not load recovery state: {exc}") from exc
 
     def _save_state(self) -> None:
         self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps({"recoveries": [asdict(item) for item in self.recoveries.values()]}, indent=2)
+        payload = json.dumps({
+            "recoveries": [asdict(item) for item in self.recoveries.values()],
+            "backups": self.backups,
+        }, indent=2)
         temporary = self.config.state_path.with_suffix(".tmp")
         temporary.write_text(payload + "\n", encoding="utf-8")
         temporary.replace(self.config.state_path)
@@ -782,8 +974,17 @@ class Service:
             pass
 
 
-def make_client(account: Account, config: Config) -> TelegramClient:
-    return TelegramClient(str(account.session), config.api_id, config.api_hash)
+def make_client(
+    account: Account,
+    config: Config,
+    api_id: int | None = None,
+    api_hash: str | None = None,
+) -> TelegramClient:
+    return TelegramClient(
+        str(account.session),
+        config.api_id if api_id is None else api_id,
+        config.api_hash if api_hash is None else api_hash,
+    )
 
 
 async def anonymous_link(client: TelegramClient, anonymous_bot: str) -> str:
@@ -819,6 +1020,26 @@ async def click_button(message: object, needle: str) -> bool:
                 await message.click(row, column)
                 return True
     return False
+
+
+async def create_bot(client: TelegramClient, handle_prefix: str) -> str:
+    async with client.conversation(BOTFATHER, timeout=60, exclusive=True) as conv:
+        await conv.send_message("/cancel")
+        await conv.get_response()
+        await conv.send_message("/newbot")
+        await conv.get_response()
+        await conv.send_message(handle_prefix)
+        await conv.get_response()
+        for digits in (2, 3, 4):
+            number = secrets.randbelow(9 * 10 ** (digits - 1)) + 10 ** (digits - 1)
+            candidate = f"{handle_prefix}{number}bot"
+            await conv.send_message(candidate)
+            reply = await conv.get_response()
+            if TOKEN_RE.search(response_text(reply)):
+                return normalize_username(candidate)
+            if "taken" not in response_text(reply).casefold() and "available" not in response_text(reply).casefold():
+                raise RecoveryError("BotFather rejected the backup bot username: " + response_text(reply))
+    raise RecoveryError(f"Could not find an available {handle_prefix}<number>bot username.")
 
 
 async def transfer_ownership(client: TelegramClient, bot_handle: str, recipient: str) -> None:
@@ -887,7 +1108,8 @@ async def set_bot_info(client: TelegramClient, target: str, name: str, about: st
             await conv.get_response()
             await conv.send_message(target)
             await conv.get_response()
-            await conv.send_message(value.replace("\r\n", "\n") or "/empty")
+            value = value.replace("\r\n", "\n").replace("\r", "\n")
+            await conv.send_message(value or "/empty")
             reply = await conv.get_response()
         if "error" in response_text(reply).casefold():
             raise RecoveryError(f"BotFather rejected {command}: {response_text(reply)}")
@@ -1096,6 +1318,7 @@ async def update_runtime_about(
     new_handle: str,
     old_handle: str,
     source_handle: str | None = None,
+    configured_handle: str | None = None,
 ) -> None:
     async with client.conversation(new_handle, timeout=90, exclusive=True) as conv:
         sent = await conv.send_message("/about")
@@ -1103,10 +1326,14 @@ async def update_runtime_about(
         current_text = response_text(current)
         updated = replace_usernames(
             current_text,
-            [(old, new_handle) for old in (source_handle, old_handle) if old],
+            [
+                (old, new_handle)
+                for old in (source_handle, configured_handle, old_handle)
+                if old
+            ],
         )
         if updated != current_text:
-            sent = await conv.send_message("/about " + " ".join(updated.splitlines()))
+            sent = await conv.send_message("/about " + updated)
             about_result = await conv.get_reply(sent)
             about_text = response_text(about_result).casefold()
             if any(word in about_text for word in ("error", "invalid", "admin only", "failed")):
