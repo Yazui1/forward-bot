@@ -603,6 +603,7 @@ class Service:
                     self.creator_next_create_at = time.time() + CREATOR_CREATE_INTERVAL
                     self._save_state()
                 self.log.info("Created backup bot %s; ownership transfer is pending", handle)
+            await self.main_client.send_message(handle, "/start")
             try:
                 await transfer_ownership(
                     self.creator_client,
@@ -1085,7 +1086,9 @@ async def transfer_ownership(client: TelegramClient, bot_handle: str, recipient:
         menu = await conv.get_response()
         if not await click_button(menu, "transfer ownership"):
             raise RecoveryError("BotFather has no Transfer Ownership control. Buttons: " + ", ".join(button_labels(menu)))
-        await conv.get_response()
+        recipient_prompt = await conv.get_response()
+        if await click_button(recipient_prompt, "choose recipient"):
+            await conv.get_response()
         await conv.send_message(recipient)
         confirmation = await conv.get_response()
         if not await click_button(confirmation, "yes, i am sure"):
@@ -1094,6 +1097,8 @@ async def transfer_ownership(client: TelegramClient, bot_handle: str, recipient:
     text = response_text(final).casefold()
     if any(word in text for word in ("error", "failed", "invalid", "sorry")):
         raise RecoveryError("BotFather rejected ownership transfer: " + response_text(final))
+    if not any(word in text for word in ("transfer", "ownership", "owned", "success", "done")):
+        raise RecoveryError("BotFather did not confirm ownership transfer: " + response_text(final))
 
 
 def replace_usernames(value: str, mappings: list[tuple[str, str]]) -> str:
@@ -1279,7 +1284,12 @@ async def restore_bot_snapshot(
         photo = snapshot_metadata_path(config, mapping).parent / str(photo_name)
         if not photo.is_file():
             raise RecoveryError(f"Snapshot profile photo is missing: {photo}")
-        target = await client.get_input_entity(target_name)
+        target_entity = await client.get_entity(target_name)
+        if not getattr(target_entity, "bot", False) or getattr(target_entity, "deleted", False):
+            raise RecoveryError(f"Telegram does not recognize {target_name} as a valid bot.")
+        if getattr(target_entity, "access_hash", None) is None:
+            raise RecoveryError(f"Telegram returned no access hash for {target_name}.")
+        target = types.InputUser(target_entity.id, target_entity.access_hash)
         uploaded = await client.upload_file(str(photo))
         await client(functions.photos.UploadProfilePhotoRequest(bot=target, file=uploaded))
     try:
