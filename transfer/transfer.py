@@ -279,9 +279,9 @@ class Service:
                 )
             except (OSError, RPCError, RecoveryError) as exc:
                 self.log.error("Pool account %s is unavailable: %s", account.username, exc)
-        await self._ensure_prepared_bots()
         await self._check_configured_bots()
         await self._resume_recoveries()
+        await self._ensure_prepared_bots()
         self.log.info("Recovery service started as %s", self.config.main.username)
         deleted_bot_monitor = asyncio.create_task(self._monitor_deleted_bots())
         try:
