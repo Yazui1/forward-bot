@@ -43,6 +43,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     touch_activity(context, user.telegram_id)
     user = repo.get_user(user.telegram_id) or user
+    if await _handle_recovery_reward(update, context, user):
+        return
     if not user.has_started:
         await _reply_to_message(context, msg, MSG_USE_START)
         return
@@ -66,6 +68,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _reply_to_message(context, msg, MSG_RATE_LIMITED, reply_markup=markup)
         return
     await _process_payload(update, context, user, extract_payload(msg), source_message=msg)
+
+
+async def _handle_recovery_reward(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user: User
+) -> bool:
+    msg = update.effective_message
+    code = str(get_config(context).get("recovery.reward_code", "") or "").strip()
+    if not msg or not code or str(getattr(msg, "text", "") or "").strip().casefold() != code.casefold():
+        return False
+    if get_repo(context).redeem_recovery_reward(user.telegram_id, code):
+        await _reply_to_message(context, msg, "Thanks! 100 credits have been added to your balance.")
+    else:
+        await _reply_to_message(context, msg, "This recovery reward code has already been used.")
+    return True
 
 
 async def submit_text(

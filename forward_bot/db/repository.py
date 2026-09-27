@@ -426,6 +426,37 @@ class Repository:
             user.credits = round_credits(user.credits + amount)
         return amount, user
 
+    def redeem_recovery_reward(self, user_id: int, code: str) -> bool:
+        normalized = str(code).strip().casefold()
+        if not normalized or not self.get_user(user_id):
+            return False
+        amount = 100.0
+        state_key = f"recovery_reward:{normalized}"
+        with self.connect() as conn:
+            claimed = conn.execute(
+                "INSERT OR IGNORE INTO bot_state (state_key, state_value) VALUES (?, ?)",
+                (state_key, str(user_id)),
+            )
+            if claimed.rowcount != 1:
+                return False
+            activity_at = self._dirty_activity.get(user_id)
+            if activity_at:
+                conn.execute(
+                    "UPDATE users SET credits=ROUND(credits + ?, 2), last_activity=? WHERE telegram_id=?",
+                    (amount, activity_at, user_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE users SET credits=ROUND(credits + ?, 2) WHERE telegram_id=?",
+                    (amount, user_id),
+                )
+            self._record_credit_delta(conn, user_id, amount, "recovery_reward")
+            conn.commit()
+        if activity_at and self._dirty_activity.get(user_id) == activity_at:
+            self._dirty_activity.pop(user_id, None)
+        self._refresh_user(user_id)
+        return True
+
     def transfer_credits(self, sender_id: int, target_id: int, amount: float, reason: str = "transfer") -> tuple[User | None, User | None]:
         amount = round_credits(amount)
         with self.connect() as conn:

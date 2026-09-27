@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, replace, field
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -43,6 +43,7 @@ CREATOR_CREATE_INTERVAL = 300
 BOT_USERNAME_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]{4,})\b")
 URL_RE = re.compile(r"https://t\.me/IncogNoteBot\?start=[A-Za-z0-9_-]+")
 OWNERSHIP_PHRASE = "ownership of the bot"
+REWARD_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,9 @@ class Recovery:
     new_handle: str | None = None
     anonymous_message_id: int | None = None
     announcement_message_id: int | None = None
+    candidate_handles: list[str] = field(default_factory=list)
+    candidate_message_ids: dict[str, int] = field(default_factory=dict)
+    reward_code: str = ""
 
 
 class RecoveryError(RuntimeError):
@@ -85,7 +89,8 @@ class Config:
         self.announcement = required_mapping(value, "announcement")
         self.cloudflare = required_mapping(value, "cloudflare")
         self.main = account_from(self.telegram, "main", source.parent)
-        self.pool = tuple(account_from(item, None, source.parent) for item in optional_list(self.telegram, "pool"))
+        self.pool = tuple(account_from(item, None, source.parent)
+                          for item in optional_list(self.telegram, "pool"))
         self.api_id = int(required_string(self.telegram, "api_id"))
         self.api_hash = required_string(self.telegram, "api_hash")
         automatic = value.get("automatic_recovery", {})
@@ -102,12 +107,17 @@ class Config:
             self.creator = None
             self.creator_api_id = None
             self.creator_api_hash = None
-        self.announcement_channel = required_string(self.announcement, "channel")
+        self.announcement_channel = required_string(
+            self.announcement, "channel")
         self.announcement_group = required_string(self.announcement, "group")
-        self.recovery_template = required_string(self.announcement, "recovery_template")
-        self.restored_template = required_string(self.announcement, "restored_template")
-        self.state_path = resolve_path(value.get("state_path", ".state/recovery.json"), source.parent)
-        self.snapshot_dir = resolve_path(value.get("snapshot_dir", ".state/snapshots"), source.parent)
+        self.recovery_template = required_string(
+            self.announcement, "recovery_template")
+        self.restored_template = required_string(
+            self.announcement, "restored_template")
+        self.state_path = resolve_path(
+            value.get("state_path", ".state/recovery.json"), source.parent)
+        self.snapshot_dir = resolve_path(
+            value.get("snapshot_dir", ".state/snapshots"), source.parent)
         self.bots = tuple(self._load_bots())
         prefixes = [item.handle_prefix.casefold() for item in self.bots]
         if len(prefixes) != len(set(prefixes)):
@@ -122,7 +132,8 @@ class Config:
             if isinstance(command, str):
                 command = shlex.split(command)
             if not isinstance(command, list) or not command or not all(isinstance(part, str) and part for part in command):
-                raise ValueError("bots.restart_command must be a non-empty command string or list.")
+                raise ValueError(
+                    "bots.restart_command must be a non-empty command string or list.")
             handle_prefix = required_string(item, "handle_prefix").lstrip("@")
             if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", handle_prefix) is None:
                 raise ValueError(
@@ -143,7 +154,8 @@ class Config:
             result.append(BotMapping(
                 handle_prefix=handle_prefix,
                 friendly_name=required_string(item, "friendly_name"),
-                config_path=resolve_path(required_string(item, "config_path"), self.source.parent),
+                config_path=resolve_path(required_string(
+                    item, "config_path"), self.source.parent),
                 token_path=required_string(item, "token_path"),
                 restart_command=tuple(command),
                 handle=handle,
@@ -154,10 +166,12 @@ class Config:
 
     def bot_for_handle(self, handle: str) -> BotMapping | None:
         clean = handle_key(handle)
-        matches = [item for item in self.bots if clean.startswith(item.handle_prefix.casefold())]
+        matches = [item for item in self.bots if clean.startswith(
+            item.handle_prefix.casefold())]
         if len(matches) > 1:
             raise RecoveryError(f"More than one mapping matches @{clean}.")
         return matches[0] if matches else None
+
 
 def required_mapping(value: dict[str, Any], key: str | None) -> dict[str, Any]:
     item = value.get(key) if key else value
@@ -233,16 +247,19 @@ def format_template(template: str, **values: str) -> str:
     try:
         return template.format(**values)
     except KeyError as exc:
-        raise RecoveryError(f"Unknown field in announcement template: {exc.args[0]}") from exc
+        raise RecoveryError(
+            f"Unknown field in announcement template: {exc.args[0]}") from exc
 
 
 class Service:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.main_client = make_client(config.main, config)
-        self.pool_clients = {account.username.casefold(): make_client(account, config) for account in config.pool}
+        self.pool_clients = {account.username.casefold(): make_client(
+            account, config) for account in config.pool}
         self.creator_client = (
-            make_client(config.creator, config, config.creator_api_id, config.creator_api_hash)
+            make_client(config.creator, config,
+                        config.creator_api_id, config.creator_api_hash)
             if config.creator is not None
             else None
         )
@@ -252,7 +269,8 @@ class Service:
         self.creator_next_create_at = 0.0
         self.lock = asyncio.Lock()
         self.recovery_locks: dict[str, asyncio.Lock] = {}
-        account_keys = [config.main.username.casefold(), *(account.username.casefold() for account in config.pool)]
+        account_keys = [config.main.username.casefold(
+        ), *(account.username.casefold() for account in config.pool)]
         if config.creator is not None:
             account_keys.append(config.creator.username.casefold())
         self.anonymous_locks = {key: asyncio.Lock() for key in account_keys}
@@ -270,7 +288,8 @@ class Service:
             try:
                 await self._start_client(self.creator_client, self.config.creator)
             except (OSError, RPCError, RecoveryError) as exc:
-                self.log.error("Creator account %s is unavailable: %s", self.config.creator.username, exc)
+                self.log.error("Creator account %s is unavailable: %s",
+                               self.config.creator.username, exc)
         await self._ensure_snapshots()
         for account in self.config.pool:
             try:
@@ -278,11 +297,13 @@ class Service:
                     self.pool_clients[account.username.casefold()], account
                 )
             except (OSError, RPCError, RecoveryError) as exc:
-                self.log.error("Pool account %s is unavailable: %s", account.username, exc)
+                self.log.error(
+                    "Pool account %s is unavailable: %s", account.username, exc)
         await self._check_configured_bots()
         await self._resume_recoveries()
         await self._ensure_prepared_bots()
-        self.log.info("Recovery service started as %s", self.config.main.username)
+        self.log.info("Recovery service started as %s",
+                      self.config.main.username)
         deleted_bot_monitor = asyncio.create_task(self._monitor_deleted_bots())
         try:
             await asyncio.gather(self.main_client.run_until_disconnected(), *(client.run_until_disconnected() for client in self.pool_clients.values()))
@@ -308,7 +329,8 @@ class Service:
                 self.config,
                 mapping,
             )
-            self.log.info("Created settings snapshot for %s", mapping.friendly_name)
+            self.log.info("Created settings snapshot for %s",
+                          mapping.friendly_name)
 
     async def _check_configured_bots(self) -> None:
         async def check(mapping: BotMapping) -> None:
@@ -359,12 +381,15 @@ class Service:
         me = await client.get_me()
         actual = normalize_username(me.username or "")
         if actual.casefold() != account.username.casefold():
-            raise RecoveryError(f"Session {account.session} belongs to {actual}, expected {account.username}.")
+            raise RecoveryError(
+                f"Session {account.session} belongs to {actual}, expected {account.username}.")
 
     def _register_handlers(self) -> None:
-        self.main_client.add_event_handler(self._on_main_message, events.NewMessage(incoming=True))
+        self.main_client.add_event_handler(
+            self._on_main_message, events.NewMessage(incoming=True))
         for username, client in self.pool_clients.items():
-            client.add_event_handler(lambda event, pool=username: self._on_pool_message(pool, event), events.NewMessage(incoming=True))
+            client.add_event_handler(lambda event, pool=username: self._on_pool_message(
+                pool, event), events.NewMessage(incoming=True))
 
     async def _on_main_message(self, event: events.NewMessage.Event) -> None:
         sender = await event.get_sender()
@@ -389,23 +414,31 @@ class Service:
         handles = message_handles(event.message)
         async with self.lock:
             matches = [
-                item for item in self.recoveries.values()
+                (item, candidate)
+                for item in self.recoveries.values()
                 if item.receiver_username.casefold() == pool
                 and item.stage == "waiting_pool"
-                and handle_is_in(handles, item.new_handle)
+                for candidate in [self._matching_candidate(item, handles)]
+                if candidate is not None
             ]
             if len(matches) != 1:
                 if matches:
-                    self.log.warning("Ambiguous pool ownership message: %s", response_text(event.message))
+                    self.log.warning(
+                        "Ambiguous pool ownership message: %s", response_text(event.message))
                 return
-            pending = matches[0]
+            pending, candidate = matches[0]
+            pending.new_handle = candidate
+            pending.anonymous_message_id = pending.candidate_message_ids.get(
+                handle_key(candidate), pending.anonymous_message_id
+            )
             pending.stage = "transferring"
             self._save_state()
         try:
             async with self.botfather_locks[pool]:
                 await self._transfer_to_main(pending, pool)
         except Exception:
-            self.log.exception("Could not transfer %s from pool %s to main", pending.new_handle, pool)
+            self.log.exception(
+                "Could not transfer %s from pool %s to main", pending.new_handle, pool)
 
     async def _on_anonymous_message(
         self, receiver: str, client: TelegramClient, event: events.NewMessage.Event
@@ -418,7 +451,7 @@ class Service:
             pending_recoveries = [
                 item for item in self.recoveries.values()
                 if item.receiver_username.casefold() == receiver
-                and item.stage == "waiting_submission"
+                and item.stage in {"waiting_submission", "waiting_main", "waiting_pool"}
             ]
             matches = []
             for item in pending_recoveries:
@@ -437,7 +470,8 @@ class Service:
                 valid = []
             else:
                 if len(matches) > 1:
-                    self.log.warning("Ambiguous replacement message: %s", response_text(event.message))
+                    self.log.warning(
+                        "Ambiguous replacement message: %s", response_text(event.message))
                 return
             if len(valid) != 1:
                 error_message = (
@@ -461,8 +495,12 @@ class Service:
             )
             return
         async with self.lock:
-            if pending.stage != "waiting_submission":
+            if pending.stage not in {"waiting_submission", "waiting_main", "waiting_pool"}:
                 return
+            if not any(handle_key(item) == handle_key(candidate) for item in pending.candidate_handles):
+                pending.candidate_handles.append(candidate)
+            pending.candidate_message_ids[handle_key(
+                candidate)] = event.message.id
             pending.new_handle = candidate
             pending.anonymous_message_id = event.message.id
             pending.stage = (
@@ -479,7 +517,8 @@ class Service:
     async def _start_recovery(self, message: object) -> None:
         handles = message_handles(message)
         if not handles:
-            self.log.warning("Abuse notification had no bot handle: %s", response_text(message))
+            self.log.warning(
+                "Abuse notification had no bot handle: %s", response_text(message))
             return
         await asyncio.gather(*(
             self._start_recovery_for_mapping(mapping, old_handle)
@@ -496,11 +535,13 @@ class Service:
         async with self.lock:
             key = mapping.handle_prefix.casefold()
             if key in self.recoveries:
-                self.log.info("Recovery for %s is already active", mapping.friendly_name)
+                self.log.info("Recovery for %s is already active",
+                              mapping.friendly_name)
                 return
             receiver = self._available_receiver()
             if receiver is None:
-                self.log.error("No available receiving account for %s", mapping.friendly_name)
+                self.log.error(
+                    "No available receiving account for %s", mapping.friendly_name)
                 return
             recovery = Recovery(
                 key=key,
@@ -508,13 +549,15 @@ class Service:
                 receiver_username=receiver,
                 anonymous_link="",
                 stage="starting",
+                reward_code=make_reward_code(),
             )
             self.recoveries[key] = recovery
             self._save_state()
         try:
             await self._prepare_recovery(recovery, mapping)
         except Exception:
-            self.log.exception("Could not start recovery for %s", mapping.friendly_name)
+            self.log.exception(
+                "Could not start recovery for %s", mapping.friendly_name)
 
     async def _start_automatic_recovery(
         self, mapping: BotMapping, old_handle: str
@@ -522,7 +565,8 @@ class Service:
         async with self.lock:
             key = mapping.handle_prefix.casefold()
             if key in self.recoveries:
-                self.log.info("Recovery for %s is already active", mapping.friendly_name)
+                self.log.info("Recovery for %s is already active",
+                              mapping.friendly_name)
                 return
             recovery = Recovery(
                 key=key,
@@ -536,7 +580,8 @@ class Service:
         try:
             await self._run_automatic_recovery(recovery, mapping)
         except Exception:
-            self.log.exception("Could not start automatic recovery for %s", mapping.friendly_name)
+            self.log.exception(
+                "Could not start automatic recovery for %s", mapping.friendly_name)
 
     async def _run_automatic_recovery(
         self, recovery: Recovery, mapping: BotMapping
@@ -554,16 +599,19 @@ class Service:
             try:
                 await self._ensure_backup(mapping)
             except Exception:
-                self.log.exception("Could not replenish the backup for %s", mapping.friendly_name)
+                self.log.exception(
+                    "Could not replenish the backup for %s", mapping.friendly_name)
 
     async def _ensure_prepared_bots(self) -> None:
         if not self.config.automatic_recovery or not self.config.prepare_bots:
             return
+
         async def prepare(mapping: BotMapping) -> None:
             try:
                 await self._ensure_backup(mapping)
             except Exception:
-                self.log.exception("Could not prepare a backup for %s", mapping.friendly_name)
+                self.log.exception(
+                    "Could not prepare a backup for %s", mapping.friendly_name)
         await asyncio.gather(*(prepare(mapping) for mapping in self.config.bots))
 
     async def _ensure_backup(self, mapping: BotMapping) -> None:
@@ -586,7 +634,8 @@ class Service:
 
     async def _create_backup(self, mapping: BotMapping) -> str:
         if self.creator_client is None or self.config.creator is None:
-            raise RecoveryError("Automatic recovery creator account is not configured.")
+            raise RecoveryError(
+                "Automatic recovery creator account is not configured.")
         creator_key = self.config.creator.username.casefold()
         async with self.botfather_locks[creator_key]:
             key = mapping.handle_prefix.casefold()
@@ -595,14 +644,16 @@ class Service:
             if handle is None:
                 wait = self.creator_next_create_at - time.time()
                 if wait > 0:
-                    self.log.info("Waiting %.0f seconds before creating the next backup bot", wait)
+                    self.log.info(
+                        "Waiting %.0f seconds before creating the next backup bot", wait)
                     await asyncio.sleep(wait)
                 handle = await create_bot(self.creator_client, mapping.handle_prefix)
                 async with self.lock:
                     self.pending_creations[key] = handle
                     self.creator_next_create_at = time.time() + CREATOR_CREATE_INTERVAL
                     self._save_state()
-                self.log.info("Created backup bot %s; ownership transfer is pending", handle)
+                self.log.info(
+                    "Created backup bot %s; ownership transfer is pending", handle)
             await self.main_client.send_message(handle, "/start")
             try:
                 await transfer_ownership(
@@ -615,9 +666,11 @@ class Service:
                     raise
         async with self.lock:
             self.pending_creations.pop(mapping.handle_prefix.casefold(), None)
-            self.backups.setdefault(mapping.handle_prefix.casefold(), []).append(handle)
+            self.backups.setdefault(
+                mapping.handle_prefix.casefold(), []).append(handle)
             self._save_state()
-        self.log.info("Prepared backup %s for %s", handle, mapping.friendly_name)
+        self.log.info("Prepared backup %s for %s",
+                      handle, mapping.friendly_name)
         return handle
 
     async def _prepare_recovery(self, recovery: Recovery, mapping: BotMapping) -> None:
@@ -645,7 +698,8 @@ class Service:
         )
         message_id = getattr(announcement, "id", None)
         if not isinstance(message_id, int):
-            raise RecoveryError("Could not record the recovery announcement message ID.")
+            raise RecoveryError(
+                "Could not record the recovery announcement message ID.")
         async with self.lock:
             if self.recoveries.get(recovery.key) is not recovery:
                 return
@@ -658,20 +712,27 @@ class Service:
         handles = message_handles(message)
         async with self.lock:
             matches = [
-                item for item in self.recoveries.values()
+                (item, candidate)
+                for item in self.recoveries.values()
                 if item.stage in {"transferring", "waiting_main"}
-                and handle_is_in(handles, item.new_handle)
+                for candidate in [self._matching_candidate(item, handles)]
+                if candidate is not None
             ]
             if len(matches) != 1:
                 return
-            recovery = matches[0]
+            recovery, candidate = matches[0]
+            recovery.new_handle = candidate
+            recovery.anonymous_message_id = recovery.candidate_message_ids.get(
+                handle_key(candidate), recovery.anonymous_message_id
+            )
             recovery.stage = "finalizing"
             self._save_state()
         try:
             await self._configure_recovered_bot_dialog(recovery)
             await self._finalize(recovery)
         except Exception:
-            self.log.exception("Recovery finalization failed for %s", recovery.new_handle)
+            self.log.exception(
+                "Recovery finalization failed for %s", recovery.new_handle)
             async with self.lock:
                 self._save_state()
 
@@ -684,7 +745,8 @@ class Service:
                 if self.recoveries.get(recovery.key) is recovery and recovery.stage == "transferring":
                     recovery.stage = "waiting_main"
                     self._save_state()
-            self.log.info("Transferred %s from %s to main account", recovery.new_handle, pool)
+            self.log.info("Transferred %s from %s to main account",
+                          recovery.new_handle, pool)
 
     async def _configure_recovered_bot_dialog(self, recovery: Recovery) -> None:
         assert recovery.new_handle
@@ -707,7 +769,8 @@ class Service:
                     pinned=False,
                 ))
             except (OSError, RPCError, ValueError) as exc:
-                self.log.warning("Could not unpin old bot %s: %s", recovery.old_handle, exc)
+                self.log.warning("Could not unpin old bot %s: %s",
+                                 recovery.old_handle, exc)
         try:
             new_peer = await self.main_client.get_input_entity(recovery.new_handle)
             await self.main_client(functions.account.UpdateNotifySettingsRequest(
@@ -719,14 +782,14 @@ class Service:
                 pinned=True,
             ))
         except (OSError, RPCError, ValueError) as exc:
-            self.log.warning("Could not mute/pin recovered bot chat %s: %s", recovery.new_handle, exc)
+            self.log.warning(
+                "Could not mute/pin recovered bot chat %s: %s", recovery.new_handle, exc)
 
     async def _resume_recoveries(self) -> None:
         resumable_stages = {
             "starting",
             "automatic_preparing",
             "transferring",
-            "waiting_main",
             "finalizing",
             "finalizing_restore",
             "finalizing_about",
@@ -738,6 +801,7 @@ class Service:
             "finalizing_delete_announcement",
             "finalizing_revoke",
         }
+
         async def resume(recovery: Recovery) -> None:
             # Passive stages continue through the event handlers after startup.
             # These stages mean an operation was already in progress when the
@@ -771,7 +835,8 @@ class Service:
                         try:
                             await self._ensure_backup(self._mapping(recovery))
                         except Exception:
-                            self.log.exception("Could not replenish the backup after recovery")
+                            self.log.exception(
+                                "Could not replenish the backup after recovery")
             except Exception:
                 self.log.exception(
                     "Could not resume recovery for %s; it remains at stage %s",
@@ -791,7 +856,8 @@ class Service:
     async def _finalize_steps(self, recovery: Recovery) -> None:
         mapping = self._mapping(recovery)
         assert recovery.new_handle
-        source_handle = normalize_username(str(load_snapshot(self.config, mapping)["source_handle"]))
+        source_handle = normalize_username(
+            str(load_snapshot(self.config, mapping)["source_handle"]))
 
         async def checkpoint(stage: str) -> None:
             async with self.lock:
@@ -811,6 +877,8 @@ class Service:
                     recovery.new_handle,
                 )
             write_yaml_value(mapping.config_path, mapping.token_path, token)
+            write_yaml_value(mapping.config_path,
+                             "recovery.reward_code", recovery.reward_code)
             restart(mapping.restart_command)
             await asyncio.sleep(10)
             await checkpoint("finalizing_about")
@@ -827,7 +895,8 @@ class Service:
 
         if recovery.stage == "finalizing_config":
             async with self.config_file_lock:
-                update_configured_handle(self.config, mapping, recovery.new_handle)
+                update_configured_handle(
+                    self.config, mapping, recovery.new_handle)
             await checkpoint("finalizing_descriptions")
 
         if recovery.stage in {"finalizing_descriptions", "finalizing_publish"}:
@@ -874,11 +943,14 @@ class Service:
             await checkpoint("finalizing_cleanup")
 
         if recovery.stage == "finalizing_cleanup":
-            anonymous_client = self._client_for(recovery.receiver_username.casefold())
+            anonymous_client = self._client_for(
+                recovery.receiver_username.casefold())
             if recovery.anonymous_message_id is not None:
                 await anonymous_client.send_message(
                     ANONYMOUS_BOT,
-                    f"Thank you. {mapping.friendly_name} has been restored as {recovery.new_handle}.",
+                    f"Thank you. {mapping.friendly_name} has been restored as {recovery.new_handle}. "
+                    f"As thanks, you will receive 100 credits after sending this code in the restored bot: "
+                    f"{recovery.reward_code}.",
                     reply_to=recovery.anonymous_message_id,
                 )
             await checkpoint("finalizing_delete_announcement")
@@ -895,7 +967,8 @@ class Service:
             await checkpoint("finalizing_revoke")
 
         if recovery.stage == "finalizing_revoke":
-            anonymous_client = self._client_for(recovery.receiver_username.casefold())
+            anonymous_client = self._client_for(
+                recovery.receiver_username.casefold())
             async with self.anonymous_locks[recovery.receiver_username.casefold()]:
                 async with self.lock:
                     other_recoveries = any(
@@ -914,9 +987,11 @@ class Service:
         return self.recovery_locks.setdefault(key, asyncio.Lock())
 
     def _mapping(self, recovery: Recovery) -> BotMapping:
-        mapping = next((item for item in self.config.bots if item.handle_prefix.casefold() == recovery.key), None)
+        mapping = next((item for item in self.config.bots if item.handle_prefix.casefold(
+        ) == recovery.key), None)
         if mapping is None:
-            raise RecoveryError(f"Mapping {recovery.key} is no longer configured.")
+            raise RecoveryError(
+                f"Mapping {recovery.key} is no longer configured.")
         return mapping
 
     def _available_receiver(self) -> str | None:
@@ -953,6 +1028,15 @@ class Service:
         return account.username
 
     @staticmethod
+    def _matching_candidate(recovery: Recovery, handles: set[str]) -> str | None:
+        candidates = recovery.candidate_handles or (
+            [recovery.new_handle] if recovery.new_handle else []
+        )
+        matches = [candidate for candidate in candidates if handle_is_in(
+            handles, candidate)]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
     def _valid_replacement(mapping: BotMapping, handle: str) -> bool:
         clean = handle.lstrip("@").casefold()
         return re.fullmatch(
@@ -963,13 +1047,30 @@ class Service:
         if not self.config.state_path.exists():
             return
         try:
-            loaded = json.loads(self.config.state_path.read_text(encoding="utf-8"))
+            loaded = json.loads(
+                self.config.state_path.read_text(encoding="utf-8"))
             recoveries = []
+            generated_reward_code = False
             for item in loaded.get("recoveries", []):
                 if "pool_username" in item and "receiver_username" not in item:
                     item["receiver_username"] = item.pop("pool_username")
-                recoveries.append(Recovery(**item))
+                recovery = Recovery(**item)
+                if recovery.new_handle and not any(
+                    handle_key(candidate) == handle_key(recovery.new_handle)
+                    for candidate in recovery.candidate_handles
+                ):
+                    recovery.candidate_handles.append(recovery.new_handle)
+                if recovery.new_handle and recovery.anonymous_message_id is not None:
+                    recovery.candidate_message_ids.setdefault(
+                        handle_key(
+                            recovery.new_handle), recovery.anonymous_message_id
+                    )
+                if not recovery.reward_code:
+                    recovery.reward_code = make_reward_code()
+                    generated_reward_code = True
+                recoveries.append(recovery)
             self.recoveries = {item.key: item for item in recoveries}
+
             loaded_backups = loaded.get("backups", {})
             if not isinstance(loaded_backups, dict):
                 raise ValueError("backups must be a JSON object.")
@@ -977,7 +1078,8 @@ class Service:
             for key, handles in loaded_backups.items():
                 if not isinstance(handles, list):
                     raise ValueError(f"backups.{key} must be a JSON list.")
-                self.backups[str(key)] = [normalize_username(str(handle)) for handle in handles]
+                self.backups[str(key)] = [normalize_username(
+                    str(handle)) for handle in handles]
             loaded_pending = loaded.get("pending_creations", {})
             if not isinstance(loaded_pending, dict):
                 raise ValueError("pending_creations must be a JSON object.")
@@ -985,9 +1087,15 @@ class Service:
                 str(key): normalize_username(str(handle))
                 for key, handle in loaded_pending.items()
             }
-            self.creator_next_create_at = float(loaded.get("creator_next_create_at", 0.0) or 0.0)
+            self.creator_next_create_at = float(
+                loaded.get("creator_next_create_at", 0.0) or 0.0)
+
+            if generated_reward_code:
+                self._save_state()
+
         except (OSError, ValueError, TypeError) as exc:
-            raise RecoveryError(f"Could not load recovery state: {exc}") from exc
+            raise RecoveryError(
+                f"Could not load recovery state: {exc}") from exc
 
     def _save_state(self) -> None:
         self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1019,6 +1127,10 @@ def make_client(
     )
 
 
+def make_reward_code() -> str:
+    return "".join(secrets.choice(REWARD_CODE_CHARS) for _ in range(4))
+
+
 async def anonymous_link(client: TelegramClient, anonymous_bot: str) -> str:
     async with client.conversation(anonymous_bot, timeout=45, exclusive=True) as conv:
         await conv.send_message("/start")
@@ -1027,7 +1139,8 @@ async def anonymous_link(client: TelegramClient, anonymous_bot: str) -> str:
         reply = await conv.get_response()
     match = URL_RE.search(response_text(reply))
     if not match:
-        raise RecoveryError("IncogNoteBot did not return the expected unique link.")
+        raise RecoveryError(
+            "IncogNoteBot did not return the expected unique link.")
     return match.group(0)
 
 
@@ -1038,7 +1151,8 @@ async def revoke_anonymous_link(client: TelegramClient, anonymous_bot: str) -> N
         await conv.send_message("Yes, I am sure")
         reply = await conv.get_response()
     if any(word in response_text(reply).casefold() for word in ("error", "failed", "invalid")):
-        raise RecoveryError("IncogNoteBot did not confirm link revocation: " + response_text(reply))
+        raise RecoveryError(
+            "IncogNoteBot did not confirm link revocation: " + response_text(reply))
 
 
 def button_labels(message: object) -> list[str]:
@@ -1063,15 +1177,18 @@ async def create_bot(client: TelegramClient, handle_prefix: str) -> str:
         await conv.send_message(handle_prefix)
         await conv.get_response()
         for digits in (2, 3, 4):
-            number = secrets.randbelow(9 * 10 ** (digits - 1)) + 10 ** (digits - 1)
+            number = secrets.randbelow(
+                9 * 10 ** (digits - 1)) + 10 ** (digits - 1)
             candidate = f"{handle_prefix}{number}bot"
             await conv.send_message(candidate)
             reply = await conv.get_response()
             if TOKEN_RE.search(response_text(reply)):
                 return normalize_username(candidate)
             if "taken" not in response_text(reply).casefold() and "available" not in response_text(reply).casefold():
-                raise RecoveryError("BotFather rejected the backup bot username: " + response_text(reply))
-    raise RecoveryError(f"Could not find an available {handle_prefix}<number>bot username.")
+                raise RecoveryError(
+                    "BotFather rejected the backup bot username: " + response_text(reply))
+    raise RecoveryError(
+        f"Could not find an available {handle_prefix}<number>bot username.")
 
 
 async def transfer_ownership(client: TelegramClient, bot_handle: str, recipient: str) -> None:
@@ -1082,10 +1199,12 @@ async def transfer_ownership(client: TelegramClient, bot_handle: str, recipient:
         await conv.send_message("/mybots")
         listing = await conv.get_response()
         if not await click_button(listing, bot_handle):
-            raise RecoveryError(f"BotFather did not list {bot_handle} as owned by the pool account.")
+            raise RecoveryError(
+                f"BotFather did not list {bot_handle} as owned by the pool account.")
         menu = await conv.get_response()
         if not await click_button(menu, "transfer ownership"):
-            raise RecoveryError("BotFather has no Transfer Ownership control. Buttons: " + ", ".join(button_labels(menu)))
+            raise RecoveryError(
+                "BotFather has no Transfer Ownership control. Buttons: " + ", ".join(button_labels(menu)))
         recipient_prompt = await conv.get_response()
         if await click_button(recipient_prompt, "choose recipient"):
             await conv.get_response()
@@ -1096,9 +1215,11 @@ async def transfer_ownership(client: TelegramClient, bot_handle: str, recipient:
         final = await conv.get_response()
     text = response_text(final).casefold()
     if any(word in text for word in ("error", "failed", "invalid", "sorry")):
-        raise RecoveryError("BotFather rejected ownership transfer: " + response_text(final))
+        raise RecoveryError(
+            "BotFather rejected ownership transfer: " + response_text(final))
     if not any(word in text for word in ("transfer", "ownership", "owned", "success", "done")):
-        raise RecoveryError("BotFather did not confirm ownership transfer: " + response_text(final))
+        raise RecoveryError(
+            "BotFather did not confirm ownership transfer: " + response_text(final))
 
 
 def replace_usernames(value: str, mappings: list[tuple[str, str]]) -> str:
@@ -1148,11 +1269,13 @@ async def set_bot_info(client: TelegramClient, target: str, name: str, about: st
             await conv.send_message(value or "/empty")
             reply = await conv.get_response()
         if "error" in response_text(reply).casefold():
-            raise RecoveryError(f"BotFather rejected {command}: {response_text(reply)}")
+            raise RecoveryError(
+                f"BotFather rejected {command}: {response_text(reply)}")
 
 
 async def set_commands(client: TelegramClient, target: str, commands: list[types.BotCommand]) -> None:
-    payload = "\n".join(f"{item.command} - {item.description}" for item in commands) or "/empty"
+    payload = "\n".join(
+        f"{item.command} - {item.description}" for item in commands) or "/empty"
     async with client.conversation(BOTFATHER, timeout=45, exclusive=True) as conv:
         await conv.send_message("/cancel")
         await conv.get_response()
@@ -1163,7 +1286,8 @@ async def set_commands(client: TelegramClient, target: str, commands: list[types
         await conv.send_message(payload)
         reply = await conv.get_response()
     if "error" in response_text(reply).casefold():
-        raise RecoveryError("BotFather rejected command update: " + response_text(reply))
+        raise RecoveryError(
+            "BotFather rejected command update: " + response_text(reply))
 
 
 async def regenerate_token(client: TelegramClient, target: str) -> str:
@@ -1176,7 +1300,8 @@ async def regenerate_token(client: TelegramClient, target: str) -> str:
         response = await conv.get_response()
     match = TOKEN_RE.search(response_text(response))
     if not match:
-        raise RecoveryError("BotFather did not return a replacement token for " + target)
+        raise RecoveryError(
+            "BotFather did not return a replacement token for " + target)
     return match.group(0)
 
 
@@ -1189,27 +1314,33 @@ def load_snapshot(config: Config, mapping: BotMapping) -> dict[str, Any]:
     try:
         snapshot = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise RecoveryError(f"Could not read bot snapshot {path}: {exc}") from exc
+        raise RecoveryError(
+            f"Could not read bot snapshot {path}: {exc}") from exc
     required = ("source_handle", "name", "about", "description", "commands")
     if not isinstance(snapshot, dict) or any(key not in snapshot for key in required):
         raise RecoveryError(f"Bot snapshot {path} is incomplete.")
     if not all(isinstance(snapshot[key], str) for key in required[:-1]):
-        raise RecoveryError(f"Bot snapshot {path} contains invalid profile text.")
+        raise RecoveryError(
+            f"Bot snapshot {path} contains invalid profile text.")
     if not isinstance(snapshot["commands"], list):
-        raise RecoveryError(f"Bot snapshot {path} has an invalid commands list.")
+        raise RecoveryError(
+            f"Bot snapshot {path} has an invalid commands list.")
     if not all(
         isinstance(item, dict)
         and isinstance(item.get("command"), str)
         and isinstance(item.get("description"), str)
         for item in snapshot["commands"]
     ):
-        raise RecoveryError(f"Bot snapshot {path} contains an invalid command.")
+        raise RecoveryError(
+            f"Bot snapshot {path} contains an invalid command.")
     photo_name = snapshot.get("profile_photo")
     if photo_name is not None:
         if not isinstance(photo_name, str) or Path(photo_name).name != photo_name:
-            raise RecoveryError(f"Bot snapshot {path} has an invalid profile photo path.")
+            raise RecoveryError(
+                f"Bot snapshot {path} has an invalid profile photo path.")
         if not (path.parent / photo_name).is_file():
-            raise RecoveryError(f"Snapshot profile photo is missing: {path.parent / photo_name}")
+            raise RecoveryError(
+                f"Snapshot profile photo is missing: {path.parent / photo_name}")
     return snapshot
 
 
@@ -1247,7 +1378,8 @@ async def snapshot_bot(
     }
     path = snapshot_metadata_path(config, mapping)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.write_text(json.dumps(snapshot, indent=2,
+                         ensure_ascii=False) + "\n", encoding="utf-8")
     temporary.replace(path)
     try:
         os.chmod(directory, 0o700)
@@ -1281,14 +1413,17 @@ async def restore_bot_snapshot(
     )
     photo_name = snapshot.get("profile_photo")
     if photo_name:
-        photo = snapshot_metadata_path(config, mapping).parent / str(photo_name)
+        photo = snapshot_metadata_path(
+            config, mapping).parent / str(photo_name)
         if not photo.is_file():
             raise RecoveryError(f"Snapshot profile photo is missing: {photo}")
         target_entity = await client.get_entity(target_name)
         if not getattr(target_entity, "bot", False) or getattr(target_entity, "deleted", False):
-            raise RecoveryError(f"Telegram does not recognize {target_name} as a valid bot.")
+            raise RecoveryError(
+                f"Telegram does not recognize {target_name} as a valid bot.")
         if getattr(target_entity, "access_hash", None) is None:
-            raise RecoveryError(f"Telegram returned no access hash for {target_name}.")
+            raise RecoveryError(
+                f"Telegram returned no access hash for {target_name}.")
         target = types.InputUser(target_entity.id, target_entity.access_hash)
         uploaded = await client.upload_file(str(photo))
         await client(functions.photos.UploadProfilePhotoRequest(bot=target, file=uploaded))
@@ -1296,12 +1431,14 @@ async def restore_bot_snapshot(
         commands = [
             types.BotCommand(
                 command=str(item["command"]),
-                description=replace_usernames(str(item["description"]), replacements),
+                description=replace_usernames(
+                    str(item["description"]), replacements),
             )
             for item in snapshot["commands"]
         ]
     except (KeyError, TypeError) as exc:
-        raise RecoveryError("The saved bot command snapshot is invalid.") from exc
+        raise RecoveryError(
+            "The saved bot command snapshot is invalid.") from exc
     await set_commands(client, target_name, commands)
     return await regenerate_token(client, target_name)
 
@@ -1310,9 +1447,11 @@ def write_yaml_value(path: Path, dotted_key: str, value: str) -> None:
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError) as exc:
-        raise RecoveryError(f"Could not read deployment config {path}: {exc}") from exc
+        raise RecoveryError(
+            f"Could not read deployment config {path}: {exc}") from exc
     if not isinstance(document, dict):
-        raise RecoveryError(f"Deployment config {path} must be a YAML mapping.")
+        raise RecoveryError(
+            f"Deployment config {path} must be a YAML mapping.")
     node = document
     parts = dotted_key.split(".")
     for part in parts[:-1]:
@@ -1321,19 +1460,23 @@ def write_yaml_value(path: Path, dotted_key: str, value: str) -> None:
             child = {}
             node[part] = child
         if not isinstance(child, dict):
-            raise RecoveryError(f"{dotted_key} cannot be written: {part} is not a mapping.")
+            raise RecoveryError(
+                f"{dotted_key} cannot be written: {part} is not a mapping.")
         node = child
     node[parts[-1]] = value
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(yaml.safe_dump(document, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    temporary.write_text(yaml.safe_dump(
+        document, sort_keys=False, allow_unicode=True), encoding="utf-8")
     temporary.replace(path)
 
 
 def restart(command: tuple[str, ...]) -> None:
     try:
-        subprocess.run(command, check=True, timeout=60, capture_output=True, text=True)
+        subprocess.run(command, check=True, timeout=60,
+                       capture_output=True, text=True)
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RecoveryError(f"Restart command failed ({' '.join(command)}): {exc}") from exc
+        raise RecoveryError(
+            f"Restart command failed ({' '.join(command)}): {exc}") from exc
 
 
 async def bot_owned_by(client: TelegramClient, handle: str) -> bool:
@@ -1451,7 +1594,8 @@ def update_index(
     old_handles: list[str] | None = None,
 ) -> str:
     label = f"Updated: {date.today().isoformat()} (Restored {mapping.friendly_name})"
-    updated, _ = re.subn(r"Updated:\s*[^<\r\n]+", label, html, count=1, flags=re.IGNORECASE)
+    updated, _ = re.subn(
+        r"Updated:\s*[^<\r\n]+", label, html, count=1, flags=re.IGNORECASE)
     updated = replace_usernames(
         updated,
         [
@@ -1460,8 +1604,10 @@ def update_index(
             if old_handle
         ],
     )
-    pattern = re.compile(rf"https://t\.me/(?P<at>@?){re.escape(mapping.handle_prefix)}[A-Za-z0-9_]*", re.IGNORECASE)
-    updated, _ = pattern.subn(lambda match: f"https://t.me/{match.group('at')}{new_handle.lstrip('@')}", updated)
+    pattern = re.compile(
+        rf"https://t\.me/(?P<at>@?){re.escape(mapping.handle_prefix)}[A-Za-z0-9_]*", re.IGNORECASE)
+    updated, _ = pattern.subn(
+        lambda match: f"https://t.me/{match.group('at')}{new_handle.lstrip('@')}", updated)
     return updated
 
 
@@ -1477,7 +1623,8 @@ async def publish_page(
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
         async with session.get(pages_url) as response:
             if response.status >= 400:
-                raise RecoveryError(f"Could not fetch Pages index ({response.status}).")
+                raise RecoveryError(
+                    f"Could not fetch Pages index ({response.status}).")
             original = await response.text()
         content = update_index(original, mapping, new_handle, old_handles)
     with tempfile.TemporaryDirectory(prefix="forward-bot-pages-") as output_dir:
@@ -1507,13 +1654,15 @@ def load_config(path: Path) -> Config:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=SETTINGS_PATH)
-    parser.add_argument("--check-config", action="store_true", help="validate config then exit")
+    parser.add_argument("--check-config", action="store_true",
+                        help="validate config then exit")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=os.environ.get(
+        "LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         config = load_config(args.config)
         if args.check_config:
@@ -1522,7 +1671,8 @@ def main() -> int:
         asyncio.run(Service(config).run())
         return 0
     except (RecoveryError, RPCError, ValueError, OSError) as exc:
-        logging.getLogger("recovery").error("Recovery service stopped: %s", exc)
+        logging.getLogger("recovery").error(
+            "Recovery service stopped: %s", exc)
         return 1
 
 

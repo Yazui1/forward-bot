@@ -85,6 +85,20 @@ class RepositoryWriteTests(unittest.TestCase):
         self.assertEqual(activity, updated.last_activity)
         self.assertIsNone(dead_table)
 
+    def test_recovery_reward_is_one_time_and_persistent(self) -> None:
+        user = self.add_user(1)
+
+        self.assertTrue(self.repo.redeem_recovery_reward(user.telegram_id, "AB12"))
+        self.assertFalse(self.repo.redeem_recovery_reward(user.telegram_id, "ab12"))
+        self.assertEqual(self.repo.get_user(user.telegram_id).credits, 120.0)
+        self.assertEqual(
+            self.scalar(
+                "SELECT state_value FROM bot_state WHERE state_key=?",
+                ("recovery_reward:ab12",),
+            ),
+            "1",
+        )
+
     def test_daily_tax_updates_all_users_with_one_connection(self) -> None:
         first = self.add_user(1, 100.0)
         second = self.add_user(2, 50.0)
