@@ -312,6 +312,7 @@ class Service:
             except (OSError, RPCError, RecoveryError) as exc:
                 self.log.error(
                     "Pool account %s is unavailable: %s", account.username, exc)
+        await self._reconcile_prepared_bots()
         await self._check_configured_bots()
         await self._resume_recoveries()
         await self._ensure_prepared_bots()
@@ -649,6 +650,26 @@ class Service:
                     "Could not prepare a backup for %s", mapping.friendly_name)
         await asyncio.gather(*(prepare(mapping) for mapping in self.config.bots))
 
+    async def _reconcile_prepared_bots(self) -> None:
+        if not self.config.automatic_recovery or not self.config.prepare_bots:
+            return
+        for mapping in self.config.bots:
+            key = mapping.handle_prefix.casefold()
+            async with self.lock:
+                handles = self.backups.get(key, [])
+                if not handles or key in self.pending_creations:
+                    continue
+                handle = handles.pop(0)
+                if not handles:
+                    self.backups.pop(key, None)
+                self.pending_creations[key] = handle
+                self._save_state()
+            try:
+                await self._create_backup(mapping)
+            except Exception:
+                self.log.exception(
+                    "Could not verify or finish transferring saved backup %s", handle)
+
     async def _ensure_backup(self, mapping: BotMapping) -> None:
         async with self.lock:
             if self.backups.get(mapping.handle_prefix.casefold()):
@@ -694,7 +715,10 @@ class Service:
                         self._save_state()
                     self.log.info(
                         "Created backup bot %s; ownership transfer is pending", handle)
+                self.log.info("Opening %s from the owner account", handle)
                 await interact_with_bot(self.main_client, handle)
+                self.log.info("Starting BotFather transfer of %s to %s",
+                              handle, self.config.main.username)
                 await transfer_ownership(
                     self.creator_client,
                     handle,
@@ -1220,17 +1244,24 @@ async def click_button(
 ) -> bool:
     for row, buttons in enumerate(getattr(message, "buttons", None) or ()):
         for column, button in enumerate(buttons):
-            if needle.casefold() in str(getattr(button, "text", "") or "").casefold():
+            label = str(getattr(button, "text", "") or "")
+            if needle.casefold() in label.casefold():
                 requires_password = getattr(
                     getattr(button, "button", None), "requires_password", False)
                 if requires_password and password is None:
                     raise RecoveryError(
                         "BotFather requires the creator's 2FA password; configure "
                         "automatic_recovery.creator.password.")
-                if requires_password:
-                    await message.click(row, column, password=password)
+                logging.getLogger("recovery").info(
+                    "Clicking BotFather button %s on message %s",
+                    label, getattr(message, "id", "unknown"))
+                if password is not None:
+                    result = await message.click(row, column, password=password)
                 else:
-                    await message.click(row, column)
+                    result = await message.click(row, column)
+                if result is None:
+                    raise RecoveryError(
+                        f"Telegram did not acknowledge the BotFather {label!r} button click.")
                 return True
     return False
 
@@ -1267,6 +1298,62 @@ async def create_bot(
         f"Could not find an available {handle_prefix}<number>bot username.")
 
 
+async def botfather_step(
+    client: TelegramClient,
+    conv: Any,
+    source: Any,
+    *,
+    click: str | None = None,
+    send: str | None = None,
+    expected_button: str | None = None,
+    expected_text: tuple[str, ...] = (),
+    accept_any: bool = False,
+    password: str | None = None,
+) -> Any:
+    if (click is None) == (send is None):
+        raise ValueError("A BotFather step must click a button or send a message.")
+
+    response_ready = asyncio.get_running_loop().create_future()
+
+    async def receive_update(event: Any) -> None:
+        message = event.message
+        if event.chat_id != source.chat_id or message.id < source.id:
+            return
+        labels = button_labels(message)
+        text = response_text(message).casefold()
+        matches_button = expected_button and any(
+            expected_button.casefold() in label.casefold() for label in labels
+        )
+        matches_text = any(phrase.casefold() in text for phrase in expected_text)
+        if (accept_any or matches_button or matches_text) and not response_ready.done():
+            response_ready.set_result(message)
+
+    client.add_event_handler(receive_update, events.NewMessage(chats=BOTFATHER))
+    client.add_event_handler(receive_update, events.MessageEdited(chats=BOTFATHER))
+    try:
+        if click is not None:
+            if not await click_button(source, click, password=password):
+                raise RecoveryError(
+                    f"BotFather did not offer {click!r}. Buttons: "
+                    + ", ".join(button_labels(source)))
+        else:
+            await conv.send_message(send)
+        try:
+            response = await asyncio.wait_for(response_ready, timeout=60)
+        except TimeoutError as exc:
+            raise RecoveryError(
+                f"BotFather did not show the expected response after {click or 'sending a message'}."
+            ) from exc
+        if response.id > source.id:
+            incoming = await conv.get_response(source)
+            while incoming.id < response.id:
+                incoming = await conv.get_response(incoming)
+            response = incoming
+        return response
+    finally:
+        client.remove_event_handler(receive_update)
+
+
 async def transfer_ownership(
     client: TelegramClient,
     bot_handle: str,
@@ -1275,32 +1362,41 @@ async def transfer_ownership(
     password: str | None = None,
 ) -> None:
     """Drive BotFather's documented /mybots ownership-transfer interaction."""
+    log = logging.getLogger("recovery")
     async with client.conversation(BOTFATHER, timeout=60, exclusive=True) as conv:
+        log.info("Resetting BotFather conversation for %s", bot_handle)
         await conv.send_message("/cancel")
         await conv.get_response()
+        log.info("Requesting BotFather bot list for %s", bot_handle)
         await conv.send_message("/mybots")
         listing = await conv.get_response()
-        if not await click_button(listing, bot_handle):
+        log.info("Selecting %s in BotFather", bot_handle)
+        menu = await botfather_step(
+            client, conv, listing, click=bot_handle,
+            expected_button="transfer ownership",
+        )
+        log.info("Received BotFather options for %s", bot_handle)
+        recipient_choice = await botfather_step(
+            client, conv, menu, click="transfer ownership",
+            expected_button="choose recipient",
+        )
+        if not await click_button(recipient_choice, "choose recipient"):
             raise RecoveryError(
-                f"BotFather did not list {bot_handle} as owned by the transferring account.")
-        menu = await conv.get_edit(listing)
-        if not await click_button(menu, "transfer ownership"):
-            raise RecoveryError(
-                "BotFather has no Transfer Ownership control. Buttons: " + ", ".join(button_labels(menu)))
-        recipient_prompt = await conv.get_response()
-        if not await click_button(recipient_prompt, "choose recipient"):
-            raise RecoveryError(
-                "BotFather did not offer a Choose recipient button. Buttons: "
-                + ", ".join(button_labels(recipient_prompt)))
-        await conv.get_response()
-        await conv.send_message(recipient)
-        confirmation = await conv.get_response()
-        if not await click_button(
-                confirmation, "yes, i am sure", password=password):
-            raise RecoveryError(
-                "BotFather did not offer the ownership confirmation button. Buttons: "
-                + ", ".join(button_labels(confirmation)))
-        final = await conv.get_edit(confirmation)
+                "BotFather did not offer Choose recipient. Buttons: "
+                + ", ".join(button_labels(recipient_choice)))
+        log.info("Waiting for BotFather recipient prompt for %s", bot_handle)
+        recipient_prompt = await conv.get_response(recipient_choice)
+        log.info("Submitting BotFather transfer recipient for %s", bot_handle)
+        confirmation = await botfather_step(
+            client, conv, recipient_prompt, send=recipient,
+            expected_button="yes, i am sure",
+        )
+        log.info("Confirming BotFather ownership transfer for %s", bot_handle)
+        final = await botfather_step(
+            client, conv, confirmation, click="yes, i am sure",
+            expected_text=("worked", "new home", "error", "failed", "invalid", "sorry"),
+            password=password,
+        )
     text = response_text(final).casefold()
     if any(word in text for word in ("error", "failed", "invalid", "sorry")):
         raise RecoveryError(
@@ -1309,6 +1405,7 @@ async def transfer_ownership(
             "transfer", "ownership", "owned", "success", "done", "worked", "new home")):
         raise RecoveryError(
             "BotFather did not confirm ownership transfer: " + response_text(final))
+    log.info("BotFather confirmed ownership transfer of %s", bot_handle)
 
 
 def replace_usernames(value: str, mappings: list[tuple[str, str]]) -> str:
@@ -1570,8 +1667,17 @@ def restart(command: tuple[str, ...]) -> None:
 
 async def bot_owned_by(client: TelegramClient, handle: str) -> bool:
     try:
-        entity = await client.get_entity(handle)
-        return bool(getattr(entity, "bot", False) and not getattr(entity, "deleted", False))
+        async with client.conversation(BOTFATHER, timeout=45, exclusive=True) as conv:
+            await conv.send_message("/cancel")
+            await conv.get_response()
+            await conv.send_message("/mybots")
+            listing = await conv.get_response()
+        target = handle_key(handle)
+        return any(
+            match.group(1).casefold() == target
+            for label in button_labels(listing)
+            for match in BOT_USERNAME_RE.finditer(label)
+        )
     except (asyncio.TimeoutError, OSError, RPCError, ValueError):
         return False
 

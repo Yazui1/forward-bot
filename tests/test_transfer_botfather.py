@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -13,6 +14,7 @@ from transfer.transfer import (
     Recovery,
     RecoveryError,
     Service,
+    bot_owned_by,
     click_button,
     create_bot,
     transfer_ownership,
@@ -30,19 +32,26 @@ class FakeMessage:
             for label, requires_password in buttons
         ]] if buttons else []
         self.passwords: list[str | None] = []
+        self.chat_id = 1
+        self.id = 1
+        self.on_click = None
 
     async def click(
         self, row: int, column: int, *, password: str | None = None
-    ) -> None:
+    ) -> object:
         self.passwords.append(password)
+        if self.on_click is not None:
+            await self.on_click()
+        return object()
 
 
 class FakeConversation:
     def __init__(self, responses: list[FakeMessage], edits: list[FakeMessage]) -> None:
-        self.responses = iter(responses)
+        self.responses = deque(responses)
         self.edits = iter(edits)
         self.sent: list[str] = []
         self.edited_messages: list[FakeMessage] = []
+        self.on_send = {}
 
     async def __aenter__(self) -> FakeConversation:
         return self
@@ -52,9 +61,12 @@ class FakeConversation:
 
     async def send_message(self, text: str) -> None:
         self.sent.append(text)
+        callback = self.on_send.get(text)
+        if callback is not None:
+            await callback()
 
-    async def get_response(self) -> FakeMessage:
-        return next(self.responses)
+    async def get_response(self, _message: FakeMessage | None = None) -> FakeMessage:
+        return self.responses.popleft()
 
     async def get_edit(self, message: FakeMessage) -> FakeMessage:
         self.edited_messages.append(message)
@@ -64,9 +76,23 @@ class FakeConversation:
 class FakeClient:
     def __init__(self, conversation: FakeConversation) -> None:
         self._conversation = conversation
+        self.handlers = []
 
     def conversation(self, *_args: object, **_kwargs: object) -> FakeConversation:
         return self._conversation
+
+    def add_event_handler(self, handler: object, _event: object) -> None:
+        self.handlers.append(handler)
+
+    def remove_event_handler(self, handler: object) -> None:
+        self.handlers = [registered for registered in self.handlers if registered is not handler]
+
+    async def emit(self, message: FakeMessage, *, new_message: bool) -> None:
+        if new_message:
+            self._conversation.responses.append(message)
+        event = SimpleNamespace(message=message, chat_id=message.chat_id)
+        for handler in tuple(self.handlers):
+            await handler(event)
 
 
 class BotFatherTests(unittest.IsolatedAsyncioTestCase):
@@ -151,40 +177,92 @@ class BotFatherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conversation.sent[:3], ["/cancel", "/newbot", "Example relay"])
         self.assertEqual(conversation.sent[-1], handle[1:])
 
-    async def test_transfer_follows_botfather_edits_and_confirms_with_2fa(self) -> None:
-        listing = FakeMessage("Choose a bot", ("Example @samplebot", False))
-        menu = FakeMessage("What do you want to do?", ("Transfer Ownership", False))
-        transfer_prompt = FakeMessage(
-            "Transfer bot ownership", ("Choose recipient", False))
-        confirmation = FakeMessage(
-            "Transfer ownership to @owner?",
-            ("Yes, I am sure, proceed.", True),
-        )
-        final = FakeMessage("It worked! The bot will enjoy its new home.")
-        conversation = FakeConversation(
-            [
-                FakeMessage("cancelled"),
-                listing,
-                transfer_prompt,
-                FakeMessage("Please share the new owner's username."),
-                confirmation,
-            ],
-            [menu, final],
-        )
+    async def test_transfer_handles_edits_and_new_messages_at_each_step(self) -> None:
+        for new_messages in (False, True):
+            with self.subTest(new_messages=new_messages):
+                listing = FakeMessage("Choose a bot", ("Example @samplebot", False))
+                listing.id = 10
+                menu = FakeMessage("What do you want to do?", ("Transfer Ownership", False))
+                recipient_choice = FakeMessage(
+                    "Transfer bot ownership", ("Choose recipient", False))
+                recipient_prompt = FakeMessage("Please share the new owner's username.")
+                confirmation = FakeMessage(
+                    "Transfer ownership to @owner?",
+                    ("Yes, I am sure, proceed.", False),
+                )
+                final = FakeMessage("It worked! The bot will enjoy its new home.")
+                conversation = FakeConversation([FakeMessage("cancelled"), listing], [])
+                client = FakeClient(conversation)
 
-        await transfer_ownership(
-            FakeClient(conversation), "@samplebot", "@owner", password="123456"
-        )
+                def transition(source: FakeMessage, response: FakeMessage) -> None:
+                    async def emit_response() -> None:
+                        response.id = source.id + int(new_messages)
+                        await client.emit(response, new_message=new_messages)
 
-        self.assertEqual(conversation.sent, ["/cancel", "/mybots", "@owner"])
-        self.assertEqual(conversation.edited_messages, [listing, confirmation])
-        self.assertEqual(confirmation.passwords, ["123456"])
+                    source.on_click = emit_response
+
+                transition(listing, menu)
+                transition(menu, recipient_choice)
+
+                async def choose_recipient() -> None:
+                    recipient_prompt.id = recipient_choice.id + 1
+                    await client.emit(recipient_prompt, new_message=True)
+
+                recipient_choice.on_click = choose_recipient
+                transition(confirmation, final)
+
+                async def send_owner() -> None:
+                    confirmation.id = recipient_prompt.id + int(new_messages)
+                    await client.emit(confirmation, new_message=new_messages)
+
+                conversation.on_send["@owner"] = send_owner
+
+                await transfer_ownership(
+                    client, "@samplebot", "@owner", password="123456"
+                )
+
+                self.assertEqual(conversation.sent, ["/cancel", "/mybots", "@owner"])
+                self.assertEqual(recipient_choice.passwords, [None])
+                self.assertEqual(confirmation.passwords, ["123456"])
 
     async def test_transfer_fails_clearly_when_2fa_password_is_missing(self) -> None:
         confirmation = FakeMessage("Confirm", ("Yes, I am sure", True))
 
         with self.assertRaisesRegex(RecoveryError, "creator.password"):
             await click_button(confirmation, "yes, i am sure")
+
+    async def test_owned_check_requires_exact_botfather_list_entry(self) -> None:
+        exact = FakeConversation(
+            [FakeMessage("cancelled"), FakeMessage("bots", ("@samplebot", False))], []
+        )
+        prefix_only = FakeConversation(
+            [FakeMessage("cancelled"), FakeMessage("bots", ("@samplebotextra", False))], []
+        )
+
+        self.assertTrue(await bot_owned_by(FakeClient(exact), "@samplebot"))
+        self.assertFalse(await bot_owned_by(FakeClient(prefix_only), "@samplebot"))
+
+    async def test_saved_backup_is_requeued_for_transfer_on_restart(self) -> None:
+        mapping = BotMapping(
+            "Example", "Example bot", Path("bot.yml"), "telegram.token", ("restart",)
+        )
+        service = Service.__new__(Service)
+        service.config = SimpleNamespace(
+            automatic_recovery=True, prepare_bots=True, bots=[mapping]
+        )
+        service.lock = asyncio.Lock()
+        service.backups = {"example": ["@samplebot"]}
+        service.pending_creations = {}
+        service._save_state = Mock()
+        service.log = Mock()
+        service._create_backup = AsyncMock(side_effect=RecoveryError("retry later"))
+
+        await service._reconcile_prepared_bots()
+
+        self.assertEqual(service.backups, {})
+        self.assertEqual(service.pending_creations, {"example": "@samplebot"})
+        service._create_backup.assert_awaited_once_with(mapping)
+        service._save_state.assert_called_once_with()
 
 
 if __name__ == "__main__":
