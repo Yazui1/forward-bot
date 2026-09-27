@@ -25,6 +25,7 @@ import yaml
 from telethon import TelegramClient, events, functions, types
 from telethon.errors import (
     ChatAboutNotModifiedError,
+    FloodWaitError,
     MessageIdInvalidError,
     RPCError,
     UsernameInvalidError,
@@ -40,6 +41,7 @@ ABUSE_NOTIFICATION = "AbuseNotification"
 ANONYMOUS_BOT = "@IncogNoteBot"
 TOKEN_RE = re.compile(r"\b\d{5,}:[A-Za-z0-9_-]{20,}\b")
 CREATOR_CREATE_INTERVAL = 300
+AUTOMATIC_WAIT_LIMIT = CREATOR_CREATE_INTERVAL
 BOT_USERNAME_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]{4,})\b")
 URL_RE = re.compile(r"https://t\.me/IncogNoteBot\?start=[A-Za-z0-9_-]+")
 OWNERSHIP_PHRASE = "ownership of the bot"
@@ -81,6 +83,10 @@ class RecoveryError(RuntimeError):
     pass
 
 
+class AutomaticWaitExceeded(RecoveryError):
+    pass
+
+
 class Config:
     def __init__(self, value: dict[str, Any], source: Path) -> None:
         self.value = value
@@ -103,10 +109,16 @@ class Config:
             self.creator = account_from(creator, None, source.parent)
             self.creator_api_id = int(required_string(creator, "api_id"))
             self.creator_api_hash = required_string(creator, "api_hash")
+            creator_password = creator.get("password")
+            if creator_password is not None and not isinstance(creator_password, str):
+                raise ValueError(
+                    "automatic_recovery.creator.password must be a string.")
+            self.creator_password = creator_password or None
         else:
             self.creator = None
             self.creator_api_id = None
             self.creator_api_hash = None
+            self.creator_password = None
         self.announcement_channel = required_string(
             self.announcement, "channel")
         self.announcement_group = required_string(self.announcement, "group")
@@ -259,7 +271,8 @@ class Service:
             account, config) for account in config.pool}
         self.creator_client = (
             make_client(config.creator, config,
-                        config.creator_api_id, config.creator_api_hash)
+                        config.creator_api_id, config.creator_api_hash,
+                        flood_sleep_threshold=0)
             if config.creator is not None
             else None
         )
@@ -484,10 +497,7 @@ class Service:
             await event.reply(error_message)
             return
         try:
-            entity = await client.get_entity(candidate)
-            if not getattr(entity, "bot", False):
-                raise ValueError(f"{candidate} is not a Telegram bot.")
-            await client.send_message(candidate, "/start")
+            await interact_with_bot(client, candidate)
         except (asyncio.TimeoutError, OSError, RPCError, ValueError):
             await event.reply(
                 f"Your message does not contain a valid bot. Create a bot named "
@@ -578,10 +588,35 @@ class Service:
             self.recoveries[key] = recovery
             self._save_state()
         try:
-            await self._run_automatic_recovery(recovery, mapping)
+            await self._run_automatic_or_fallback(recovery, mapping)
         except Exception:
             self.log.exception(
                 "Could not start automatic recovery for %s", mapping.friendly_name)
+
+    async def _run_automatic_or_fallback(
+        self, recovery: Recovery, mapping: BotMapping
+    ) -> None:
+        try:
+            await self._run_automatic_recovery(recovery, mapping)
+        except (AutomaticWaitExceeded, FloodWaitError) as exc:
+            if recovery.new_handle is not None:
+                raise
+            self.log.warning(
+                "Automatic recovery for %s is switching to manual after %s",
+                mapping.friendly_name,
+                exc,
+            )
+            await self._fallback_to_manual(recovery, mapping)
+
+    async def _fallback_to_manual(
+        self, recovery: Recovery, mapping: BotMapping
+    ) -> None:
+        async with self.lock:
+            if self.recoveries.get(recovery.key) is not recovery or recovery.new_handle:
+                return
+            recovery.stage = "starting"
+            self._save_state()
+        await self._prepare_recovery(recovery, mapping)
 
     async def _run_automatic_recovery(
         self, recovery: Recovery, mapping: BotMapping
@@ -641,28 +676,39 @@ class Service:
             key = mapping.handle_prefix.casefold()
             async with self.lock:
                 handle = self.pending_creations.get(key)
-            if handle is None:
                 wait = self.creator_next_create_at - time.time()
-                if wait > 0:
-                    self.log.info(
-                        "Waiting %.0f seconds before creating the next backup bot", wait)
-                    await asyncio.sleep(wait)
-                handle = await create_bot(self.creator_client, mapping.handle_prefix)
-                async with self.lock:
-                    self.pending_creations[key] = handle
-                    self.creator_next_create_at = time.time() + CREATOR_CREATE_INTERVAL
-                    self._save_state()
+            if wait > AUTOMATIC_WAIT_LIMIT:
+                raise AutomaticWaitExceeded(
+                    f"creator account is cooling down for another {wait:.0f} seconds")
+            if wait > 0:
                 self.log.info(
-                    "Created backup bot %s; ownership transfer is pending", handle)
-            await self.main_client.send_message(handle, "/start")
+                    "Waiting %.0f seconds before the next BotFather operation", wait)
+                await asyncio.sleep(wait)
             try:
+                if handle is None:
+                    handle = await create_bot(
+                        self.creator_client, mapping.handle_prefix, mapping.friendly_name)
+                    async with self.lock:
+                        self.pending_creations[key] = handle
+                        self.creator_next_create_at = time.time() + CREATOR_CREATE_INTERVAL
+                        self._save_state()
+                    self.log.info(
+                        "Created backup bot %s; ownership transfer is pending", handle)
+                await interact_with_bot(self.main_client, handle)
                 await transfer_ownership(
                     self.creator_client,
                     handle,
                     self.config.main.username,
+                    password=self.config.creator_password,
                 )
+            except FloodWaitError as exc:
+                async with self.lock:
+                    self.creator_next_create_at = max(
+                        self.creator_next_create_at, time.time() + exc.seconds)
+                    self._save_state()
+                raise
             except Exception:
-                if not await bot_owned_by(self.main_client, handle):
+                if handle is None or not await bot_owned_by(self.main_client, handle):
                     raise
         async with self.lock:
             self.pending_creations.pop(mapping.handle_prefix.casefold(), None)
@@ -730,6 +776,12 @@ class Service:
         try:
             await self._configure_recovered_bot_dialog(recovery)
             await self._finalize(recovery)
+            if self.config.automatic_recovery and self.config.prepare_bots:
+                try:
+                    await self._ensure_backup(self._mapping(recovery))
+                except Exception:
+                    self.log.exception(
+                        "Could not replenish the backup after manual recovery")
         except Exception:
             self.log.exception(
                 "Recovery finalization failed for %s", recovery.new_handle)
@@ -739,7 +791,7 @@ class Service:
     async def _transfer_to_main(self, recovery: Recovery, pool: str) -> None:
         async with self._recovery_lock(recovery.key):
             assert recovery.new_handle
-            await self.main_client.send_message(recovery.new_handle, "/start")
+            await interact_with_bot(self.main_client, recovery.new_handle)
             await transfer_ownership(self.pool_clients[pool], recovery.new_handle, self.config.main.username)
             async with self.lock:
                 if self.recoveries.get(recovery.key) is recovery and recovery.stage == "transferring":
@@ -813,7 +865,8 @@ class Service:
                     await self._prepare_recovery(recovery, self._mapping(recovery))
                     return
                 if recovery.stage == "automatic_preparing":
-                    await self._run_automatic_recovery(recovery, self._mapping(recovery))
+                    await self._run_automatic_or_fallback(
+                        recovery, self._mapping(recovery))
                     return
                 if recovery.stage == "transferring":
                     pool = recovery.receiver_username.casefold()
@@ -831,7 +884,7 @@ class Service:
                     if not automatic:
                         await self._configure_recovered_bot_dialog(recovery)
                     await self._finalize(recovery)
-                    if automatic and self.config.prepare_bots:
+                    if self.config.automatic_recovery and self.config.prepare_bots:
                         try:
                             await self._ensure_backup(self._mapping(recovery))
                         except Exception:
@@ -1119,11 +1172,14 @@ def make_client(
     config: Config,
     api_id: int | None = None,
     api_hash: str | None = None,
+    *,
+    flood_sleep_threshold: int = 60,
 ) -> TelegramClient:
     return TelegramClient(
         str(account.session),
         config.api_id if api_id is None else api_id,
         config.api_hash if api_hash is None else api_hash,
+        flood_sleep_threshold=flood_sleep_threshold,
     )
 
 
@@ -1159,22 +1215,42 @@ def button_labels(message: object) -> list[str]:
     return [str(getattr(button, "text", "") or "") for row in (getattr(message, "buttons", None) or ()) for button in row]
 
 
-async def click_button(message: object, needle: str) -> bool:
+async def click_button(
+    message: object, needle: str, *, password: str | None = None
+) -> bool:
     for row, buttons in enumerate(getattr(message, "buttons", None) or ()):
         for column, button in enumerate(buttons):
             if needle.casefold() in str(getattr(button, "text", "") or "").casefold():
-                await message.click(row, column)
+                requires_password = getattr(
+                    getattr(button, "button", None), "requires_password", False)
+                if requires_password and password is None:
+                    raise RecoveryError(
+                        "BotFather requires the creator's 2FA password; configure "
+                        "automatic_recovery.creator.password.")
+                if requires_password:
+                    await message.click(row, column, password=password)
+                else:
+                    await message.click(row, column)
                 return True
     return False
 
 
-async def create_bot(client: TelegramClient, handle_prefix: str) -> str:
+async def interact_with_bot(client: TelegramClient, bot_handle: str) -> None:
+    entity = await client.get_entity(bot_handle)
+    if not getattr(entity, "bot", False):
+        raise ValueError(f"{bot_handle} is not a Telegram bot.")
+    await client.send_message(bot_handle, "/start")
+
+
+async def create_bot(
+    client: TelegramClient, handle_prefix: str, bot_name: str
+) -> str:
     async with client.conversation(BOTFATHER, timeout=60, exclusive=True) as conv:
         await conv.send_message("/cancel")
         await conv.get_response()
         await conv.send_message("/newbot")
         await conv.get_response()
-        await conv.send_message(handle_prefix)
+        await conv.send_message(bot_name)
         await conv.get_response()
         for digits in (2, 3, 4):
             number = secrets.randbelow(
@@ -1191,7 +1267,13 @@ async def create_bot(client: TelegramClient, handle_prefix: str) -> str:
         f"Could not find an available {handle_prefix}<number>bot username.")
 
 
-async def transfer_ownership(client: TelegramClient, bot_handle: str, recipient: str) -> None:
+async def transfer_ownership(
+    client: TelegramClient,
+    bot_handle: str,
+    recipient: str,
+    *,
+    password: str | None = None,
+) -> None:
     """Drive BotFather's documented /mybots ownership-transfer interaction."""
     async with client.conversation(BOTFATHER, timeout=60, exclusive=True) as conv:
         await conv.send_message("/cancel")
@@ -1200,24 +1282,31 @@ async def transfer_ownership(client: TelegramClient, bot_handle: str, recipient:
         listing = await conv.get_response()
         if not await click_button(listing, bot_handle):
             raise RecoveryError(
-                f"BotFather did not list {bot_handle} as owned by the pool account.")
-        menu = await conv.get_response()
+                f"BotFather did not list {bot_handle} as owned by the transferring account.")
+        menu = await conv.get_edit(listing)
         if not await click_button(menu, "transfer ownership"):
             raise RecoveryError(
                 "BotFather has no Transfer Ownership control. Buttons: " + ", ".join(button_labels(menu)))
         recipient_prompt = await conv.get_response()
-        if await click_button(recipient_prompt, "choose recipient"):
-            await conv.get_response()
+        if not await click_button(recipient_prompt, "choose recipient"):
+            raise RecoveryError(
+                "BotFather did not offer a Choose recipient button. Buttons: "
+                + ", ".join(button_labels(recipient_prompt)))
+        await conv.get_response()
         await conv.send_message(recipient)
         confirmation = await conv.get_response()
-        if not await click_button(confirmation, "yes, i am sure"):
-            await conv.send_message("Yes, I am sure")
-        final = await conv.get_response()
+        if not await click_button(
+                confirmation, "yes, i am sure", password=password):
+            raise RecoveryError(
+                "BotFather did not offer the ownership confirmation button. Buttons: "
+                + ", ".join(button_labels(confirmation)))
+        final = await conv.get_edit(confirmation)
     text = response_text(final).casefold()
     if any(word in text for word in ("error", "failed", "invalid", "sorry")):
         raise RecoveryError(
             "BotFather rejected ownership transfer: " + response_text(final))
-    if not any(word in text for word in ("transfer", "ownership", "owned", "success", "done")):
+    if not any(word in text for word in (
+            "transfer", "ownership", "owned", "success", "done", "worked", "new home")):
         raise RecoveryError(
             "BotFather did not confirm ownership transfer: " + response_text(final))
 

@@ -37,6 +37,8 @@ automatic_recovery:
     session: ".session/creator"
     api_id: "123456"
     api_hash: "creator-telegram-api-hash"
+    # Optional; quote numeric passwords so YAML reads them as strings.
+    # password: "your-2FA-password"
 
 # State contains handles, backup handles, pending creator handles, message IDs, and temporary anonymous links; tokens never enter it.
 state_path: ".state/recovery.json"
