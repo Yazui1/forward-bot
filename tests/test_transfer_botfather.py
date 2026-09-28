@@ -5,10 +5,11 @@ import unittest
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from transfer.transfer import (
     AutomaticWaitExceeded,
+    BotFatherMiniApp,
     BotMapping,
     Config,
     Recovery,
@@ -161,68 +162,70 @@ class BotFatherTests(unittest.IsolatedAsyncioTestCase):
         service._prepare_recovery.assert_awaited_once_with(recovery, mapping)
 
     async def test_create_bot_sends_configured_name_before_username(self) -> None:
-        conversation = FakeConversation(
-            [
-                FakeMessage("cancelled"),
-                FakeMessage("new bot name"),
-                FakeMessage("choose username"),
-                FakeMessage("Use this token: 12345:abcdefghijklmnopqrstuvwxyz"),
-            ],
-            [],
-        )
-
-        handle = await create_bot(FakeClient(conversation), "ExampleRelay", "Example relay")
+        conversation = FakeConversation([], [])
+        with patch("transfer.transfer.BotFatherMiniApp") as mini_app:
+            mini_app.return_value.create_bot = AsyncMock(
+                return_value={"ok": True, "bot_id": 123})
+            with patch("transfer.transfer.secrets.randbelow", return_value=0):
+                handle = await create_bot(
+                    FakeClient(conversation), "ExampleRelay", "Example relay")
 
         self.assertRegex(handle, r"^@ExampleRelay\d{2}bot$")
-        self.assertEqual(conversation.sent[:3], ["/cancel", "/newbot", "Example relay"])
-        self.assertEqual(conversation.sent[-1], handle[1:])
+        mini_app.return_value.create_bot.assert_awaited_once_with(
+            "Example relay", "ExampleRelay10bot")
+        self.assertEqual(conversation.sent, [])
 
-    async def test_transfer_handles_edits_and_new_messages_at_each_step(self) -> None:
+    async def test_mini_app_create_bot_sends_expected_form(self) -> None:
+        app = BotFatherMiniApp(FakeClient(FakeConversation([], [])))
+        app._authenticated_api_request = AsyncMock(
+            return_value={"ok": True, "bot_id": 123})
+
+        await app.create_bot("Example relay", "ExampleRelay10bot")
+
+        app._authenticated_api_request.assert_awaited_once_with(
+            "createBot",
+            {
+                "title": "Example relay",
+                "about": "",
+                "username": "ExampleRelay10bot",
+                "userpic": "",
+            },
+        )
+
+    async def test_transfer_uses_mini_app_and_confirms_in_chat(self) -> None:
         for new_messages in (False, True):
             with self.subTest(new_messages=new_messages):
-                listing = FakeMessage("Choose a bot", ("Example @samplebot", False))
-                listing.id = 10
-                menu = FakeMessage("What do you want to do?", ("Transfer Ownership", False))
-                recipient_choice = FakeMessage(
-                    "Transfer bot ownership", ("Choose recipient", False))
-                recipient_prompt = FakeMessage("Please share the new owner's username.")
+                baseline = FakeMessage("previous BotFather message")
+                baseline.id = 10
                 confirmation = FakeMessage(
-                    "Transfer ownership to @owner?",
+                    "You are about to transfer ownership of @samplebot to @owner.",
                     ("Yes, I am sure, proceed.", False),
                 )
+                confirmation.id = 11
                 final = FakeMessage("It worked! The bot will enjoy its new home.")
-                conversation = FakeConversation([FakeMessage("cancelled"), listing], [])
+                conversation = FakeConversation([final], [])
                 client = FakeClient(conversation)
+                client.get_messages = AsyncMock(
+                    side_effect=[[baseline], [confirmation]])
 
-                def transition(source: FakeMessage, response: FakeMessage) -> None:
-                    async def emit_response() -> None:
-                        response.id = source.id + int(new_messages)
-                        await client.emit(response, new_message=new_messages)
+                async def confirm() -> None:
+                    final.id = confirmation.id + int(new_messages)
+                    await client.emit(final, new_message=new_messages)
 
-                    source.on_click = emit_response
+                confirmation.on_click = confirm
 
-                transition(listing, menu)
-                transition(menu, recipient_choice)
+                with patch.object(
+                    BotFatherMiniApp,
+                    "request_transfer",
+                    new=AsyncMock(return_value=(
+                        "tg://resolve?domain=BotFather&start=transfer_test")),
+                ) as request_transfer:
+                    await transfer_ownership(
+                        client, "@samplebot", "@owner", password="123456")
 
-                async def choose_recipient() -> None:
-                    recipient_prompt.id = recipient_choice.id + 1
-                    await client.emit(recipient_prompt, new_message=True)
-
-                recipient_choice.on_click = choose_recipient
-                transition(confirmation, final)
-
-                async def send_owner() -> None:
-                    confirmation.id = recipient_prompt.id + int(new_messages)
-                    await client.emit(confirmation, new_message=new_messages)
-
-                conversation.on_send["@owner"] = send_owner
-
-                await transfer_ownership(
-                    client, "@samplebot", "@owner", password="123456"
-                )
-
-                self.assertEqual(conversation.sent, ["/cancel", "/mybots", "@owner"])
-                self.assertEqual(recipient_choice.passwords, [None])
+                request_transfer.assert_awaited_once_with(
+                    "@samplebot", "@owner")
+                self.assertEqual(conversation.sent, [])
                 self.assertEqual(confirmation.passwords, ["123456"])
 
     async def test_transfer_fails_clearly_when_2fa_password_is_missing(self) -> None:

@@ -17,12 +17,16 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, replace, field
 from datetime import date
+from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 import aiohttp
 import yaml
-from telethon import TelegramClient, events, functions, types
+from telethon import TelegramClient, events, functions, types, utils
 from telethon.errors import (
     ChatAboutNotModifiedError,
     FloodWaitError,
@@ -37,6 +41,7 @@ from telethon.sessions import StringSession
 HERE = Path(__file__).resolve().parent
 SETTINGS_PATH = HERE / "config.yml"
 BOTFATHER = "BotFather"
+BOTFATHER_WEBAPP = "https://webappinternal.telegram.org/botfather"
 ABUSE_NOTIFICATION = "AbuseNotification"
 ANONYMOUS_BOT = "@IncogNoteBot"
 TOKEN_RE = re.compile(r"\b\d{5,}:[A-Za-z0-9_-]{20,}\b")
@@ -1262,6 +1267,9 @@ async def click_button(
                 if result is None:
                     raise RecoveryError(
                         f"Telegram did not acknowledge the BotFather {label!r} button click.")
+                logging.getLogger("recovery").info(
+                    "BotFather acknowledged button %s on message %s",
+                    label, getattr(message, "id", "unknown"))
                 return True
     return False
 
@@ -1276,24 +1284,32 @@ async def interact_with_bot(client: TelegramClient, bot_handle: str) -> None:
 async def create_bot(
     client: TelegramClient, handle_prefix: str, bot_name: str
 ) -> str:
-    async with client.conversation(BOTFATHER, timeout=60, exclusive=True) as conv:
-        await conv.send_message("/cancel")
-        await conv.get_response()
-        await conv.send_message("/newbot")
-        await conv.get_response()
-        await conv.send_message(bot_name)
-        await conv.get_response()
-        for digits in (2, 3, 4):
-            number = secrets.randbelow(
-                9 * 10 ** (digits - 1)) + 10 ** (digits - 1)
-            candidate = f"{handle_prefix}{number}bot"
-            await conv.send_message(candidate)
-            reply = await conv.get_response()
-            if TOKEN_RE.search(response_text(reply)):
+    api = BotFatherMiniApp(client)
+    for digits in (2, 3, 4):
+        number = secrets.randbelow(
+            9 * 10 ** (digits - 1)) + 10 ** (digits - 1)
+        candidate = f"{handle_prefix}{number}bot"
+        try:
+            result = await api.create_bot(bot_name, candidate)
+        except RecoveryError as exc:
+            error = str(exc)
+            if any(term in error.casefold() for term in (
+                    "taken", "already exists", "not available", "unavailable")):
+                continue
+            raise RecoveryError(
+                "BotFather rejected the backup bot creation: " + error) from exc
+        if result.get("ok") is True:
+            bot_id = result.get("bot_id")
+            if isinstance(bot_id, int) and not isinstance(bot_id, bool) and bot_id > 0:
                 return normalize_username(candidate)
-            if "taken" not in response_text(reply).casefold() and "available" not in response_text(reply).casefold():
-                raise RecoveryError(
-                    "BotFather rejected the backup bot username: " + response_text(reply))
+            raise RecoveryError(
+                "BotFather Mini App created a bot without returning its ID.")
+        error = str(result.get("msg") or result.get("error") or "unknown error")
+        if any(term in error.casefold() for term in (
+                "taken", "already exists", "not available", "unavailable")):
+            continue
+        raise RecoveryError(
+            "BotFather rejected the backup bot creation: " + error)
     raise RecoveryError(
         f"Could not find an available {handle_prefix}<number>bot username.")
 
@@ -1354,6 +1370,291 @@ async def botfather_step(
         client.remove_event_handler(receive_update)
 
 
+class BotFatherAuthExpired(RecoveryError):
+    pass
+
+
+class BotFatherMiniApp:
+    def __init__(self, client: TelegramClient) -> None:
+        self.client = client
+        session_file = getattr(getattr(client, "session", None), "filename", None)
+        if session_file and str(session_file) != ":memory:":
+            prefix = Path(str(session_file))
+            self.cookie_path = Path(str(prefix) + ".botfather.cookies.txt")
+            self.cache_path = Path(str(prefix) + ".botfather.json")
+            self.cookie_path.parent.mkdir(parents=True, exist_ok=True)
+            self.cookies = MozillaCookieJar(str(self.cookie_path))
+            if self.cookie_path.exists():
+                try:
+                    self.cookies.load(ignore_discard=True, ignore_expires=True)
+                except Exception:
+                    self.cookies.clear()
+            try:
+                cached = json.loads(self.cache_path.read_text(encoding="utf-8"))
+                cached_hash = cached.get("api_hash")
+                self.api_hash = (
+                    cached_hash
+                    if isinstance(cached_hash, str)
+                    and re.fullmatch(r"[A-Za-z0-9_-]+", cached_hash)
+                    else None
+                )
+            except (OSError, ValueError, AttributeError):
+                self.api_hash = None
+        else:
+            self.cookie_path = None
+            self.cache_path = None
+            self.cookies = MozillaCookieJar()
+            self.api_hash = None
+        self.opener = build_opener(HTTPCookieProcessor(self.cookies))
+
+    def _save(self) -> None:
+        if self.cookie_path is None or self.cache_path is None:
+            return
+        self.cookie_path.parent.mkdir(parents=True, exist_ok=True)
+        cookie_tmp = self.cookie_path.with_name(self.cookie_path.name + ".tmp")
+        self.cookies.save(
+            str(cookie_tmp), ignore_discard=True, ignore_expires=True)
+        os.chmod(cookie_tmp, 0o600)
+        cookie_tmp.replace(self.cookie_path)
+        if self.api_hash:
+            cache_tmp = self.cache_path.with_name(self.cache_path.name + ".tmp")
+            cache_tmp.write_text(
+                json.dumps({"api_hash": self.api_hash}) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(cache_tmp, 0o600)
+            cache_tmp.replace(self.cache_path)
+
+    def _request_sync(
+        self, url: str, form: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "en-GB,en;q=0.9,en-US;q=0.8",
+        }
+        data = None
+        if form is not None:
+            data = urlencode(form).encode("utf-8")
+            headers.update({
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": "https://webappinternal.telegram.org",
+                "Priority": "u=1, i",
+                "Referer": f"{BOTFATHER_WEBAPP}/create"
+                if form.get("method") == "createBot"
+                else BOTFATHER_WEBAPP,
+                "X-Requested-With": "XMLHttpRequest",
+            })
+        request = Request(url, data=data, headers=headers)
+        try:
+            try:
+                with self.opener.open(request, timeout=30) as response:
+                    status = response.status
+                    body = response.read().decode("utf-8", "replace")
+                    final_url = response.geturl()
+            except HTTPError as response:
+                try:
+                    status = response.code
+                    body = response.read().decode("utf-8", "replace")
+                    final_url = response.geturl()
+                finally:
+                    response.close()
+            return status, body, final_url
+        except URLError as exc:
+            raise RecoveryError(
+                "Could not reach the BotFather Mini App.") from exc
+        finally:
+            self._save()
+
+    async def _request(
+        self, url: str, form: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        return await asyncio.to_thread(self._request_sync, url, form)
+
+    @staticmethod
+    def _access_denied(status: int, body: str, final_url: str) -> bool:
+        if status in (401, 403) or urlparse(final_url).path.rstrip("/") == "/auth":
+            return True
+        try:
+            payload = json.loads(body)
+            body = str(payload.get("error", body)) if isinstance(payload, dict) else body
+        except ValueError:
+            pass
+        text = re.sub(r"[_-]+", " ", body.casefold())
+        return any(term in text for term in (
+            "access denied",
+            "denied access",
+            "unauthorized",
+            "authentication required",
+            "auth required",
+            "auth expired",
+            "session expired",
+            "not authenticated",
+            "token expired",
+            "invalid token",
+            "invalid hash",
+            "hash expired",
+        ))
+
+    @staticmethod
+    def _json(status: int, body: str, method: str) -> dict[str, Any]:
+        if not 200 <= status < 300:
+            raise RecoveryError(
+                f"BotFather Mini App {method} request returned HTTP {status}.")
+        try:
+            payload = json.loads(body)
+        except ValueError as exc:
+            raise RecoveryError(
+                f"BotFather Mini App {method} returned invalid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise RecoveryError(
+                f"BotFather Mini App {method} returned an unexpected response.")
+        return payload
+
+    def _has_auth_cookie(self) -> bool:
+        return any(
+            cookie.name == "stel_bot_father_token" and not cookie.is_expired()
+            for cookie in self.cookies
+        )
+
+    async def _init_data(self) -> str:
+        bot_entity = await self.client.get_entity(BOTFATHER)
+        peer = await self.client.get_input_entity(BOTFATHER)
+        result = await self.client(functions.messages.RequestMainWebViewRequest(
+            peer=peer,
+            bot=utils.get_input_user(bot_entity),
+            platform="tdesktop",
+        ))
+        url = urlparse(result.url)
+        for params in (url.fragment, url.query):
+            init_data = parse_qs(params).get("tgWebAppData", [None])[0]
+            if init_data:
+                return init_data
+        raise RecoveryError(
+            "Telegram did not include Mini App initData in the BotFather WebView URL.")
+
+    async def _refresh_auth(self) -> None:
+        init_data = await self._init_data()
+        status, page, _ = await self._request(BOTFATHER_WEBAPP)
+        if status >= 500:
+            raise RecoveryError(
+                f"BotFather Mini App page returned HTTP {status}.")
+        page = page.replace("\\/", "/")
+        match = re.search(
+            r'"apiUrl"\s*:\s*"/api\?hash=([A-Za-z0-9_-]+)', page)
+        if not match:
+            raise RecoveryError(
+                "Could not find BotFather Mini App API hash in its page.")
+        self.api_hash = match.group(1)
+        self._save()
+        url = f"{BOTFATHER_WEBAPP}/api?hash={self.api_hash}"
+        status, body, final_url = await self._request(url, {
+            "method": "auth",
+            "_auth": init_data,
+        })
+        if self._access_denied(status, body, final_url):
+            raise RecoveryError("BotFather Mini App rejected Telegram initData.")
+        payload = self._json(status, body, "auth")
+        if payload.get("error"):
+            raise RecoveryError(
+                "BotFather Mini App authentication failed: "
+                + str(payload["error"]))
+        if not self._has_auth_cookie():
+            raise RecoveryError(
+                "BotFather Mini App auth did not set stel_bot_father_token.")
+        self._save()
+
+    async def _api_request(
+        self, method: str, form: dict[str, str]
+    ) -> dict[str, Any]:
+        if not self.api_hash:
+            raise BotFatherAuthExpired("BotFather Mini App API hash is missing.")
+        url = f"{BOTFATHER_WEBAPP}/api?hash={self.api_hash}"
+        status, body, final_url = await self._request(url, {
+            **form,
+            "method": method,
+        })
+        if self._access_denied(status, body, final_url):
+            raise BotFatherAuthExpired(
+                "BotFather Mini App session was denied or expired.")
+        payload = self._json(status, body, method)
+        if payload.get("error"):
+            error = str(payload["error"])
+            if self._access_denied(status, error, final_url):
+                raise BotFatherAuthExpired(
+                    "BotFather Mini App session was denied or expired.")
+            raise RecoveryError(
+                f"BotFather Mini App {method} failed: {error}")
+        return payload
+
+    async def _authenticated_api_request(
+        self, method: str, form: dict[str, str]
+    ) -> dict[str, Any]:
+        if not self.api_hash or not self._has_auth_cookie():
+            await self._refresh_auth()
+        try:
+            return await self._api_request(method, form)
+        except BotFatherAuthExpired:
+            await self._refresh_auth()
+            return await self._api_request(method, form)
+
+    async def create_bot(self, title: str, username: str) -> dict[str, Any]:
+        return await self._authenticated_api_request("createBot", {
+            "title": title,
+            "about": "",
+            "username": username,
+            "userpic": "",
+        })
+
+    async def request_transfer(
+        self, bot_handle: str, recipient: str
+    ) -> str:
+        bot = await self.client.get_entity(bot_handle)
+        owner = await self.client.get_entity(recipient)
+        if not getattr(bot, "bot", False):
+            raise RecoveryError(f"{bot_handle} is not a Telegram bot.")
+        if getattr(owner, "bot", False):
+            raise RecoveryError("The new owner must be a Telegram user.")
+        form = {"recipient_id": str(owner.id), "bid": str(bot.id)}
+        payload = await self._authenticated_api_request("requestTransferBot", form)
+        open_url = payload.get("open")
+        if not isinstance(open_url, str) or not open_url:
+            raise RecoveryError(
+                "BotFather Mini App did not return the transfer confirmation link.")
+        return open_url
+
+
+def botfather_start_parameter(open_url: str) -> str:
+    parsed = urlparse(open_url)
+    query = parse_qs(parsed.query)
+    if parsed.scheme == "tg" and parsed.netloc.casefold() == "resolve":
+        username = query.get("domain", [""])[0]
+    elif parsed.hostname and parsed.hostname.casefold() in {"t.me", "telegram.me"}:
+        username = parsed.path.strip("/").split("/", 1)[0]
+    else:
+        username = ""
+    if username.casefold() != "botfather":
+        raise RecoveryError(
+            "BotFather Mini App returned an unexpected Telegram link.")
+    start = query.get("start", [None])[0]
+    if not start:
+        raise RecoveryError(
+            "BotFather transfer link did not include a start parameter.")
+    return start
+
+
+def is_transfer_confirmation(
+    message: object, bot_handle: str, recipient: str
+) -> bool:
+    text = response_text(message).casefold()
+    return (
+        bot_handle.lstrip("@").casefold() in text
+        and recipient.lstrip("@").casefold() in text
+        and any("yes, i am sure" in label.casefold()
+                for label in button_labels(message))
+    )
+
+
 async def transfer_ownership(
     client: TelegramClient,
     bot_handle: str,
@@ -1361,36 +1662,35 @@ async def transfer_ownership(
     *,
     password: str | None = None,
 ) -> None:
-    """Drive BotFather's documented /mybots ownership-transfer interaction."""
+    """Request ownership transfer in BotFather's Mini App, then confirm in chat."""
     log = logging.getLogger("recovery")
+    before = await client.get_messages(BOTFATHER, limit=1)
+    if not before:
+        raise RecoveryError(
+            "Cannot track BotFather's transfer confirmation without chat history.")
+    baseline = before[0]
+    api = BotFatherMiniApp(client)
+    open_url = await api.request_transfer(bot_handle, recipient)
+    start = botfather_start_parameter(open_url)
+    log.info("Requested BotFather Mini App transfer for %s", bot_handle)
+
+    recent = await client.get_messages(BOTFATHER, limit=10)
+    confirmation = next(
+        (message for message in recent
+         if message.id > baseline.id
+         and is_transfer_confirmation(message, bot_handle, recipient)),
+        None,
+    )
     async with client.conversation(BOTFATHER, timeout=60, exclusive=True) as conv:
-        log.info("Resetting BotFather conversation for %s", bot_handle)
-        await conv.send_message("/cancel")
-        await conv.get_response()
-        log.info("Requesting BotFather bot list for %s", bot_handle)
-        await conv.send_message("/mybots")
-        listing = await conv.get_response()
-        log.info("Selecting %s in BotFather", bot_handle)
-        menu = await botfather_step(
-            client, conv, listing, click=bot_handle,
-            expected_button="transfer ownership",
-        )
-        log.info("Received BotFather options for %s", bot_handle)
-        recipient_choice = await botfather_step(
-            client, conv, menu, click="transfer ownership",
-            expected_button="choose recipient",
-        )
-        if not await click_button(recipient_choice, "choose recipient"):
+        if confirmation is None:
+            confirmation = await botfather_step(
+                client, conv, baseline, send=f"/start {start}",
+                expected_button="yes, i am sure",
+                expected_text=("about to transfer ownership",),
+            )
+        if not is_transfer_confirmation(confirmation, bot_handle, recipient):
             raise RecoveryError(
-                "BotFather did not offer Choose recipient. Buttons: "
-                + ", ".join(button_labels(recipient_choice)))
-        log.info("Waiting for BotFather recipient prompt for %s", bot_handle)
-        recipient_prompt = await conv.get_response(recipient_choice)
-        log.info("Submitting BotFather transfer recipient for %s", bot_handle)
-        confirmation = await botfather_step(
-            client, conv, recipient_prompt, send=recipient,
-            expected_button="yes, i am sure",
-        )
+                "BotFather's confirmation did not match the requested bot and recipient.")
         log.info("Confirming BotFather ownership transfer for %s", bot_handle)
         final = await botfather_step(
             client, conv, confirmation, click="yes, i am sure",
@@ -1694,7 +1994,7 @@ async def bot_needs_recovery(client: TelegramClient, handle: str) -> bool:
             return True
         async with client.conversation(handle, timeout=45, exclusive=True) as conv:
             sent = await conv.send_message("/about")
-            await conv.get_reply(sent)
+            await conv.get_response(sent)
         return False
     except (asyncio.TimeoutError, OSError, RPCError, ValueError):
         return True
@@ -1709,7 +2009,7 @@ async def update_runtime_about(
 ) -> None:
     async with client.conversation(new_handle, timeout=90, exclusive=True) as conv:
         sent = await conv.send_message("/about")
-        current = await conv.get_reply(sent)
+        current = await conv.get_response(sent)
         current_text = response_text(current)
         updated = replace_usernames(
             current_text,
@@ -1721,7 +2021,7 @@ async def update_runtime_about(
         )
         if updated != current_text:
             sent = await conv.send_message("/about " + updated)
-            about_result = await conv.get_reply(sent)
+            about_result = await conv.get_response(sent)
             about_text = response_text(about_result).casefold()
             if any(word in about_text for word in ("error", "invalid", "admin only", "failed")):
                 raise RecoveryError(
@@ -1729,7 +2029,7 @@ async def update_runtime_about(
                     + response_text(about_result)
                 )
             sent = await conv.send_message("/reload")
-            reload_result = await conv.get_reply(sent)
+            reload_result = await conv.get_response(sent)
             reload_text = response_text(reload_result).casefold()
             if any(word in reload_text for word in ("error", "invalid", "admin only", "failed")):
                 raise RecoveryError(
