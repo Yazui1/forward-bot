@@ -69,7 +69,7 @@ class MediaService:
             return None
         try:
             with Image.open(BytesIO(data)) as img:
-                img = img.convert("RGB").filter(ImageFilter.GaussianBlur(radius=8))
+                img = img.convert("RGB").filter(ImageFilter.GaussianBlur(radius=4))
                 out = BytesIO()
                 img.save(out, format="JPEG", quality=70)
                 blurred = out.getvalue()
