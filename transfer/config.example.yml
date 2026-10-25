@@ -22,13 +22,24 @@ announcement:
     then send its username to {anonymous_link}.
   restored_template: "{friendly_name} has been restored: {new_handle}"
 
+# Enable to keep the IncogNote link active after recovery. Later valid bot
+# submissions are collected as spares, transferred to the main account, and
+# used by automatic recovery before creating a new bot.
+anonymous_submissions:
+  retain_link_after_recovery: false
+  donation_template: "Contribute a spare {friendly_name} bot by sending its @username here: {anonymous_link}"
+
 cloudflare:
   project_name: "your-pages-project"
   pages_url: "https://your-pages-project.pages.dev"
   # Authenticate Wrangler separately, for example with `wrangler login`.
 
-# Set enabled to true to create replacement bots automatically with the creator account.
+# Set enabled to true to restore automatically, creating a bot if needed.
+# A saved spare is used automatically even when enabled is false. A creator
+# account is only needed when the spare queue is empty.
 # Set prepare_bots to true to keep one already-transferred backup per configured bot.
+# For donated-spare-only operation, keep prepare_bots false and omit creator;
+# an empty queue falls back to manual recovery.
 automatic_recovery:
   enabled: false
   prepare_bots: false
@@ -40,7 +51,7 @@ automatic_recovery:
     # Optional; quote numeric passwords so YAML reads them as strings.
     # password: "your-2FA-password"
 
-# State contains handles, backup handles, pending creator handles, message IDs, and temporary anonymous links; tokens never enter it.
+# State contains handles, backup and donation queues, message IDs, and anonymous links; tokens never enter it.
 state_path: ".state/recovery.json"
 snapshot_dir: ".state/snapshots"
 
