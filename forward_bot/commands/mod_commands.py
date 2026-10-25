@@ -613,5 +613,6 @@ async def reload_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     context.application.bot_data["tagger"].refresh(new)
     context.application.bot_data["ai"].update_config(new.section("ai"))
     context.application.bot_data["rate_limiter"].update_config(int(new.get("rate_limits.message_send_limit", 8) or 8), int(new.get("rate_limits.window_seconds", 30) or 30))
+    context.application.bot_data["unblur_limiter"].update_config(int(new.get("unblur.limit", 1) or 1), int(new.get("unblur.window_seconds", 3600) or 3600))
     context.application.bot_data["queue"].update_config(new)
     await update.effective_message.reply_text("Config reloaded.")

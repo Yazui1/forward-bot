@@ -138,6 +138,10 @@ async def run(config_path: str = "config.yml") -> None:
         int(config.get("rate_limits.message_send_limit", 8) or 8),
         int(config.get("rate_limits.window_seconds", 30) or 30),
     )
+    unblur_limiter = RateLimiter(
+        int(config.get("unblur.limit", 1) or 1),
+        int(config.get("unblur.window_seconds", 3600) or 3600),
+    )
     aggregate_logger = AggregateLogger()
     queue = DeliveryQueue(config, repo, store, media, aggregate_logger=aggregate_logger)
     setattr(store, "delivery_queue", queue)
@@ -154,6 +158,7 @@ async def run(config_path: str = "config.yml") -> None:
         ai=ai,
         tagger=tagger,
         rate_limiter=rate_limiter,
+        unblur_limiter=unblur_limiter,
         queue=queue,
         aggregate_logger=aggregate_logger,
         config_ref=config_ref,

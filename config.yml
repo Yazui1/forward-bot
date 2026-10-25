@@ -44,6 +44,11 @@ rate_limits:
   window_seconds: 30
   cooldown_seconds: 30
 
+unblur:
+  limit: 1
+  window_seconds: 3600
+  cost: 5.0
+
 credits:
   starting_balance: 20.0
   text_message_reward: 0.15

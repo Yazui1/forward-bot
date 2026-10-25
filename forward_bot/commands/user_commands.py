@@ -4,8 +4,9 @@ import math
 import logging
 import random
 import re
+from io import BytesIO
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
@@ -78,6 +79,7 @@ def register_user_commands(registry: HelpRegistry) -> None:
     add("credit", "Credits", "Transfer credits by reply or reference.", credit)
     add("creditstats", "Credits",
         "Show credit leaderboard and economy details.", creditstats)
+    add("unblur", "Media", "Reveal the original media from a blurred message.", unblur)
     add("gamble", "Credits", "Gamble credits with 50% odds.", gamble)
     add("invite", "Invites", "Create or show your invite link.", invite)
     add("sendinvite", "Invites",
@@ -495,6 +497,7 @@ async def creditstats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Upvote sent: -{float(config.get('credits.upvote_cost', 0) or 0):.2f}",
         f"Downvote penalty to sender: -{float(config.get('credits.downvote_penalty', 0) or 0):.2f}",
         f"Unsend: -{float(config.get('credits.unsend_cost', 0) or 0):.2f}",
+        f"Unblur: -{float(config.get('unblur.cost', 0) or 0):.2f}",
         f"Edit: -{float(config.get('credits.edit_cost', 0) or 0):.2f}",
         f"Whisper: -{float(config.get('credits.whisper_cost', 0) or 0):.2f}",
         f"Fight fee: {float(config.get('fights.initiation_fee_percent', 0) or 0) * 100:.2f}% of stake, min {float(config.get('fights.initiation_fee_min', 0) or 0):.2f}, max {float(config.get('fights.initiation_fee_max', 0) or 0):.2f}",
@@ -600,6 +603,69 @@ async def sendinvite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     from forward_bot.handlers.message_handlers import submit_text
     await submit_text(update, context, text, force_remove_buttons=True)
+
+
+async def unblur(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user, _ = await ensure_user(update, context)
+    msg, delivery, error = await resolve_message_from_reply(update, context)
+    if not user or not msg:
+        await command_reply(update, context, error or "Reply to a blurred media message.")
+        return
+    if not delivery or not delivery.blurred:
+        await command_reply(update, context, "That message was not blurred.")
+        return
+    if msg.deleted or not msg.media_file_id or msg.content_type == "text":
+        await command_reply(update, context, "The original media is no longer available.")
+        return
+    config = get_config(context)
+    cost = float(config.get("unblur.cost", 5.0) or 5.0)
+    if user.credits < cost:
+        await command_reply(update, context, f"Insufficient credits. Cost: {cost:.2f}.")
+        return
+    limiter = context.application.bot_data["unblur_limiter"]
+    allowed, retry = limiter.check(user.telegram_id)
+    if not allowed:
+        await command_reply(update, context, f"You can unblur another message in {retry}s.")
+        return
+    command = update.effective_message
+    try:
+        file = await context.bot.get_file(msg.media_file_id)
+        data = BytesIO(bytes(await file.download_as_bytearray()))
+        kwargs = {
+            "chat_id": command.chat_id,
+            "reply_to_message_id": command.reply_to_message.message_id,
+        }
+        if msg.text and msg.content_type != "sticker" and msg.content_type != "video_note":
+            kwargs["caption"] = msg.text
+        if msg.parse_mode and "caption" in kwargs:
+            kwargs["parse_mode"] = msg.parse_mode
+        upload = InputFile(data, filename="unblurred")
+        if msg.content_type == "photo":
+            await context.bot.send_photo(photo=upload, **kwargs)
+        elif msg.content_type == "video":
+            await context.bot.send_video(video=upload, **kwargs)
+        elif msg.content_type == "animation":
+            await context.bot.send_animation(animation=upload, **kwargs)
+        elif msg.content_type == "document":
+            await context.bot.send_document(document=upload, **kwargs)
+        elif msg.content_type == "sticker":
+            await context.bot.send_sticker(sticker=upload, chat_id=command.chat_id,
+                                            reply_to_message_id=command.reply_to_message.message_id)
+        elif msg.content_type == "video_note":
+            await context.bot.send_video_note(video_note=upload, **kwargs)
+        else:
+            await command_reply(update, context, "This media type cannot be unblurred.")
+            return
+    except TelegramError as exc:
+        log_telegram_error(LOGGER, "unblur.send", exc, aggregate=context.application.bot_data.get(
+            "aggregate_logger"), repo=get_repo(context), user_id=user.telegram_id)
+        await command_reply(update, context, "Could not retrieve the original media.")
+        return
+    _, updated = apply_credit(repo=get_repo(context), config=config,
+                              user_id=user.telegram_id, amount=-cost,
+                              reason="unblur_cost", cap_positive=False)
+    touch_activity(context, user.telegram_id)
+    await command_reply(update, context, f"Unblurred. Cost: {cost:.2f}. Balance: {updated.credits:.2f}.")
 
 
 async def unsend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
