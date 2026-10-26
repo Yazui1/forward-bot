@@ -26,6 +26,7 @@ COMMON_TELEGRAM_ERROR_MARKERS = (
     "message can't be edited",
     "flood control exceeded",
     "timed out",
+    "user_bot_to_bot_disabled",
 )
 
 UNREACHABLE_TELEGRAM_ERROR_MARKERS = (
@@ -34,6 +35,7 @@ UNREACHABLE_TELEGRAM_ERROR_MARKERS = (
     "chat not found",
     "user is deactivated",
     "forbidden",
+    "user_bot_to_bot_disabled",
 )
 
 

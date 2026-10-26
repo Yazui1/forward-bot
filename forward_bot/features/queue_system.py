@@ -564,6 +564,7 @@ class DeliveryQueue:
                         self._aggregate_logger.increment("telegram.delivery.reply_rejected.BadRequest")
                     return "reply_rejected"
                 log_telegram_error(LOGGER, "delivery.bad_request", exc, aggregate=self._aggregate_logger,
+                                   user_id=item.recipient_id,
                                    message_id=item.message_id, recipient_id=item.recipient_id)
                 msg = str(exc).lower()
                 if "chat not found" in msg or "bot was blocked" in msg:
